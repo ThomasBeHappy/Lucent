@@ -2061,11 +2061,60 @@ void EditorUI::DrawRenderPropertiesPanel() {
     // === Denoise ===
     if (currentMode != gfx::RenderMode::Simple) {
         if (ImGui::CollapsingHeader("Denoise")) {
-            ImGui::Checkbox("Enable Denoise", &settings.enableDenoise);
-            if (settings.enableDenoise) {
-                ImGui::DragFloat("Strength", &settings.denoiseStrength, 0.01f, 0.0f, 1.0f, "%.2f");
+            const char* denoiserNames[] = {
+                "None",
+                "Box Blur",
+                "Edge-Aware",
+                "OpenImageDenoise",
+                "OptiX",
+                "NRD"
+            };
+            int denoiserIdx = static_cast<int>(settings.denoiser);
+            if (ImGui::BeginCombo("Denoiser", denoiserNames[denoiserIdx])) {
+                for (int i = 0; i < 6; i++) {
+                    gfx::DenoiserType type = static_cast<gfx::DenoiserType>(i);
+                    bool supported = (type == gfx::DenoiserType::None ||
+                                      type == gfx::DenoiserType::Box ||
+                                      type == gfx::DenoiserType::EdgeAware);
+                    if (!supported) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.45f, 0.45f, 1.0f));
+                    }
+
+                    if (ImGui::Selectable(denoiserNames[i], i == denoiserIdx,
+                            supported ? 0 : ImGuiSelectableFlags_Disabled)) {
+                        settings.denoiser = static_cast<gfx::DenoiserType>(i);
+                        settingsChanged = true;
+                    }
+
+                    if (!supported) {
+                        ImGui::PopStyleColor();
+                    }
+
+                    if (!supported && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                        ImGui::BeginTooltip();
+                        ImGui::TextUnformatted("External integration required");
+                        ImGui::EndTooltip();
+                    }
+                }
+                ImGui::EndCombo();
             }
-            ImGui::TextDisabled("(Not yet implemented)");
+
+            if (settings.denoiser != gfx::DenoiserType::None) {
+                if (ImGui::DragFloat("Strength", &settings.denoiseStrength, 0.01f, 0.0f, 1.0f, "%.2f")) {
+                    settingsChanged = true;
+                }
+                if (ImGui::DragInt("Radius", (int*)&settings.denoiseRadius, 1.0f, 1, 8)) {
+                    settingsChanged = true;
+                }
+
+                bool supported = (settings.denoiser == gfx::DenoiserType::Box ||
+                                  settings.denoiser == gfx::DenoiserType::EdgeAware);
+                if (!supported) {
+                    ImGui::TextDisabled("Selected denoiser not available in this build.");
+                } else {
+                    ImGui::TextDisabled("Edge-aware and box denoisers are CPU-only for final renders.");
+                }
+            }
         }
     }
     
