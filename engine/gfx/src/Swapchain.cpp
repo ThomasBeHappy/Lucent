@@ -21,6 +21,12 @@ void Swapchain::Shutdown() {
 }
 
 bool Swapchain::Recreate(uint32_t width, uint32_t height) {
+    // Check if new extent is valid before destroying old swapchain
+    if (width == 0 || height == 0) {
+        m_NeedsRecreate = true;
+        return false;
+    }
+    
     m_Config.width = width;
     m_Config.height = height;
     
