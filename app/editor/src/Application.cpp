@@ -427,6 +427,8 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
     
     // Check render mode
     gfx::RenderMode renderMode = m_Renderer.GetRenderMode();
+    // Keep settings mode in sync (used for convergence logic)
+    m_Renderer.GetSettings().activeMode = renderMode;
     
     if (renderMode == gfx::RenderMode::Traced && m_Renderer.GetTracerCompute()) {
         // =========================================================================
@@ -446,6 +448,51 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
         
         // Copy accumulation image to offscreen for display
         gfx::TracerCompute* tracer = m_Renderer.GetTracerCompute();
+        if (tracer && tracer->GetAccumulationImage() && tracer->GetAccumulationImage()->GetHandle() != VK_NULL_HANDLE) {
+            // Transition offscreen to transfer dst (from SHADER_READ_ONLY_OPTIMAL after EndOffscreenPass)
+            offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            
+            // Transition accumulation to transfer src
+            tracer->GetAccumulationImage()->TransitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            
+            // Blit accumulation to offscreen
+            VkImageBlit blitRegion{};
+            blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            blitRegion.srcSubresource.layerCount = 1;
+            blitRegion.srcOffsets[1] = { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 };
+            blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            blitRegion.dstSubresource.layerCount = 1;
+            blitRegion.dstOffsets[1] = { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 };
+            
+            vkCmdBlitImage(cmd, 
+                tracer->GetAccumulationImage()->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                offscreen->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1, &blitRegion, VK_FILTER_NEAREST);
+            
+            // Transition back to shader read for composite pass
+            tracer->GetAccumulationImage()->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+            offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+    } else if (renderMode == gfx::RenderMode::RayTraced &&
+               m_Renderer.GetTracerRayKHR() &&
+               m_Renderer.GetTracerRayKHR()->IsSupported()) {
+        // =========================================================================
+        // RayTraced Mode: Vulkan KHR ray tracing pipeline
+        // =========================================================================
+        LUCENT_GPU_SCOPE(cmd, "RayTracedPass");
+        
+        // Clear offscreen to black first frame (before tracer populates it)
+        gfx::RenderSettings& settings = m_Renderer.GetSettings();
+        if (settings.accumulatedSamples == 0) {
+            m_Renderer.BeginOffscreenPass(cmd, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+            m_Renderer.EndOffscreenPass(cmd);
+        }
+        
+        // Render using KHR ray tracer
+        RenderRayTracedPath(cmd);
+        
+        // Copy accumulation image to offscreen for display
+        gfx::TracerRayKHR* tracer = m_Renderer.GetTracerRayKHR();
         if (tracer && tracer->GetAccumulationImage() && tracer->GetAccumulationImage()->GetHandle() != VK_NULL_HANDLE) {
             // Transition offscreen to transfer dst (from SHADER_READ_ONLY_OPTIMAL after EndOffscreenPass)
             offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -749,9 +796,6 @@ void Application::RenderShadowPass(VkCommandBuffer cmd) {
 }
 
 void Application::UpdateTracerScene() {
-    gfx::TracerCompute* tracer = m_Renderer.GetTracerCompute();
-    if (!tracer) return;
-    
     // Build scene data for the tracer
     std::vector<gfx::BVHBuilder::Triangle> triangles;
     std::vector<gfx::GPUMaterial> materials;
@@ -824,13 +868,64 @@ void Application::UpdateTracerScene() {
         }
     });
     
-    tracer->UpdateScene(triangles, materials);
+    // Update the currently active tracer backend
+    gfx::RenderMode mode = m_Renderer.GetRenderMode();
+    if (mode == gfx::RenderMode::RayTraced) {
+        if (gfx::TracerRayKHR* rt = m_Renderer.GetTracerRayKHR(); rt && rt->IsSupported()) {
+            rt->UpdateScene(triangles, materials);
+        }
+    } else {
+        if (gfx::TracerCompute* compute = m_Renderer.GetTracerCompute()) {
+            compute->UpdateScene(triangles, materials);
+        }
+    }
+    
     m_TracerSceneDirty = false;
 }
 
 void Application::RenderTracedPath(VkCommandBuffer cmd) {
     gfx::TracerCompute* tracer = m_Renderer.GetTracerCompute();
     if (!tracer) return;
+    
+    gfx::RenderSettings& settings = m_Renderer.GetSettings();
+    
+    // Check if we need to reset accumulation
+    if (settings.ConsumeReset()) {
+        tracer->ResetAccumulation();
+    }
+    
+    // Check if scene needs to be updated
+    if (m_TracerSceneDirty) {
+        UpdateTracerScene();
+    }
+    
+    // Check if already converged
+    if (settings.IsConverged()) {
+        return; // No more samples needed
+    }
+    
+    // Build GPU camera data
+    gfx::GPUCamera gpuCamera{};
+    gpuCamera.invView = glm::inverse(m_EditorCamera.GetViewMatrix());
+    gpuCamera.invProj = glm::inverse(m_EditorCamera.GetProjectionMatrix());
+    gpuCamera.position = m_EditorCamera.GetPosition();
+    gpuCamera.fov = m_EditorCamera.GetFOV();
+    
+    gfx::Image* offscreen = m_Renderer.GetOffscreenImage();
+    gpuCamera.resolution = glm::vec2(offscreen->GetWidth(), offscreen->GetHeight());
+    gpuCamera.nearPlane = m_EditorCamera.GetNearClip();
+    gpuCamera.farPlane = m_EditorCamera.GetFarClip();
+    
+    // Trace
+    tracer->Trace(cmd, gpuCamera, settings, offscreen);
+    
+    // Increment sample count
+    settings.IncrementSamples(1);
+}
+
+void Application::RenderRayTracedPath(VkCommandBuffer cmd) {
+    gfx::TracerRayKHR* tracer = m_Renderer.GetTracerRayKHR();
+    if (!tracer || !tracer->IsSupported()) return;
     
     gfx::RenderSettings& settings = m_Renderer.GetSettings();
     

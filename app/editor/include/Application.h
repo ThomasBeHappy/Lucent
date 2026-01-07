@@ -100,6 +100,7 @@ private:
     // Traced mode support
     void UpdateTracerScene();
     void RenderTracedPath(VkCommandBuffer cmd);
+    void RenderRayTracedPath(VkCommandBuffer cmd);
     bool m_TracerSceneDirty = true;
 };
 
