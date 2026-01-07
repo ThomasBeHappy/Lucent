@@ -21,7 +21,28 @@ layout(push_constant) uniform PushConstants {
     float clampValue;
 } pc;
 
-layout(location = 0) rayPayloadEXT vec3 payload;
+// Ray payload: carries radiance, throughput, hit info for multi-bounce
+struct RayPayload {
+    vec3 radiance;
+    vec3 throughput;
+    vec3 hitPos;
+    vec3 hitNormal;
+    vec3 nextDir;
+    uint seed;
+    bool hit;
+    bool done;
+    // Material properties at hit
+    vec3 albedo;
+    vec3 emissive;
+    float metallic;
+    float roughness;
+};
+
+layout(location = 0) rayPayloadEXT RayPayload payload;
+
+const float PI = 3.14159265359;
+const vec3 LIGHT_DIR = normalize(vec3(1.0, 1.0, 0.5));
+const vec3 LIGHT_COLOR = vec3(1.0, 0.98, 0.95) * 2.5;
 
 // PCG random
 uint pcgHash(uint v) {
@@ -33,6 +54,38 @@ uint pcgHash(uint v) {
 float randomFloat(inout uint seed) {
     seed = pcgHash(seed);
     return float(seed) / 4294967295.0;
+}
+
+// Sky color
+vec3 getSkyColor(vec3 direction) {
+    float t = 0.5 * (direction.y + 1.0);
+    vec3 skyColor = mix(vec3(1.0), vec3(0.5, 0.7, 1.0), t) * 0.5;
+    
+    // Add sun
+    float sunDot = dot(direction, LIGHT_DIR);
+    if (sunDot > 0.995) {
+        skyColor += LIGHT_COLOR * 2.0;
+    } else if (sunDot > 0.98) {
+        float sunGlow = (sunDot - 0.98) / 0.015;
+        skyColor += LIGHT_COLOR * sunGlow * 0.5;
+    }
+    
+    return skyColor;
+}
+
+// Trace shadow ray - returns visibility (1 = lit, 0 = shadow)
+float traceShadow(vec3 origin, vec3 direction) {
+    // Use a simple payload for shadow - the miss shader will set it to 1.0
+    payload.radiance = vec3(0.0);  // Will be set to 1.0 on miss
+    
+    traceRayEXT(topLevelAS,
+                gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+                0xFF,
+                1, 2, 1,  // shadow ray type
+                origin, 0.001, direction, 10000.0,
+                0);
+    
+    return payload.radiance.x;
 }
 
 void main() {
@@ -56,29 +109,86 @@ void main() {
     vec3 origin = camera.position;
     vec3 direction = normalize(worldPos.xyz - camera.position);
     
-    float tMin = 0.001;
-    float tMax = 10000.0;
+    // Path tracing loop
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
     
-    // Trace ray
-    payload = vec3(0.0);
-    traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF,
-                0, 2, 0, origin, tMin, direction, tMax, 0);
+    for (uint bounce = 0; bounce <= pc.maxBounces; bounce++) {
+        // Initialize payload
+        payload.radiance = vec3(0.0);
+        payload.throughput = throughput;
+        payload.seed = seed;
+        payload.hit = false;
+        payload.done = false;
+        
+        // Trace ray
+        traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF,
+                    0, 2, 0,  // primary ray type
+                    origin, 0.001, direction, 10000.0, 0);
+        
+        seed = payload.seed;
+        
+        if (!payload.hit) {
+            // Miss - add sky contribution
+            radiance += throughput * getSkyColor(direction);
+            break;
+        }
+        
+        // Add emissive contribution
+        radiance += throughput * payload.emissive;
+        
+        // Direct lighting with shadow ray
+        vec3 shadowOrigin = payload.hitPos + payload.hitNormal * 0.001;
+        float visibility = traceShadow(shadowOrigin, LIGHT_DIR);
+        
+        float NdotL = max(dot(payload.hitNormal, LIGHT_DIR), 0.0);
+        vec3 diffuseColor = payload.albedo * (1.0 - payload.metallic);
+        vec3 directLight = diffuseColor * LIGHT_COLOR * NdotL * visibility / PI;
+        radiance += throughput * directLight;
+        
+        // Update throughput for next bounce
+        // For metals, tint by albedo; for non-metals, mostly white specular
+        vec3 F0 = mix(vec3(0.04), payload.albedo, payload.metallic);
+        float cosTheta = max(dot(-direction, payload.hitNormal), 0.0);
+        vec3 fresnel = F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+        
+        // Blend diffuse and specular contribution to throughput
+        vec3 diffuseThroughput = payload.albedo * (1.0 - payload.metallic) * (1.0 - fresnel);
+        vec3 specularThroughput = fresnel;
+        throughput *= mix(diffuseThroughput, specularThroughput, payload.metallic);
+        
+        // Russian roulette after first few bounces
+        if (bounce > 2) {
+            float p = max(throughput.x, max(throughput.y, throughput.z));
+            if (randomFloat(seed) > p) {
+                break;
+            }
+            throughput /= p;
+        }
+        
+        // Setup next ray
+        origin = payload.hitPos + payload.hitNormal * 0.001;
+        direction = payload.nextDir;
+        
+        // Early termination if throughput is negligible
+        if (max(throughput.x, max(throughput.y, throughput.z)) < 0.001) {
+            break;
+        }
+    }
     
     // Clamp fireflies
-    vec3 color = payload;
     if (pc.clampValue > 0.0) {
-        float luminance = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        float luminance = dot(radiance, vec3(0.2126, 0.7152, 0.0722));
         if (luminance > pc.clampValue) {
-            color *= pc.clampValue / luminance;
+            radiance *= pc.clampValue / luminance;
         }
     }
     
     // Accumulate
     vec4 prevColor = imageLoad(accumImage, ivec2(pixel));
     float sampleWeight = 1.0 / float(pc.sampleIndex + 1);
-    vec3 accumulated = mix(prevColor.rgb, color, sampleWeight);
+    vec3 accumulated = mix(prevColor.rgb, radiance, sampleWeight);
     
     imageStore(accumImage, ivec2(pixel), vec4(accumulated, 1.0));
 }
-
 

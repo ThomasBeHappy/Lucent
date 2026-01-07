@@ -1,13 +1,28 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
 
-layout(location = 0) rayPayloadInEXT vec3 payload;
+// Ray payload: must match raygen/closesthit
+struct RayPayload {
+    vec3 radiance;
+    vec3 throughput;
+    vec3 hitPos;
+    vec3 hitNormal;
+    vec3 nextDir;
+    uint seed;
+    bool hit;
+    bool done;
+    // Material properties at hit
+    vec3 albedo;
+    vec3 emissive;
+    float metallic;
+    float roughness;
+};
+
+layout(location = 0) rayPayloadInEXT RayPayload payload;
 
 void main() {
-    // Sky color (simple gradient)
-    vec3 direction = gl_WorldRayDirectionEXT;
-    float t = 0.5 * (direction.y + 1.0);
-    payload = mix(vec3(1.0), vec3(0.5, 0.7, 1.0), t) * 0.5;
+    // Primary ray miss - signal no hit
+    payload.hit = false;
+    payload.done = true;
 }
-
 

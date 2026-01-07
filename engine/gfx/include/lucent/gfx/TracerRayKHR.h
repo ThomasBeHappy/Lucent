@@ -46,6 +46,16 @@ struct RTInstance {
     uint32_t materialId;
 };
 
+// RT vertex for shader access (pos + normal + uv, 32 bytes)
+struct RTVertex {
+    glm::vec3 position;
+    float pad0;
+    glm::vec3 normal;
+    float pad1;
+    glm::vec2 uv;
+    glm::vec2 pad2;
+};
+
 // Push constants for ray tracing shaders
 struct RTPushConstants {
     uint32_t frameIndex;
@@ -116,7 +126,8 @@ private:
     TLAS m_TLAS;
     
     // Scene data
-    Buffer m_VertexBuffer;
+    Buffer m_PositionBuffer;        // Positions only for BLAS geometry
+    Buffer m_VertexBuffer;          // Full vertices (RTVertex) for shader access
     Buffer m_IndexBuffer;
     Buffer m_PrimitiveMaterialBuffer;
     Buffer m_MaterialBuffer;

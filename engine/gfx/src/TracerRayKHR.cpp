@@ -102,6 +102,7 @@ void TracerRayKHR::Shutdown() {
     m_TLAS.instanceBuffer.Shutdown();
     
     // Destroy buffers
+    m_PositionBuffer.Shutdown();
     m_VertexBuffer.Shutdown();
     m_IndexBuffer.Shutdown();
     m_PrimitiveMaterialBuffer.Shutdown();
@@ -427,16 +428,32 @@ bool TracerRayKHR::CreateAccumulationImage(uint32_t width, uint32_t height) {
 bool TracerRayKHR::BuildBLAS(const std::vector<BVHBuilder::Triangle>& triangles) {
     if (triangles.empty()) return false;
     
+    // Wait for GPU to finish using old buffers before rebuilding
+    m_Context->WaitIdle();
+    
     VkDevice device = m_Context->GetDevice();
     m_TriangleCount = static_cast<uint32_t>(triangles.size());
     
-    // Create vertex buffer (positions only for BLAS)
+    // Create position buffer (positions only for BLAS building)
     std::vector<glm::vec3> positions;
     positions.reserve(triangles.size() * 3);
     for (const auto& tri : triangles) {
         positions.push_back(tri.v0);
         positions.push_back(tri.v1);
         positions.push_back(tri.v2);
+    }
+    
+    // Create full vertex buffer (pos + normal + uv for shader access)
+    std::vector<RTVertex> vertices;
+    vertices.reserve(triangles.size() * 3);
+    for (const auto& tri : triangles) {
+        RTVertex v0{}, v1{}, v2{};
+        v0.position = tri.v0; v0.normal = tri.n0; v0.uv = tri.uv0;
+        v1.position = tri.v1; v1.normal = tri.n1; v1.uv = tri.uv1;
+        v2.position = tri.v2; v2.normal = tri.n2; v2.uv = tri.uv2;
+        vertices.push_back(v0);
+        vertices.push_back(v1);
+        vertices.push_back(v2);
     }
 
     // Per-primitive material ids (one per triangle, indexed by gl_PrimitiveID)
@@ -446,11 +463,26 @@ bool TracerRayKHR::BuildBLAS(const std::vector<BVHBuilder::Triangle>& triangles)
         materialIds.push_back(tri.materialId);
     }
     
+    // Position buffer for BLAS geometry (vec3 only)
+    BufferDesc posDesc{};
+    posDesc.size = positions.size() * sizeof(glm::vec3);
+    posDesc.usage = BufferUsage::AccelerationStructure;
+    posDesc.hostVisible = true;
+    posDesc.deviceAddress = true;
+    posDesc.debugName = "RTPositionBuffer";
+    
+    m_PositionBuffer.Shutdown();
+    if (!m_PositionBuffer.Init(m_Device, posDesc)) {
+        LUCENT_CORE_ERROR("TracerRayKHR: Failed to create position buffer");
+        return false;
+    }
+    m_PositionBuffer.Upload(positions.data(), posDesc.size);
+    
+    // Full vertex buffer for shader access (RTVertex)
     BufferDesc vbDesc{};
-    vbDesc.size = positions.size() * sizeof(glm::vec3);
-    vbDesc.usage = BufferUsage::AccelerationStructure;
+    vbDesc.size = vertices.size() * sizeof(RTVertex);
+    vbDesc.usage = BufferUsage::Storage;
     vbDesc.hostVisible = true;
-    vbDesc.deviceAddress = true;
     vbDesc.debugName = "RTVertexBuffer";
     
     m_VertexBuffer.Shutdown();
@@ -458,7 +490,7 @@ bool TracerRayKHR::BuildBLAS(const std::vector<BVHBuilder::Triangle>& triangles)
         LUCENT_CORE_ERROR("TracerRayKHR: Failed to create vertex buffer");
         return false;
     }
-    m_VertexBuffer.Upload(positions.data(), vbDesc.size);
+    m_VertexBuffer.Upload(vertices.data(), vbDesc.size);
     
     // Create index buffer
     std::vector<uint32_t> indices;
@@ -494,14 +526,14 @@ bool TracerRayKHR::BuildBLAS(const std::vector<BVHBuilder::Triangle>& triangles)
     }
     m_PrimitiveMaterialBuffer.Upload(materialIds.data(), pmDesc.size);
     
-    // Geometry description
+    // Geometry description (uses position buffer for BLAS, not full vertex buffer)
     VkAccelerationStructureGeometryKHR geometry{};
     geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
     geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
     geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
     geometry.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
     geometry.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-    geometry.geometry.triangles.vertexData.deviceAddress = m_VertexBuffer.GetDeviceAddress();
+    geometry.geometry.triangles.vertexData.deviceAddress = m_PositionBuffer.GetDeviceAddress();
     geometry.geometry.triangles.vertexStride = sizeof(glm::vec3);
     geometry.geometry.triangles.maxVertex = static_cast<uint32_t>(positions.size()) - 1;
     geometry.geometry.triangles.indexType = VK_INDEX_TYPE_UINT32;
