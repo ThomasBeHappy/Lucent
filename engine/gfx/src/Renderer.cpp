@@ -127,6 +127,19 @@ bool Renderer::Init(VulkanContext* context, Device* device, const RendererConfig
         }
     }
     
+#ifdef LUCENT_ENABLE_OPTIX
+    // Initialize OptiX AI denoiser (optional, only on NVIDIA GPUs with OptiX SDK)
+    if (m_Capabilities.tracedAvailable || m_Capabilities.rayTracedAvailable) {
+        m_OptiXDenoiser = std::make_unique<OptiXDenoiser>();
+        if (!m_OptiXDenoiser->Init(m_Context, m_Device)) {
+            LUCENT_CORE_INFO("OptiX denoiser not available (optional)");
+            m_OptiXDenoiser.reset();
+        } else {
+            LUCENT_CORE_INFO("OptiX AI denoiser initialized");
+        }
+    }
+#endif
+    
     LUCENT_CORE_INFO("Renderer initialized");
     return true;
 }
@@ -151,6 +164,13 @@ void Renderer::Shutdown() {
         m_FinalRender->Shutdown();
         m_FinalRender.reset();
     }
+    
+#ifdef LUCENT_ENABLE_OPTIX
+    if (m_OptiXDenoiser) {
+        m_OptiXDenoiser->Shutdown();
+        m_OptiXDenoiser.reset();
+    }
+#endif
     
     DestroyShadowResources();
     DestroyPipelines();

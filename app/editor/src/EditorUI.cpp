@@ -2076,6 +2076,12 @@ void EditorUI::DrawRenderPropertiesPanel() {
                     bool supported = (type == gfx::DenoiserType::None ||
                                       type == gfx::DenoiserType::Box ||
                                       type == gfx::DenoiserType::EdgeAware);
+                    
+                    // OptiX is supported if available
+                    if (type == gfx::DenoiserType::OptiX && m_Renderer->IsOptiXDenoiserAvailable()) {
+                        supported = true;
+                    }
+                    
                     if (!supported) {
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.45f, 0.45f, 1.0f));
                     }
@@ -2092,7 +2098,11 @@ void EditorUI::DrawRenderPropertiesPanel() {
 
                     if (!supported && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
                         ImGui::BeginTooltip();
-                        ImGui::TextUnformatted("External integration required");
+                        if (type == gfx::DenoiserType::OptiX) {
+                            ImGui::TextUnformatted("OptiX SDK not found or initialization failed");
+                        } else {
+                            ImGui::TextUnformatted("External integration required");
+                        }
                         ImGui::EndTooltip();
                     }
                 }
@@ -2109,7 +2119,10 @@ void EditorUI::DrawRenderPropertiesPanel() {
 
                 bool supported = (settings.denoiser == gfx::DenoiserType::Box ||
                                   settings.denoiser == gfx::DenoiserType::EdgeAware);
-                if (!supported) {
+                bool isOptiX = (settings.denoiser == gfx::DenoiserType::OptiX && m_Renderer->IsOptiXDenoiserAvailable());
+                if (isOptiX) {
+                    ImGui::TextDisabled("OptiX AI Denoiser with albedo + normal guides.");
+                } else if (!supported) {
                     ImGui::TextDisabled("Selected denoiser not available in this build.");
                 } else {
                     ImGui::TextDisabled("Edge-aware and box denoisers are CPU-only for final renders.");

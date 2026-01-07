@@ -127,7 +127,7 @@ bool TracerCompute::Init(VulkanContext* context, Device* device) {
     
     // Create descriptor pool
     VkDescriptorPoolSize poolSizes[] = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },  // accumImage + albedoImage + normalImage
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
     };
@@ -150,12 +150,14 @@ bool TracerCompute::Init(VulkanContext* context, Device* device) {
         { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },     // bvhNodes
         { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },     // instances
         { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },     // materials
-        { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }      // camera
+        { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },     // camera
+        { 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },      // albedoImage
+        { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }       // normalImage
     };
     
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 6;
+    layoutInfo.bindingCount = 8;
     layoutInfo.pBindings = bindings;
     
     if (vkCreateDescriptorSetLayout(context->GetDevice(), &layoutInfo, nullptr, &m_DescriptorLayout) != VK_SUCCESS) {
@@ -193,6 +195,8 @@ void TracerCompute::Shutdown() {
     m_SceneGPU.materialBuffer.Shutdown();
     
     m_AccumulationImage.Shutdown();
+    m_AlbedoImage.Shutdown();
+    m_NormalImage.Shutdown();
     m_CameraBuffer.Shutdown();
     
     if (m_Pipeline != VK_NULL_HANDLE) {
@@ -282,12 +286,14 @@ bool TracerCompute::CreateAccumulationImage(uint32_t width, uint32_t height) {
     }
     
     m_AccumulationImage.Shutdown();
+    m_AlbedoImage.Shutdown();
+    m_NormalImage.Shutdown();
     
     ImageDesc desc{};
     desc.width = width;
     desc.height = height;
     desc.format = VK_FORMAT_R32G32B32A32_SFLOAT;  // HDR accumulation
-    desc.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    desc.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     desc.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     desc.debugName = "TracerAccumulationImage";
     
@@ -296,16 +302,31 @@ bool TracerCompute::CreateAccumulationImage(uint32_t width, uint32_t height) {
         return false;
     }
     
+    // Create AOV images for denoiser
+    desc.debugName = "TracerAlbedoImage";
+    if (!m_AlbedoImage.Init(m_Device, desc)) {
+        LUCENT_CORE_ERROR("Failed to create tracer albedo image");
+        return false;
+    }
+    
+    desc.debugName = "TracerNormalImage";
+    if (!m_NormalImage.Init(m_Device, desc)) {
+        LUCENT_CORE_ERROR("Failed to create tracer normal image");
+        return false;
+    }
+    
     // Transition to general layout for compute
     VkCommandBuffer cmd = m_Device->BeginSingleTimeCommands();
     m_AccumulationImage.TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    m_AlbedoImage.TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    m_NormalImage.TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     m_Device->EndSingleTimeCommands(cmd);
     
     m_AccumWidth = width;
     m_AccumHeight = height;
     m_DescriptorsDirty = true;  // Accumulation image changed, need to update descriptors
     
-    LUCENT_CORE_DEBUG("TracerCompute accumulation image created: {}x{}", width, height);
+    LUCENT_CORE_DEBUG("TracerCompute accumulation + AOV images created: {}x{}", width, height);
     return true;
 }
 
@@ -316,6 +337,15 @@ void TracerCompute::UpdateDescriptors() {
     VkDescriptorImageInfo imageInfo{};
     imageInfo.imageView = m_AccumulationImage.GetView();
     imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    
+    // AOV images for denoiser
+    VkDescriptorImageInfo albedoInfo{};
+    albedoInfo.imageView = m_AlbedoImage.GetView();
+    albedoInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    
+    VkDescriptorImageInfo normalInfo{};
+    normalInfo.imageView = m_NormalImage.GetView();
+    normalInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     
     // Scene buffers (use dummy if not ready)
     VkDescriptorBufferInfo triangleInfo{};
@@ -343,7 +373,7 @@ void TracerCompute::UpdateDescriptors() {
     cameraInfo.offset = 0;
     cameraInfo.range = sizeof(GPUCamera);
     
-    VkWriteDescriptorSet writes[6] = {};
+    VkWriteDescriptorSet writes[8] = {};
     
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = m_DescriptorSet;
@@ -387,7 +417,21 @@ void TracerCompute::UpdateDescriptors() {
     writes[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[5].pBufferInfo = &cameraInfo;
     
-    vkUpdateDescriptorSets(device, 6, writes, 0, nullptr);
+    writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[6].dstSet = m_DescriptorSet;
+    writes[6].dstBinding = 6;
+    writes[6].descriptorCount = 1;
+    writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[6].pImageInfo = &albedoInfo;
+    
+    writes[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[7].dstSet = m_DescriptorSet;
+    writes[7].dstBinding = 7;
+    writes[7].descriptorCount = 1;
+    writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[7].pImageInfo = &normalInfo;
+    
+    vkUpdateDescriptorSets(device, 8, writes, 0, nullptr);
 }
 
 void TracerCompute::UpdateScene(const std::vector<BVHBuilder::Triangle>& inputTriangles,
@@ -578,7 +622,7 @@ void TracerCompute::Trace(VkCommandBuffer cmd,
 void TracerCompute::ResetAccumulation() {
     m_FrameIndex = 0;
     
-    // Clear accumulation image if it exists
+    // Clear accumulation and AOV images if they exist
     if (m_AccumulationImage.GetHandle() != VK_NULL_HANDLE) {
         VkCommandBuffer cmd = m_Device->BeginSingleTimeCommands();
         
@@ -592,6 +636,15 @@ void TracerCompute::ResetAccumulation() {
         
         vkCmdClearColorImage(cmd, m_AccumulationImage.GetHandle(), VK_IMAGE_LAYOUT_GENERAL, 
             &clearColor, 1, &range);
+        
+        if (m_AlbedoImage.GetHandle() != VK_NULL_HANDLE) {
+            vkCmdClearColorImage(cmd, m_AlbedoImage.GetHandle(), VK_IMAGE_LAYOUT_GENERAL, 
+                &clearColor, 1, &range);
+        }
+        if (m_NormalImage.GetHandle() != VK_NULL_HANDLE) {
+            vkCmdClearColorImage(cmd, m_NormalImage.GetHandle(), VK_IMAGE_LAYOUT_GENERAL, 
+                &clearColor, 1, &range);
+        }
         
         m_Device->EndSingleTimeCommands(cmd);
     }

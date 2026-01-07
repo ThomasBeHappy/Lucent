@@ -67,7 +67,6 @@ void EdgeAwareDenoise(const float* src, float* dst, uint32_t width, uint32_t hei
             float centerR = src[centerIdx + 0];
             float centerG = src[centerIdx + 1];
             float centerB = src[centerIdx + 2];
-            float centerA = src[centerIdx + 3];
             float centerLuma = ComputeLuminance(centerR, centerG, centerB);
 
             float sumR = 0.0f;

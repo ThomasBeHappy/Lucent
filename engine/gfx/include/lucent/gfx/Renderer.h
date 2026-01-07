@@ -11,6 +11,9 @@
 #include "lucent/gfx/TracerCompute.h"
 #include "lucent/gfx/TracerRayKHR.h"
 #include "lucent/gfx/FinalRender.h"
+#ifdef LUCENT_ENABLE_OPTIX
+#include "lucent/gfx/OptiXDenoiser.h"
+#endif
 #include <glm/glm.hpp>
 #include <vector>
 #include <memory>
@@ -95,6 +98,14 @@ public:
     TracerCompute* GetTracerCompute() { return m_TracerCompute.get(); }
     TracerRayKHR* GetTracerRayKHR() { return m_TracerRayKHR.get(); }
     FinalRender* GetFinalRender() { return m_FinalRender.get(); }
+    
+#ifdef LUCENT_ENABLE_OPTIX
+    // OptiX AI denoiser
+    OptiXDenoiser* GetOptiXDenoiser() { return m_OptiXDenoiser.get(); }
+    bool IsOptiXDenoiserAvailable() const { return m_OptiXDenoiser && m_OptiXDenoiser->IsAvailable(); }
+#else
+    bool IsOptiXDenoiserAvailable() const { return false; }
+#endif
     
     // Post-processing
     VkPipeline GetPostFXPipeline() const { return m_PostFXPipeline; }
@@ -226,6 +237,11 @@ private:
     
     // Final render (for image export)
     std::unique_ptr<FinalRender> m_FinalRender;
+    
+#ifdef LUCENT_ENABLE_OPTIX
+    // OptiX AI denoiser
+    std::unique_ptr<OptiXDenoiser> m_OptiXDenoiser;
+#endif
     
     // Legacy render pass support (Vulkan 1.1/1.2 fallback)
     VkRenderPass m_OffscreenRenderPass = VK_NULL_HANDLE;

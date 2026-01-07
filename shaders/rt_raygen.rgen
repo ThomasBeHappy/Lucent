@@ -4,6 +4,10 @@
 layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelAS;
 layout(set = 0, binding = 1, rgba32f) uniform image2D accumImage;
 
+// AOV images for denoiser (albedo and normal guides)
+layout(set = 0, binding = 7, rgba32f) uniform image2D albedoImage;
+layout(set = 0, binding = 8, rgba32f) uniform image2D normalImage;
+
 layout(set = 0, binding = 5) uniform CameraUBO {
     mat4 invView;
     mat4 invProj;
@@ -113,6 +117,11 @@ void main() {
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
     
+    // AOV storage for denoiser (first-hit values)
+    vec3 firstHitAlbedo = vec3(0.0);
+    vec3 firstHitNormal = vec3(0.0);
+    bool capturedAOV = false;
+    
     for (uint bounce = 0; bounce <= pc.maxBounces; bounce++) {
         // Initialize payload
         payload.radiance = vec3(0.0);
@@ -130,8 +139,22 @@ void main() {
         
         if (!payload.hit) {
             // Miss - add sky contribution
-            radiance += throughput * getSkyColor(direction);
+            vec3 skyColor = getSkyColor(direction);
+            radiance += throughput * skyColor;
+            
+            // For sky hits on first bounce, use sky as albedo
+            if (!capturedAOV) {
+                firstHitAlbedo = skyColor;
+                firstHitNormal = -direction * 0.5 + 0.5;  // Remap to [0,1]
+            }
             break;
+        }
+        
+        // Capture first-hit AOVs for denoiser
+        if (!capturedAOV) {
+            firstHitAlbedo = payload.albedo;
+            firstHitNormal = payload.hitNormal * 0.5 + 0.5;  // Remap to [0,1]
+            capturedAOV = true;
         }
         
         // Add emissive contribution
@@ -184,11 +207,18 @@ void main() {
         }
     }
     
-    // Accumulate
+    // Accumulate color
     vec4 prevColor = imageLoad(accumImage, ivec2(pixel));
     float sampleWeight = 1.0 / float(pc.sampleIndex + 1);
     vec3 accumulated = mix(prevColor.rgb, radiance, sampleWeight);
-    
     imageStore(accumImage, ivec2(pixel), vec4(accumulated, 1.0));
+    
+    // Accumulate AOVs (albedo and normal - these converge quickly)
+    vec4 prevAlbedo = imageLoad(albedoImage, ivec2(pixel));
+    vec4 prevNormal = imageLoad(normalImage, ivec2(pixel));
+    vec3 accumAlbedo = mix(prevAlbedo.rgb, firstHitAlbedo, sampleWeight);
+    vec3 accumNormal = mix(prevNormal.rgb, firstHitNormal, sampleWeight);
+    imageStore(albedoImage, ivec2(pixel), vec4(accumAlbedo, 1.0));
+    imageStore(normalImage, ivec2(pixel), vec4(accumNormal, 1.0));
 }
 

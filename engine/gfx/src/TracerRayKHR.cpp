@@ -33,7 +33,7 @@ bool TracerRayKHR::Init(VulkanContext* context, Device* device) {
     // Create descriptor pool
     VkDescriptorPoolSize poolSizes[] = {
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },  // accumImage + albedoImage + normalImage
         // vertices, indices, materials, primitiveMaterialIds
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
@@ -58,12 +58,14 @@ bool TracerRayKHR::Init(VulkanContext* context, Device* device) {
         { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }, // indices
         { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }, // materials
         { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr },  // camera
-        { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr } // per-primitive material ids
+        { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }, // per-primitive material ids
+        { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr },  // albedoImage
+        { 8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr }   // normalImage
     };
     
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 7;
+    layoutInfo.bindingCount = 9;
     layoutInfo.pBindings = bindings;
     
     if (vkCreateDescriptorSetLayout(context->GetDevice(), &layoutInfo, nullptr, &m_DescriptorLayout) != VK_SUCCESS) {
@@ -110,8 +112,10 @@ void TracerRayKHR::Shutdown() {
     m_SBTBuffer.Shutdown();
     m_CameraBuffer.Shutdown();
     
-    // Destroy image
+    // Destroy images
     m_AccumulationImage.Shutdown();
+    m_AlbedoImage.Shutdown();
+    m_NormalImage.Shutdown();
     
     // Destroy pipeline
     if (m_Pipeline != VK_NULL_HANDLE) {
@@ -398,12 +402,14 @@ bool TracerRayKHR::CreateAccumulationImage(uint32_t width, uint32_t height) {
     }
     
     m_AccumulationImage.Shutdown();
+    m_AlbedoImage.Shutdown();
+    m_NormalImage.Shutdown();
     
     ImageDesc desc{};
     desc.width = width;
     desc.height = height;
     desc.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-    desc.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    desc.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     desc.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     desc.debugName = "RTAccumulationImage";
     
@@ -412,16 +418,31 @@ bool TracerRayKHR::CreateAccumulationImage(uint32_t width, uint32_t height) {
         return false;
     }
     
-    // Transition to general layout
+    // Create AOV images for denoiser
+    desc.debugName = "RTAlbedoImage";
+    if (!m_AlbedoImage.Init(m_Device, desc)) {
+        LUCENT_CORE_ERROR("TracerRayKHR: Failed to create albedo image");
+        return false;
+    }
+    
+    desc.debugName = "RTNormalImage";
+    if (!m_NormalImage.Init(m_Device, desc)) {
+        LUCENT_CORE_ERROR("TracerRayKHR: Failed to create normal image");
+        return false;
+    }
+    
+    // Transition all to general layout
     VkCommandBuffer cmd = m_Device->BeginSingleTimeCommands();
     m_AccumulationImage.TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    m_AlbedoImage.TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    m_NormalImage.TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     m_Device->EndSingleTimeCommands(cmd);
     
     m_AccumWidth = width;
     m_AccumHeight = height;
     m_DescriptorsDirty = true;
     
-    LUCENT_CORE_DEBUG("TracerRayKHR: Accumulation image created: {}x{}", width, height);
+    LUCENT_CORE_DEBUG("TracerRayKHR: Accumulation + AOV images created: {}x{}", width, height);
     return true;
 }
 
@@ -838,6 +859,14 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
         imageInfo.imageView = m_AccumulationImage.GetView();
         imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
+        VkDescriptorImageInfo albedoInfo{};
+        albedoInfo.imageView = m_AlbedoImage.GetView();
+        albedoInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo normalInfo{};
+        normalInfo.imageView = m_NormalImage.GetView();
+        normalInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
         VkDescriptorBufferInfo vertexInfo{};
         vertexInfo.buffer = m_VertexBuffer.GetHandle();
         vertexInfo.offset = 0;
@@ -863,7 +892,7 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
         cameraInfo.offset = 0;
         cameraInfo.range = sizeof(GPUCamera);
 
-        VkWriteDescriptorSet writes[7] = {};
+        VkWriteDescriptorSet writes[9] = {};
 
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].pNext = &asWrite;
@@ -914,7 +943,21 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
         writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[6].pBufferInfo = &primMatInfo;
 
-        vkUpdateDescriptorSets(device, 7, writes, 0, nullptr);
+        writes[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[7].dstSet = m_DescriptorSet;
+        writes[7].dstBinding = 7;
+        writes[7].descriptorCount = 1;
+        writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[7].pImageInfo = &albedoInfo;
+
+        writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[8].dstSet = m_DescriptorSet;
+        writes[8].dstBinding = 8;
+        writes[8].descriptorCount = 1;
+        writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[8].pImageInfo = &normalInfo;
+
+        vkUpdateDescriptorSets(device, 9, writes, 0, nullptr);
         m_DescriptorsDirty = false;
     }
     
@@ -967,6 +1010,15 @@ void TracerRayKHR::ResetAccumulation() {
         
         vkCmdClearColorImage(cmd, m_AccumulationImage.GetHandle(), VK_IMAGE_LAYOUT_GENERAL,
                               &clearColor, 1, &range);
+        
+        if (m_AlbedoImage.GetHandle() != VK_NULL_HANDLE) {
+            vkCmdClearColorImage(cmd, m_AlbedoImage.GetHandle(), VK_IMAGE_LAYOUT_GENERAL,
+                                  &clearColor, 1, &range);
+        }
+        if (m_NormalImage.GetHandle() != VK_NULL_HANDLE) {
+            vkCmdClearColorImage(cmd, m_NormalImage.GetHandle(), VK_IMAGE_LAYOUT_GENERAL,
+                                  &clearColor, 1, &range);
+        }
         
         m_Device->EndSingleTimeCommands(cmd);
     }

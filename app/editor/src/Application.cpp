@@ -5,6 +5,7 @@
 #include "lucent/scene/Components.h"
 #include "lucent/material/MaterialAsset.h"
 #include <GLFW/glfw3.h>
+#include <cmath>
 
 // GLFW native access (Win32 HWND)
 #define GLFW_EXPOSE_NATIVE_WIN32
@@ -13,6 +14,51 @@
 #include <Windows.h>
 
 namespace lucent {
+
+namespace {
+
+struct CameraSnapshot {
+    glm::vec3 position{};
+    glm::vec3 target{};
+    float fov = 0.0f;
+    float aspect = 0.0f;
+    float nearClip = 0.0f;
+    float farClip = 0.0f;
+};
+
+static CameraSnapshot SnapshotCamera(const scene::EditorCamera& cam) {
+    CameraSnapshot s{};
+    s.position = cam.GetPosition();
+    s.target = cam.GetTarget();
+    s.fov = cam.GetFOV();
+    s.aspect = cam.GetAspectRatio();
+    s.nearClip = cam.GetNearClip();
+    s.farClip = cam.GetFarClip();
+    return s;
+}
+
+static bool NearlyEqual(float a, float b, float eps = 1e-6f) {
+    return std::fabs(a - b) <= eps;
+}
+
+static bool NearlyEqualVec3(const glm::vec3& a, const glm::vec3& b, float eps = 1e-6f) {
+    glm::vec3 d = a - b;
+    return (d.x * d.x + d.y * d.y + d.z * d.z) <= (eps * eps);
+}
+
+static bool HasCameraChanged(const CameraSnapshot& prev, const scene::EditorCamera& cam) {
+    // Position/target cover orbit/pan/rotate (and most focus/reset operations).
+    // Projection params cover fly-mode scroll (FOV) and other projection tweaks.
+    if (!NearlyEqualVec3(prev.position, cam.GetPosition())) return true;
+    if (!NearlyEqualVec3(prev.target, cam.GetTarget())) return true;
+    if (!NearlyEqual(prev.fov, cam.GetFOV())) return true;
+    if (!NearlyEqual(prev.aspect, cam.GetAspectRatio())) return true;
+    if (!NearlyEqual(prev.nearClip, cam.GetNearClip())) return true;
+    if (!NearlyEqual(prev.farClip, cam.GetFarClip())) return true;
+    return false;
+}
+
+} // namespace
 
 Application::~Application() {
     Shutdown();
@@ -297,6 +343,9 @@ void Application::Run() {
         double currentTime = glfwGetTime();
         m_DeltaTime = static_cast<float>(currentTime - m_LastFrameTime);
         m_LastFrameTime = currentTime;
+
+        // Snapshot camera BEFORE polling events (camera is modified in GLFW callbacks).
+        CameraSnapshot prevCam = SnapshotCamera(m_EditorCamera);
         
         // FPS counter
         m_FrameCount++;
@@ -323,18 +372,12 @@ void Application::Run() {
         // Process input
         ProcessInput();
         
-        // Store camera state before update
-        glm::mat4 prevViewMatrix = m_EditorCamera.GetViewMatrix();
-        
         // Update camera
         m_EditorCamera.Update(m_DeltaTime);
         
-        // Check if camera has moved (reset accumulation for traced modes)
-        if (m_Renderer.GetRenderMode() != gfx::RenderMode::Simple) {
-            glm::mat4 newViewMatrix = m_EditorCamera.GetViewMatrix();
-            if (prevViewMatrix != newViewMatrix) {
-                m_Renderer.GetSettings().MarkDirty();
-            }
+        // Check if camera has moved/changed (reset accumulation for traced modes)
+        if (m_Renderer.GetRenderMode() != gfx::RenderMode::Simple && HasCameraChanged(prevCam, m_EditorCamera)) {
+            m_Renderer.GetSettings().MarkDirty();
         }
         
         // Check if scene was modified in EditorUI (object transforms changed)
@@ -422,9 +465,14 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
     gfx::Image* offscreen = m_Renderer.GetOffscreenImage();
     VkExtent2D extent = { offscreen->GetWidth(), offscreen->GetHeight() };
     
-    // Update camera aspect ratio based on viewport size
+    // Update camera aspect ratio based on viewport size (and reset accumulation if it changes)
     float aspectRatio = static_cast<float>(extent.width) / static_cast<float>(extent.height);
-    m_EditorCamera.SetAspectRatio(aspectRatio);
+    if (!NearlyEqual(m_EditorCamera.GetAspectRatio(), aspectRatio)) {
+        m_EditorCamera.SetAspectRatio(aspectRatio);
+        if (m_Renderer.GetRenderMode() != gfx::RenderMode::Simple) {
+            m_Renderer.GetSettings().MarkDirty();
+        }
+    }
     
     // Check render mode
     gfx::RenderMode renderMode = m_Renderer.GetRenderMode();
@@ -450,11 +498,31 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
         // Copy accumulation image to offscreen for display
         gfx::TracerCompute* tracer = m_Renderer.GetTracerCompute();
         if (tracer && tracer->GetAccumulationImage() && tracer->GetAccumulationImage()->GetHandle() != VK_NULL_HANDLE) {
+            // Determine which image to blit from (denoised or raw accumulation)
+            gfx::Image* srcImage = tracer->GetAccumulationImage();
+            
+#ifdef LUCENT_ENABLE_OPTIX
+            // Apply OptiX AI denoiser if enabled
+            if (settings.denoiser == gfx::DenoiserType::OptiX && m_Renderer.IsOptiXDenoiserAvailable()) {
+                auto* denoiser = m_Renderer.GetOptiXDenoiser();
+                if (denoiser) {
+                    // OptiX denoising with albedo + normal AOV guides
+                    // Note: Full implementation requires Vulkan-CUDA interop
+                    denoiser->Denoise(
+                        tracer->GetAccumulationImage(),
+                        tracer->GetAlbedoImage(),
+                        tracer->GetNormalImage(),
+                        offscreen, cmd, VK_NULL_HANDLE, VK_NULL_HANDLE
+                    );
+                }
+            }
+#endif
+            
             // Transition offscreen to transfer dst (from SHADER_READ_ONLY_OPTIMAL after EndOffscreenPass)
             offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             
             // Transition accumulation to transfer src
-            tracer->GetAccumulationImage()->TransitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            srcImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             
             // Blit accumulation to offscreen
             VkImageBlit blitRegion{};
@@ -466,12 +534,12 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
             blitRegion.dstOffsets[1] = { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 };
             
             vkCmdBlitImage(cmd, 
-                tracer->GetAccumulationImage()->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                srcImage->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 offscreen->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 1, &blitRegion, VK_FILTER_NEAREST);
             
             // Transition back to shader read for composite pass
-            tracer->GetAccumulationImage()->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+            srcImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
             offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
     } else if (renderMode == gfx::RenderMode::RayTraced &&
@@ -495,11 +563,31 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
         // Copy accumulation image to offscreen for display
         gfx::TracerRayKHR* tracer = m_Renderer.GetTracerRayKHR();
         if (tracer && tracer->GetAccumulationImage() && tracer->GetAccumulationImage()->GetHandle() != VK_NULL_HANDLE) {
+            // Determine which image to blit from (denoised or raw accumulation)
+            gfx::Image* srcImage = tracer->GetAccumulationImage();
+            
+#ifdef LUCENT_ENABLE_OPTIX
+            // Apply OptiX AI denoiser if enabled
+            if (settings.denoiser == gfx::DenoiserType::OptiX && m_Renderer.IsOptiXDenoiserAvailable()) {
+                auto* denoiser = m_Renderer.GetOptiXDenoiser();
+                if (denoiser) {
+                    // OptiX denoising with albedo + normal AOV guides
+                    // Note: Full implementation requires Vulkan-CUDA interop
+                    denoiser->Denoise(
+                        tracer->GetAccumulationImage(),
+                        tracer->GetAlbedoImage(),
+                        tracer->GetNormalImage(),
+                        offscreen, cmd, VK_NULL_HANDLE, VK_NULL_HANDLE
+                    );
+                }
+            }
+#endif
+            
             // Transition offscreen to transfer dst (from SHADER_READ_ONLY_OPTIMAL after EndOffscreenPass)
             offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             
             // Transition accumulation to transfer src
-            tracer->GetAccumulationImage()->TransitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            srcImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             
             // Blit accumulation to offscreen
             VkImageBlit blitRegion{};
@@ -511,12 +599,12 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
             blitRegion.dstOffsets[1] = { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 };
             
             vkCmdBlitImage(cmd, 
-                tracer->GetAccumulationImage()->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                srcImage->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 offscreen->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 1, &blitRegion, VK_FILTER_NEAREST);
             
             // Transition back to shader read for composite pass
-            tracer->GetAccumulationImage()->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+            srcImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
             offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
     } else {

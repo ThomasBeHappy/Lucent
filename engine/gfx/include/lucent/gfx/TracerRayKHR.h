@@ -92,6 +92,10 @@ public:
     // Get accumulation image
     Image* GetAccumulationImage() { return &m_AccumulationImage; }
     
+    // Get AOV images for denoiser
+    Image* GetAlbedoImage() { return &m_AlbedoImage; }
+    Image* GetNormalImage() { return &m_NormalImage; }
+    
     bool IsReady() const { return m_Ready; }
     
 private:
@@ -154,8 +158,10 @@ private:
     VkStridedDeviceAddressRegionKHR m_HitRegion{};
     VkStridedDeviceAddressRegionKHR m_CallableRegion{};
     
-    // Accumulation
+    // Accumulation and AOV images
     Image m_AccumulationImage;
+    Image m_AlbedoImage;   // First-hit albedo for denoiser
+    Image m_NormalImage;   // First-hit normal for denoiser
     Buffer m_CameraBuffer;
     uint32_t m_AccumWidth = 0;
     uint32_t m_AccumHeight = 0;
