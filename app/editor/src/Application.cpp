@@ -442,8 +442,8 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
         // Copy accumulation image to offscreen for display
         gfx::TracerCompute* tracer = m_Renderer.GetTracerCompute();
         if (tracer && tracer->GetAccumulationImage() && tracer->GetAccumulationImage()->GetHandle() != VK_NULL_HANDLE) {
-            // Transition offscreen to transfer dst
-            offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            // Transition offscreen to transfer dst (from SHADER_READ_ONLY_OPTIMAL after EndOffscreenPass)
+            offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             
             // Transition accumulation to transfer src
             tracer->GetAccumulationImage()->TransitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -462,7 +462,7 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
                 offscreen->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 1, &blitRegion, VK_FILTER_NEAREST);
             
-            // Transition back
+            // Transition back to shader read for composite pass
             tracer->GetAccumulationImage()->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
             offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }

@@ -303,6 +303,7 @@ bool TracerCompute::CreateAccumulationImage(uint32_t width, uint32_t height) {
     
     m_AccumWidth = width;
     m_AccumHeight = height;
+    m_DescriptorsDirty = true;  // Accumulation image changed, need to update descriptors
     
     LUCENT_CORE_DEBUG("TracerCompute accumulation image created: {}x{}", width, height);
     return true;
@@ -503,6 +504,7 @@ void TracerCompute::UpdateScene(const std::vector<BVHBuilder::Triangle>& inputTr
     m_SceneGPU.valid = true;
     
     m_SceneDirty = false;
+    m_DescriptorsDirty = true;  // Scene buffers changed, need to update descriptors
     
     LUCENT_CORE_INFO("TracerCompute scene updated: {} triangles, {} BVH nodes, {} materials",
         m_SceneGPU.triangleCount, m_SceneGPU.bvhNodeCount, m_SceneGPU.materialCount);
@@ -527,13 +529,18 @@ void TracerCompute::Trace(VkCommandBuffer cmd,
         if (!CreateDescriptorSets()) {
             return;
         }
+        m_DescriptorsDirty = true;
     }
     
-    // Update camera UBO
+    // Update camera UBO (buffer contents, not descriptor)
     m_CameraBuffer.Upload(&camera, sizeof(GPUCamera));
     
-    // Update descriptors
-    UpdateDescriptors();
+    // Only update descriptors when they actually changed (scene updated, image resized)
+    // Updating every frame causes validation errors when descriptor is still in use
+    if (m_DescriptorsDirty) {
+        UpdateDescriptors();
+        m_DescriptorsDirty = false;
+    }
     
     // Bind pipeline
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_Pipeline);

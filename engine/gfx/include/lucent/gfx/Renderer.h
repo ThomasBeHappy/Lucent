@@ -229,6 +229,9 @@ private:
     VkFramebuffer m_OffscreenFramebuffer = VK_NULL_HANDLE;
     std::vector<VkFramebuffer> m_SwapchainFramebuffers;
     
+    // Per-swapchain-image semaphores (to avoid semaphore reuse before present completes)
+    std::vector<VkSemaphore> m_ImageRenderFinishedSemaphores;
+    
     // Shadow mapping
     static constexpr uint32_t SHADOW_MAP_SIZE = 2048;
     Image m_ShadowMap;

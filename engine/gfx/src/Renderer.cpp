@@ -48,6 +48,17 @@ bool Renderer::Init(VulkanContext* context, Device* device, const RendererConfig
         return false;
     }
     
+    // Create per-swapchain-image semaphores to avoid semaphore reuse before present completes
+    m_ImageRenderFinishedSemaphores.resize(m_Swapchain.GetImageCount());
+    VkSemaphoreCreateInfo semaphoreInfo{};
+    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    for (size_t i = 0; i < m_ImageRenderFinishedSemaphores.size(); i++) {
+        if (vkCreateSemaphore(context->GetDevice(), &semaphoreInfo, nullptr, &m_ImageRenderFinishedSemaphores[i]) != VK_SUCCESS) {
+            LUCENT_CORE_ERROR("Failed to create per-image semaphore");
+            return false;
+        }
+    }
+    
     if (!CreateOffscreenResources()) {
         LUCENT_CORE_ERROR("Failed to create offscreen resources");
         return false;
@@ -207,10 +218,10 @@ void Renderer::EndFrame() {
         return;
     }
     
-    // Submit
+    // Submit - use per-image semaphore for present to avoid reuse before present completes
     VkSemaphore waitSemaphores[] = { frame.imageAvailableSemaphore };
     VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
-    VkSemaphore signalSemaphores[] = { frame.renderFinishedSemaphore };
+    VkSemaphore renderFinishedSemaphore = m_ImageRenderFinishedSemaphores[m_CurrentImageIndex];
     
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -220,7 +231,7 @@ void Renderer::EndFrame() {
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
     submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores = signalSemaphores;
+    submitInfo.pSignalSemaphores = &renderFinishedSemaphore;
     
     if (vkQueueSubmit(m_Context->GetGraphicsQueue(), 1, &submitInfo, frame.inFlightFence) != VK_SUCCESS) {
         LUCENT_CORE_ERROR("Failed to submit command buffer");
@@ -228,7 +239,7 @@ void Renderer::EndFrame() {
     }
     
     // Present
-    if (!m_Swapchain.Present(frame.renderFinishedSemaphore, m_CurrentImageIndex)) {
+    if (!m_Swapchain.Present(renderFinishedSemaphore, m_CurrentImageIndex)) {
         if (m_Swapchain.NeedsRecreate()) {
             m_NeedsResize = true;
         }
@@ -308,7 +319,8 @@ bool Renderer::CreateOffscreenResources() {
     colorDesc.width = extent.width;
     colorDesc.height = extent.height;
     colorDesc.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-    colorDesc.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    colorDesc.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | 
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     colorDesc.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     colorDesc.debugName = "OffscreenColor";
     
@@ -330,8 +342,9 @@ bool Renderer::CreateOffscreenResources() {
     }
     
     // Transition images to correct layouts
+    // Note: Offscreen color starts in SHADER_READ_ONLY_OPTIMAL so BeginOffscreenPass can transition it properly
     m_Device->ImmediateSubmit([this](VkCommandBuffer cmd) {
-        m_OffscreenColor.TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        m_OffscreenColor.TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         m_OffscreenDepth.TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     });
     
@@ -692,6 +705,14 @@ bool Renderer::CreatePipelines() {
 void Renderer::DestroyFrameResources() {
     VkDevice device = m_Context->GetDevice();
     
+    // Destroy per-image semaphores
+    for (auto semaphore : m_ImageRenderFinishedSemaphores) {
+        if (semaphore != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device, semaphore, nullptr);
+        }
+    }
+    m_ImageRenderFinishedSemaphores.clear();
+    
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         FrameData& frame = m_Frames[i];
         
@@ -858,10 +879,26 @@ void Renderer::RecreateSwapchain() {
     
     if (width == 0 || height == 0) return;
     
+    // Destroy old per-image semaphores
+    for (auto semaphore : m_ImageRenderFinishedSemaphores) {
+        if (semaphore != VK_NULL_HANDLE) {
+            vkDestroySemaphore(m_Context->GetDevice(), semaphore, nullptr);
+        }
+    }
+    m_ImageRenderFinishedSemaphores.clear();
+    
     // Recreate swapchain
     if (!m_Swapchain.Recreate(width, height)) {
         LUCENT_CORE_ERROR("Failed to recreate swapchain");
         return;
+    }
+    
+    // Recreate per-image semaphores
+    m_ImageRenderFinishedSemaphores.resize(m_Swapchain.GetImageCount());
+    VkSemaphoreCreateInfo semaphoreInfo{};
+    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    for (size_t i = 0; i < m_ImageRenderFinishedSemaphores.size(); i++) {
+        vkCreateSemaphore(m_Context->GetDevice(), &semaphoreInfo, nullptr, &m_ImageRenderFinishedSemaphores[i]);
     }
     
     // Recreate offscreen resources

@@ -149,6 +149,7 @@ private:
     // Scene data
     SceneGPU m_SceneGPU;
     bool m_SceneDirty = true;
+    bool m_DescriptorsDirty = true;  // Only update descriptors when needed
     
     // Compute pipeline
     VkDescriptorSetLayout m_DescriptorLayout = VK_NULL_HANDLE;

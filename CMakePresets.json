@@ -19,7 +19,8 @@
             },
             "cacheVariables": {
                 "CMAKE_CXX_STANDARD": "20",
-                "VCPKG_TARGET_TRIPLET": "x64-windows"
+                "VCPKG_TARGET_TRIPLET": "x64-windows",
+                "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/triplets"
             },
             "generator": "Visual Studio 17 2022",
             "architecture": "x64"
@@ -37,7 +38,8 @@
             },
             "cacheVariables": {
                 "CMAKE_CXX_STANDARD": "20",
-                "VCPKG_TARGET_TRIPLET": "x64-windows"
+                "VCPKG_TARGET_TRIPLET": "x64-windows",
+                "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/triplets"
             },
             "generator": "Ninja"
         },

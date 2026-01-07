@@ -290,6 +290,10 @@ bool VulkanContext::CreateLogicalDevice(const VulkanContextConfig& config) {
         uniqueQueueFamilies.insert(m_QueueFamilies.compute);
     }
     
+    if (m_QueueFamilies.transfer != UINT32_MAX) {
+        uniqueQueueFamilies.insert(m_QueueFamilies.transfer);
+    }
+    
     float queuePriority = 1.0f;
     for (uint32_t queueFamily : uniqueQueueFamilies) {
         VkDeviceQueueCreateInfo queueCreateInfo{};
@@ -330,6 +334,7 @@ bool VulkanContext::CreateLogicalDevice(const VulkanContextConfig& config) {
     // Build feature chain
     VkPhysicalDeviceFeatures2 deviceFeatures2{};
     deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    deviceFeatures2.features.fillModeNonSolid = VK_TRUE;  // Enable wireframe mode
     
     // Vulkan 1.2 features - only request if device supports them
     VkPhysicalDeviceVulkan12Features vulkan12Features{};
@@ -406,6 +411,12 @@ bool VulkanContext::CreateLogicalDevice(const VulkanContextConfig& config) {
         vkGetDeviceQueue(m_Device, m_QueueFamilies.compute, 0, &m_ComputeQueue);
     } else {
         m_ComputeQueue = m_GraphicsQueue;
+    }
+    
+    if (m_QueueFamilies.transfer != UINT32_MAX) {
+        vkGetDeviceQueue(m_Device, m_QueueFamilies.transfer, 0, &m_TransferQueue);
+    } else {
+        m_TransferQueue = m_GraphicsQueue;
     }
     
     LUCENT_CORE_INFO("Logical device created");

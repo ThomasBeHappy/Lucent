@@ -71,6 +71,7 @@ public:
     VkQueue GetGraphicsQueue() const { return m_GraphicsQueue; }
     VkQueue GetPresentQueue() const { return m_PresentQueue; }
     VkQueue GetComputeQueue() const { return m_ComputeQueue; }
+    VkQueue GetTransferQueue() const { return m_TransferQueue; }
     
     const QueueFamilyIndices& GetQueueFamilies() const { return m_QueueFamilies; }
     const DeviceFeatures& GetDeviceFeatures() const { return m_DeviceFeatures; }
@@ -108,6 +109,7 @@ private:
     VkQueue m_GraphicsQueue = VK_NULL_HANDLE;
     VkQueue m_PresentQueue = VK_NULL_HANDLE;
     VkQueue m_ComputeQueue = VK_NULL_HANDLE;
+    VkQueue m_TransferQueue = VK_NULL_HANDLE;
     
     QueueFamilyIndices m_QueueFamilies;
     DeviceFeatures m_DeviceFeatures;
