@@ -93,6 +93,28 @@ bool Renderer::Init(VulkanContext* context, Device* device, const RendererConfig
         }
     }
     
+    // Initialize KHR ray tracer if RayTraced mode is available
+    if (m_Capabilities.rayTracedAvailable) {
+        m_TracerRayKHR = std::make_unique<TracerRayKHR>();
+        if (!m_TracerRayKHR->Init(m_Context, m_Device)) {
+            LUCENT_CORE_WARN("Failed to initialize KHR ray tracer, RayTraced mode disabled");
+            m_TracerRayKHR.reset();
+            m_Capabilities.rayTracedAvailable = false;
+            if (m_RenderMode == RenderMode::RayTraced) {
+                m_RenderMode = m_Capabilities.tracedAvailable ? RenderMode::Traced : RenderMode::Simple;
+            }
+        }
+    }
+    
+    // Initialize final render (always available if any tracer is available)
+    if (m_Capabilities.tracedAvailable || m_Capabilities.rayTracedAvailable) {
+        m_FinalRender = std::make_unique<FinalRender>();
+        if (!m_FinalRender->Init(this)) {
+            LUCENT_CORE_WARN("Failed to initialize final render");
+            m_FinalRender.reset();
+        }
+    }
+    
     LUCENT_CORE_INFO("Renderer initialized");
     return true;
 }
@@ -102,10 +124,20 @@ void Renderer::Shutdown() {
     
     m_Context->WaitIdle();
     
-    // Shutdown tracer
+    // Shutdown tracers
     if (m_TracerCompute) {
         m_TracerCompute->Shutdown();
         m_TracerCompute.reset();
+    }
+    
+    if (m_TracerRayKHR) {
+        m_TracerRayKHR->Shutdown();
+        m_TracerRayKHR.reset();
+    }
+    
+    if (m_FinalRender) {
+        m_FinalRender->Shutdown();
+        m_FinalRender.reset();
     }
     
     DestroyShadowResources();

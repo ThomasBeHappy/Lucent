@@ -1,0 +1,352 @@
+#include "lucent/gfx/FinalRender.h"
+#include "lucent/gfx/Renderer.h"
+#include "lucent/gfx/TracerCompute.h"
+#include "lucent/gfx/TracerRayKHR.h"
+#include "lucent/core/Log.h"
+#include <GLFW/glfw3.h>
+#include <fstream>
+#include <cmath>
+
+// stb_image_write for PNG export
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
+
+namespace lucent::gfx {
+
+FinalRender::~FinalRender() {
+    Shutdown();
+}
+
+bool FinalRender::Init(Renderer* renderer) {
+    m_Renderer = renderer;
+    LUCENT_CORE_INFO("FinalRender initialized");
+    return true;
+}
+
+void FinalRender::Shutdown() {
+    Cancel();
+    DestroyRenderResources();
+    m_Renderer = nullptr;
+}
+
+bool FinalRender::Start(const FinalRenderConfig& config, const GPUCamera& camera,
+                         const std::vector<BVHBuilder::Triangle>& triangles,
+                         const std::vector<GPUMaterial>& materials) {
+    if (m_Status == FinalRenderStatus::Rendering) {
+        LUCENT_CORE_WARN("FinalRender: Already rendering");
+        return false;
+    }
+    
+    m_Config = config;
+    m_Camera = camera;
+    m_Camera.resolution = glm::vec2(config.width, config.height);
+    m_Triangles = triangles;
+    m_Materials = materials;
+    
+    // Create render resources
+    if (!CreateRenderResources()) {
+        LUCENT_CORE_ERROR("FinalRender: Failed to create render resources");
+        m_Status = FinalRenderStatus::Failed;
+        return false;
+    }
+    
+    // Update tracer scene
+    if (m_Config.useRayTracing && m_Renderer->GetTracerRayKHR() && m_Renderer->GetTracerRayKHR()->IsSupported()) {
+        m_Renderer->GetTracerRayKHR()->UpdateScene(triangles, materials);
+        m_Renderer->GetTracerRayKHR()->ResetAccumulation();
+    } else if (m_Renderer->GetTracerCompute()) {
+        m_Renderer->GetTracerCompute()->UpdateScene(triangles, materials);
+        m_Renderer->GetTracerCompute()->ResetAccumulation();
+    } else {
+        LUCENT_CORE_ERROR("FinalRender: No tracer available");
+        m_Status = FinalRenderStatus::Failed;
+        return false;
+    }
+    
+    m_CurrentSample = 0;
+    m_StartTime = glfwGetTime();
+    m_CancelRequested = false;
+    m_Status = FinalRenderStatus::Rendering;
+    
+    LUCENT_CORE_INFO("FinalRender: Started {}x{}, {} samples", 
+        config.width, config.height, config.samples);
+    
+    return true;
+}
+
+void FinalRender::Cancel() {
+    if (m_Status == FinalRenderStatus::Rendering) {
+        m_CancelRequested = true;
+        m_Status = FinalRenderStatus::Cancelled;
+        LUCENT_CORE_INFO("FinalRender: Cancelled");
+    }
+}
+
+bool FinalRender::RenderSample() {
+    if (m_Status != FinalRenderStatus::Rendering) {
+        return false;
+    }
+    
+    if (m_CancelRequested) {
+        m_Status = FinalRenderStatus::Cancelled;
+        return false;
+    }
+    
+    if (m_CurrentSample >= m_Config.samples) {
+        // Apply tonemapping and finalize
+        ApplyTonemap();
+        m_Status = FinalRenderStatus::Completed;
+        
+        float elapsed = GetElapsedTime();
+        LUCENT_CORE_INFO("FinalRender: Completed in {:.2f}s ({:.2f}ms/sample)", 
+            elapsed, elapsed * 1000.0f / m_Config.samples);
+        
+        // Auto-save if path is set
+        if (!m_Config.outputPath.empty()) {
+            ExportImage(m_Config.outputPath);
+        }
+        
+        return false;
+    }
+    
+    // Create render settings for this sample
+    RenderSettings settings;
+    settings.activeMode = m_Config.useRayTracing ? RenderMode::RayTraced : RenderMode::Traced;
+    settings.maxBounces = m_Config.maxBounces;
+    settings.clampIndirect = 10.0f;
+    settings.accumulatedSamples = m_CurrentSample;
+    settings.viewportSamples = m_Config.samples;
+    
+    // Record command buffer
+    VkCommandBuffer cmd = m_Renderer->GetDevice()->BeginSingleTimeCommands();
+    
+    // Trace one sample
+    if (m_Config.useRayTracing && m_Renderer->GetTracerRayKHR() && m_Renderer->GetTracerRayKHR()->IsSupported()) {
+        m_Renderer->GetTracerRayKHR()->Trace(cmd, m_Camera, settings, &m_AccumImage);
+    } else if (m_Renderer->GetTracerCompute()) {
+        m_Renderer->GetTracerCompute()->Trace(cmd, m_Camera, settings, &m_AccumImage);
+    }
+    
+    m_Renderer->GetDevice()->EndSingleTimeCommands(cmd);
+    
+    m_CurrentSample++;
+    
+    // Call progress callback
+    if (m_ProgressCallback) {
+        m_ProgressCallback(m_CurrentSample, m_Config.samples, GetElapsedTime());
+    }
+    
+    return true;
+}
+
+float FinalRender::GetProgress() const {
+    if (m_Config.samples == 0) return 0.0f;
+    return static_cast<float>(m_CurrentSample) / static_cast<float>(m_Config.samples);
+}
+
+float FinalRender::GetElapsedTime() const {
+    return static_cast<float>(glfwGetTime() - m_StartTime);
+}
+
+bool FinalRender::CreateRenderResources() {
+    Device* device = m_Renderer->GetDevice();
+    
+    // Create accumulation image
+    ImageDesc accumDesc{};
+    accumDesc.width = m_Config.width;
+    accumDesc.height = m_Config.height;
+    accumDesc.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    accumDesc.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    accumDesc.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    accumDesc.debugName = "FinalRenderAccum";
+    
+    m_AccumImage.Shutdown();
+    if (!m_AccumImage.Init(device, accumDesc)) {
+        return false;
+    }
+    
+    // Transition to general layout
+    VkCommandBuffer cmd = device->BeginSingleTimeCommands();
+    m_AccumImage.TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    device->EndSingleTimeCommands(cmd);
+    
+    // Create tonemapped output image
+    ImageDesc renderDesc{};
+    renderDesc.width = m_Config.width;
+    renderDesc.height = m_Config.height;
+    renderDesc.format = VK_FORMAT_R8G8B8A8_UNORM;
+    renderDesc.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    renderDesc.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    renderDesc.debugName = "FinalRenderOutput";
+    
+    m_RenderImage.Shutdown();
+    if (!m_RenderImage.Init(device, renderDesc)) {
+        return false;
+    }
+    
+    // Allocate CPU buffer
+    m_PixelBuffer.resize(m_Config.width * m_Config.height * 4);
+    
+    return true;
+}
+
+void FinalRender::DestroyRenderResources() {
+    m_AccumImage.Shutdown();
+    m_RenderImage.Shutdown();
+    m_PixelBuffer.clear();
+}
+
+bool FinalRender::ApplyTonemap() {
+    // For simplicity, we'll read back the HDR image and tonemap on CPU
+    // A more efficient implementation would use a compute shader
+    
+    Device* device = m_Renderer->GetDevice();
+    
+    // Create staging buffer for readback
+    VkDeviceSize imageSize = m_Config.width * m_Config.height * sizeof(float) * 4;
+    
+    BufferDesc stagingDesc{};
+    stagingDesc.size = imageSize;
+    stagingDesc.usage = BufferUsage::Staging;
+    stagingDesc.hostVisible = true;
+    stagingDesc.debugName = "FinalRenderStaging";
+    
+    Buffer stagingBuffer;
+    if (!stagingBuffer.Init(device, stagingDesc)) {
+        return false;
+    }
+    
+    // Copy image to staging buffer
+    VkCommandBuffer cmd = device->BeginSingleTimeCommands();
+    
+    // Transition accum image for transfer
+    m_AccumImage.TransitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {m_Config.width, m_Config.height, 1};
+    
+    vkCmdCopyImageToBuffer(cmd, m_AccumImage.GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            stagingBuffer.GetHandle(), 1, &region);
+    
+    device->EndSingleTimeCommands(cmd);
+    
+    // Read back and tonemap
+    float* hdrData = static_cast<float*>(stagingBuffer.Map());
+    
+    for (uint32_t i = 0; i < m_Config.width * m_Config.height; i++) {
+        float r = hdrData[i * 4 + 0];
+        float g = hdrData[i * 4 + 1];
+        float b = hdrData[i * 4 + 2];
+        
+        // Apply exposure
+        r *= m_Config.exposure;
+        g *= m_Config.exposure;
+        b *= m_Config.exposure;
+        
+        // Apply tonemapping
+        switch (m_Config.tonemap) {
+            case TonemapOperator::Reinhard:
+                r = r / (1.0f + r);
+                g = g / (1.0f + g);
+                b = b / (1.0f + b);
+                break;
+                
+            case TonemapOperator::ACES: {
+                // ACES filmic tonemap
+                auto aces = [](float x) {
+                    const float a = 2.51f;
+                    const float b = 0.03f;
+                    const float c = 2.43f;
+                    const float d = 0.59f;
+                    const float e = 0.14f;
+                    return std::clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0f, 1.0f);
+                };
+                r = aces(r);
+                g = aces(g);
+                b = aces(b);
+                break;
+            }
+            
+            case TonemapOperator::None:
+            default:
+                r = std::clamp(r, 0.0f, 1.0f);
+                g = std::clamp(g, 0.0f, 1.0f);
+                b = std::clamp(b, 0.0f, 1.0f);
+                break;
+        }
+        
+        // Apply gamma
+        r = std::pow(r, 1.0f / m_Config.gamma);
+        g = std::pow(g, 1.0f / m_Config.gamma);
+        b = std::pow(b, 1.0f / m_Config.gamma);
+        
+        // Convert to 8-bit
+        m_PixelBuffer[i * 4 + 0] = static_cast<uint8_t>(r * 255.0f);
+        m_PixelBuffer[i * 4 + 1] = static_cast<uint8_t>(g * 255.0f);
+        m_PixelBuffer[i * 4 + 2] = static_cast<uint8_t>(b * 255.0f);
+        m_PixelBuffer[i * 4 + 3] = 255;
+    }
+    
+    stagingBuffer.Unmap();
+    stagingBuffer.Shutdown();
+    
+    return true;
+}
+
+bool FinalRender::ExportImage(const std::string& path) {
+    if (m_PixelBuffer.empty()) {
+        LUCENT_CORE_ERROR("FinalRender: No image to export");
+        return false;
+    }
+    
+    // Determine format from extension
+    std::string ext = path.substr(path.find_last_of('.') + 1);
+    
+    int result = 0;
+    
+    if (ext == "png" || ext == "PNG") {
+        result = stbi_write_png(path.c_str(), m_Config.width, m_Config.height, 4, 
+                                 m_PixelBuffer.data(), m_Config.width * 4);
+    } else if (ext == "jpg" || ext == "jpeg" || ext == "JPG" || ext == "JPEG") {
+        result = stbi_write_jpg(path.c_str(), m_Config.width, m_Config.height, 4,
+                                 m_PixelBuffer.data(), 95);
+    } else if (ext == "bmp" || ext == "BMP") {
+        result = stbi_write_bmp(path.c_str(), m_Config.width, m_Config.height, 4,
+                                 m_PixelBuffer.data());
+    } else {
+        // Default to PNG
+        result = stbi_write_png(path.c_str(), m_Config.width, m_Config.height, 4,
+                                 m_PixelBuffer.data(), m_Config.width * 4);
+    }
+    
+    if (result) {
+        LUCENT_CORE_INFO("FinalRender: Exported to {}", path);
+        return true;
+    } else {
+        LUCENT_CORE_ERROR("FinalRender: Failed to export to {}", path);
+        return false;
+    }
+}
+
+bool FinalRender::SaveToPNG(const std::string& path) {
+    return stbi_write_png(path.c_str(), m_Config.width, m_Config.height, 4,
+                           m_PixelBuffer.data(), m_Config.width * 4) != 0;
+}
+
+bool FinalRender::SaveToEXR(const std::string& path) {
+    (void)path;  // Suppress unused parameter warning
+    // EXR export would require a library like tinyexr
+    LUCENT_CORE_WARN("FinalRender: EXR export not yet implemented");
+    return false;
+}
+
+} // namespace lucent::gfx
+

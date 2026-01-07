@@ -76,39 +76,40 @@ bool MaterialIRCompiler::Compile(const MaterialGraph& graph, MaterialIR& outIR, 
     std::unordered_map<NodeID, uint32_t> nodeToInstr;
     uint32_t nextInstrId = 1;
     
-    // Get topologically sorted nodes
-    auto sortedNodes = graph.TopologicalSort();
+    // Iterate all nodes in the graph
+    const auto& nodes = graph.GetNodes();
     
-    for (NodeID nodeId : sortedNodes) {
-        const MaterialNode* node = graph.GetNode(nodeId);
-        if (!node) continue;
-        
+    for (const auto& [nodeId, node] : nodes) {
         IRInstruction instr;
         instr.id = nextInstrId++;
         nodeToInstr[nodeId] = instr.id;
         
         // Convert node type
-        switch (node->type) {
+        switch (node.type) {
             case NodeType::ConstFloat:
                 instr.type = IRNodeType::ConstFloat;
-                instr.operands[0] = std::get<float>(node->parameter);
+                if (auto* v = std::get_if<float>(&node.parameter)) {
+                    instr.operands[0] = *v;
+                }
                 break;
                 
             case NodeType::ConstVec3:
                 instr.type = IRNodeType::ConstVec3;
-                instr.operands[0] = std::get<glm::vec3>(node->parameter);
+                if (auto* v = std::get_if<glm::vec3>(&node.parameter)) {
+                    instr.operands[0] = *v;
+                }
                 break;
                 
             case NodeType::Texture2D:
             case NodeType::NormalMap: {
-                instr.type = node->type == NodeType::Texture2D ? 
+                instr.type = node.type == NodeType::Texture2D ? 
                     IRNodeType::Texture2D : IRNodeType::NormalMap;
                     
                 // Extract texture path from parameter
-                if (auto* str = std::get_if<std::string>(&node->parameter)) {
+                if (auto* str = std::get_if<std::string>(&node.parameter)) {
                     instr.texture.path = *str;
                     instr.texture.bindingSlot = static_cast<uint32_t>(outIR.textures.size());
-                    instr.texture.isSRGB = (node->type == NodeType::Texture2D);
+                    instr.texture.isSRGB = (node.type == NodeType::Texture2D);
                     outIR.textures.push_back(instr.texture);
                 }
                 break;
@@ -130,17 +131,16 @@ bool MaterialIRCompiler::Compile(const MaterialGraph& graph, MaterialIR& outIR, 
                 instr.type = IRNodeType::Lerp;
                 break;
                 
-            case NodeType::SeparateXYZ:
+            case NodeType::SeparateVec3:
                 instr.type = IRNodeType::SeparateRGB;
                 break;
                 
-            case NodeType::CombineXYZ:
+            case NodeType::CombineVec3:
                 instr.type = IRNodeType::CombineRGB;
                 break;
                 
             case NodeType::Noise:
                 instr.type = IRNodeType::Noise;
-                // Noise parameters would be extracted here
                 instr.noiseScale = 1.0f;
                 instr.noiseOctaves = 4;
                 break;
@@ -149,94 +149,57 @@ bool MaterialIRCompiler::Compile(const MaterialGraph& graph, MaterialIR& outIR, 
                 instr.type = IRNodeType::Fresnel;
                 break;
                 
-            case NodeType::ColorRamp: {
+            case NodeType::ColorRamp:
                 instr.type = IRNodeType::ColorRamp;
-                // Parse color ramp stops from parameter
-                if (auto* str = std::get_if<std::string>(&node->parameter)) {
-                    // Parse RAMP: format from ColorRampStops
-                    // This is a simplified version - full implementation would parse the stops
-                }
                 break;
-            }
-            
-            case NodeType::OutputPBR:
+                
+            case NodeType::PBROutput:
                 instr.type = IRNodeType::OutputPBR;
-                // Map connected inputs to PBR outputs
                 break;
                 
             default:
-                // Unsupported node type
-                errorMsg = "Unsupported node type: " + std::to_string(static_cast<int>(node->type));
+                // Unsupported node type - use constant fallback
+                errorMsg = "Unsupported node type: " + std::to_string(static_cast<int>(node.type));
                 LUCENT_CORE_WARN("MaterialIR: {}", errorMsg);
-                // Continue with a constant fallback
                 instr.type = IRNodeType::ConstFloat;
                 instr.operands[0] = 0.5f;
                 break;
         }
         
-        // Resolve input connections
-        for (const auto& [inputPinId, outputPinId] : graph.GetLinks()) {
-            // Find if this link connects to one of our input pins
-            const MaterialPin* inputPin = graph.GetPin(inputPinId);
-            const MaterialPin* outputPin = graph.GetPin(outputPinId);
-            
-            if (inputPin && inputPin->nodeId == nodeId) {
-                // This node receives input from outputPin's node
-                if (outputPin) {
-                    auto srcIt = nodeToInstr.find(outputPin->nodeId);
-                    if (srcIt != nodeToInstr.end()) {
-                        // Store reference to source instruction
-                        // Map input pin index to operand index
-                        // (simplified - full version would track pin indices)
-                        instr.operands[0] = srcIt->second;
-                    }
-                }
-            }
-        }
-        
         outIR.instructions.push_back(instr);
         
-        // Track PBR output connections
-        if (node->type == NodeType::OutputPBR) {
-            // The OutputPBR node itself is the output marker
-            // We need to trace back its input connections
-            for (const auto& pin : node->inputs) {
-                if (pin.name == "Base Color") {
-                    // Find what's connected to this pin
-                    for (const auto& link : graph.GetLinks()) {
-                        if (link.inputPinId == pin.id) {
-                            const MaterialPin* srcPin = graph.GetPin(link.outputPinId);
-                            if (srcPin && nodeToInstr.count(srcPin->nodeId)) {
-                                outIR.output.baseColorInstr = nodeToInstr[srcPin->nodeId];
-                            }
-                        }
-                    }
-                } else if (pin.name == "Metallic") {
-                    for (const auto& link : graph.GetLinks()) {
-                        if (link.inputPinId == pin.id) {
-                            const MaterialPin* srcPin = graph.GetPin(link.outputPinId);
-                            if (srcPin && nodeToInstr.count(srcPin->nodeId)) {
-                                outIR.output.metallicInstr = nodeToInstr[srcPin->nodeId];
-                            }
-                        }
-                    }
-                } else if (pin.name == "Roughness") {
-                    for (const auto& link : graph.GetLinks()) {
-                        if (link.inputPinId == pin.id) {
-                            const MaterialPin* srcPin = graph.GetPin(link.outputPinId);
-                            if (srcPin && nodeToInstr.count(srcPin->nodeId)) {
-                                outIR.output.roughnessInstr = nodeToInstr[srcPin->nodeId];
-                            }
-                        }
-                    }
-                } else if (pin.name == "Emissive") {
-                    for (const auto& link : graph.GetLinks()) {
-                        if (link.inputPinId == pin.id) {
-                            const MaterialPin* srcPin = graph.GetPin(link.outputPinId);
-                            if (srcPin && nodeToInstr.count(srcPin->nodeId)) {
-                                outIR.output.emissiveInstr = nodeToInstr[srcPin->nodeId];
-                            }
-                        }
+        // Track PBR output node
+        if (node.type == NodeType::PBROutput) {
+            // Try to find connected inputs by looking at links
+            const auto& links = graph.GetLinks();
+            
+            // Find pins that belong to this node
+            const auto& pins = graph.GetPins();
+            for (const auto& [pinId, pin] : pins) {
+                if (pin.nodeId != nodeId || pin.direction != PinDirection::Input) continue;
+                
+                // Find link that ends at this pin
+                for (const auto& [linkId, link] : links) {
+                    if (link.endPinId != pinId) continue;
+                    
+                    // Find source pin and its node
+                    auto srcPinIt = pins.find(link.startPinId);
+                    if (srcPinIt == pins.end()) continue;
+                    
+                    auto srcNodeIt = nodeToInstr.find(srcPinIt->second.nodeId);
+                    if (srcNodeIt == nodeToInstr.end()) continue;
+                    
+                    // Map pin name to output
+                    if (pin.name == "Base Color") {
+                        outIR.output.baseColorInstr = srcNodeIt->second;
+                    } else if (pin.name == "Metallic") {
+                        outIR.output.metallicInstr = srcNodeIt->second;
+                    } else if (pin.name == "Roughness") {
+                        outIR.output.roughnessInstr = srcNodeIt->second;
+                    } else if (pin.name == "Emissive") {
+                        outIR.output.emissiveInstr = srcNodeIt->second;
+                    } else if (pin.name == "Normal") {
+                        outIR.output.normalInstr = srcNodeIt->second;
                     }
                 }
             }
@@ -248,13 +211,10 @@ bool MaterialIRCompiler::Compile(const MaterialGraph& graph, MaterialIR& outIR, 
 
 bool MaterialIRCompiler::IsTracedCompatible(const MaterialGraph& graph) {
     // Check if all nodes in the graph are supported in traced mode
-    auto sortedNodes = graph.TopologicalSort();
+    const auto& nodes = graph.GetNodes();
     
-    for (NodeID nodeId : sortedNodes) {
-        const MaterialNode* node = graph.GetNode(nodeId);
-        if (!node) continue;
-        
-        switch (node->type) {
+    for (const auto& [nodeId, node] : nodes) {
+        switch (node.type) {
             // Supported nodes
             case NodeType::ConstFloat:
             case NodeType::ConstVec3:
@@ -264,12 +224,12 @@ bool MaterialIRCompiler::IsTracedCompatible(const MaterialGraph& graph) {
             case NodeType::Add:
             case NodeType::Multiply:
             case NodeType::Lerp:
-            case NodeType::SeparateXYZ:
-            case NodeType::CombineXYZ:
+            case NodeType::SeparateVec3:
+            case NodeType::CombineVec3:
             case NodeType::Noise:
             case NodeType::Fresnel:
             case NodeType::ColorRamp:
-            case NodeType::OutputPBR:
+            case NodeType::PBROutput:
             case NodeType::Remap:
             case NodeType::Step:
             case NodeType::Smoothstep:
@@ -287,4 +247,3 @@ bool MaterialIRCompiler::IsTracedCompatible(const MaterialGraph& graph) {
 }
 
 } // namespace lucent::material
-

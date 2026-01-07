@@ -9,6 +9,8 @@
 #include "lucent/gfx/RenderCapabilities.h"
 #include "lucent/gfx/RenderSettings.h"
 #include "lucent/gfx/TracerCompute.h"
+#include "lucent/gfx/TracerRayKHR.h"
+#include "lucent/gfx/FinalRender.h"
 #include <glm/glm.hpp>
 #include <vector>
 #include <memory>
@@ -54,6 +56,8 @@ public:
     Swapchain* GetSwapchain() { return &m_Swapchain; }
     Image* GetOffscreenImage() { return &m_OffscreenColor; }
     Image* GetDepthImage() { return &m_OffscreenDepth; }
+    Device* GetDevice() { return m_Device; }
+    VulkanContext* GetContext() { return m_Context; }
     
     VkDescriptorSet GetCompositeDescriptorSet() const { return m_CompositeDescriptorSet; }
     VkPipeline GetCompositePipeline() const { return m_CompositePipeline; }
@@ -85,6 +89,8 @@ public:
     
     // Tracer access
     TracerCompute* GetTracerCompute() { return m_TracerCompute.get(); }
+    TracerRayKHR* GetTracerRayKHR() { return m_TracerRayKHR.get(); }
+    FinalRender* GetFinalRender() { return m_FinalRender.get(); }
     
     // Post-processing
     VkPipeline GetPostFXPipeline() const { return m_PostFXPipeline; }
@@ -210,6 +216,12 @@ private:
     
     // Compute tracer (for Traced mode)
     std::unique_ptr<TracerCompute> m_TracerCompute;
+    
+    // KHR ray tracer (for RayTraced mode)
+    std::unique_ptr<TracerRayKHR> m_TracerRayKHR;
+    
+    // Final render (for image export)
+    std::unique_ptr<FinalRender> m_FinalRender;
     
     // Legacy render pass support (Vulkan 1.1/1.2 fallback)
     VkRenderPass m_OffscreenRenderPass = VK_NULL_HANDLE;

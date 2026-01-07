@@ -10,6 +10,8 @@ add_library(engine_gfx STATIC
     src/DebugUtils.cpp
     src/RenderCapabilities.cpp
     src/TracerCompute.cpp
+    src/TracerRayKHR.cpp
+    src/FinalRender.cpp
 )
 
 target_include_directories(engine_gfx
