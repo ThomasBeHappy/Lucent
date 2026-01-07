@@ -259,57 +259,101 @@ bool OptiXDenoiser::Denoise(
     VkSemaphore /*waitSemaphore*/,
     VkSemaphore /*signalSemaphore*/)
 {
-    if (!m_Initialized || !inputColor || !output) return false;
+    if (!m_Initialized || !inputColor) return false;
     
     uint32_t width = inputColor->GetWidth();
     uint32_t height = inputColor->GetHeight();
-    size_t pixelCount = static_cast<size_t>(width) * height;
-    size_t bufferSize = pixelCount * 4 * sizeof(float);
+    size_t bufferSize = static_cast<size_t>(width) * height * 4 * sizeof(float);
     
     // Resize CUDA buffers if needed
     if (width != m_Width || height != m_Height) {
         if (!Resize(width, height)) {
             return false;
         }
+        // Also resize/recreate shared images
+        ResizeSharedImages(width, height);
     }
     
-    // Allocate CPU staging memory if needed
-    if (m_StagingBufferSize < bufferSize) {
-        m_StagingBuffer.reset(new float[pixelCount * 4]);
-        m_StagingBufferSize = bufferSize;
+    // Ensure shared images exist
+    if (m_SharedColor.vkImage == VK_NULL_HANDLE) {
+        ResizeSharedImages(width, height);
     }
     
-    // We need to synchronize: the tracer has written to images on GPU
-    // Ensure all prior GPU work is complete before we can read the images
-    m_Context->WaitIdle();
-    
-    // Download color image from Vulkan to CPU, then upload to CUDA
-    if (!DownloadImageToCuda(inputColor, m_ColorBuffer, width, height, cmd)) {
-        LUCENT_CORE_WARN("OptiXDenoiser: Failed to download color image");
+    // Check if CUDA arrays are valid (external memory export must have succeeded)
+    if (!m_SharedColor.cudaArray || !m_SharedAlbedo.cudaArray || 
+        !m_SharedNormal.cudaArray || !m_SharedOutput.cudaArray) {
+        LUCENT_CORE_WARN("OptiXDenoiser: CUDA arrays not available, skipping denoise");
         return false;
     }
     
-    // Download albedo and normal AOV guides if available
+    VkDevice device = m_Context->GetDevice();
+    
+    // ========== GPU-ONLY PATH ==========
+    // Step 1: Copy Vulkan images to shared images (GPU blit)
+    VkCommandBuffer copyCmd = m_Device->BeginSingleTimeCommands();
+    
+    // Transition shared images to transfer dst
+    TransitionImageLayout(copyCmd, m_SharedColor.vkImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    TransitionImageLayout(copyCmd, m_SharedAlbedo.vkImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    TransitionImageLayout(copyCmd, m_SharedNormal.vkImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    
+    // Transition input images to transfer src
+    inputColor->TransitionLayout(copyCmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     if (inputAlbedo && inputAlbedo->GetHandle()) {
-        DownloadImageToCuda(inputAlbedo, m_AlbedoBuffer, width, height, cmd);
-    } else {
-        // Fill with white albedo if not available
-        cudaMemset(reinterpret_cast<void*>(m_AlbedoBuffer), 0xFF, bufferSize);
+        inputAlbedo->TransitionLayout(copyCmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     }
-    
     if (inputNormal && inputNormal->GetHandle()) {
-        DownloadImageToCuda(inputNormal, m_NormalBuffer, width, height, cmd);
-    } else {
-        // Fill with up normals if not available
-        cudaMemset(reinterpret_cast<void*>(m_NormalBuffer), 0, bufferSize);
+        inputNormal->TransitionLayout(copyCmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     }
     
-    // Setup denoiser params
+    // Copy color
+    VkImageCopy copyRegion{};
+    copyRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copyRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copyRegion.extent = {width, height, 1};
+    
+    vkCmdCopyImage(copyCmd, inputColor->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        m_SharedColor.vkImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+    
+    if (inputAlbedo && inputAlbedo->GetHandle()) {
+        vkCmdCopyImage(copyCmd, inputAlbedo->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            m_SharedAlbedo.vkImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+    }
+    if (inputNormal && inputNormal->GetHandle()) {
+        vkCmdCopyImage(copyCmd, inputNormal->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            m_SharedNormal.vkImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+    }
+    
+    // Transition back
+    inputColor->TransitionLayout(copyCmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    if (inputAlbedo && inputAlbedo->GetHandle()) {
+        inputAlbedo->TransitionLayout(copyCmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    if (inputNormal && inputNormal->GetHandle()) {
+        inputNormal->TransitionLayout(copyCmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    
+    // Transition shared images to general for CUDA access
+    TransitionImageLayout(copyCmd, m_SharedColor.vkImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    TransitionImageLayout(copyCmd, m_SharedAlbedo.vkImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    TransitionImageLayout(copyCmd, m_SharedNormal.vkImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    TransitionImageLayout(copyCmd, m_SharedOutput.vkImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    
+    m_Device->EndSingleTimeCommands(copyCmd);
+    
+    // Step 2: Copy from CUDA arrays to linear buffers (GPU-to-GPU within CUDA)
+    cudaMemcpy2DFromArray(reinterpret_cast<void*>(m_ColorBuffer), width * 4 * sizeof(float),
+        m_SharedColor.cudaArray, 0, 0, width * 4 * sizeof(float), height, cudaMemcpyDeviceToDevice);
+    cudaMemcpy2DFromArray(reinterpret_cast<void*>(m_AlbedoBuffer), width * 4 * sizeof(float),
+        m_SharedAlbedo.cudaArray, 0, 0, width * 4 * sizeof(float), height, cudaMemcpyDeviceToDevice);
+    cudaMemcpy2DFromArray(reinterpret_cast<void*>(m_NormalBuffer), width * 4 * sizeof(float),
+        m_SharedNormal.cudaArray, 0, 0, width * 4 * sizeof(float), height, cudaMemcpyDeviceToDevice);
+    
+    // Step 3: Run OptiX denoiser
     OptixDenoiserParams params{};
-    params.blendFactor = 0.0f;  // 0 = fully denoised, 1 = original
+    params.blendFactor = 0.0f;
     params.hdrIntensity = m_IntensityBuffer;
     
-    // Create image descriptors
     unsigned int rowStride = width * 4 * sizeof(float);
     unsigned int pixelStride = 4 * sizeof(float);
     
@@ -321,256 +365,99 @@ bool OptiXDenoiser::Denoise(
     colorImage.pixelStrideInBytes = pixelStride;
     colorImage.format = OPTIX_PIXEL_FORMAT_FLOAT4;
     
-    // Compute HDR intensity
-    optixDenoiserComputeIntensity(
-        m_Denoiser,
-        m_CudaStream,
-        &colorImage,
-        m_IntensityBuffer,
-        m_ScratchBuffer,
-        m_DenoiserSizes.withoutOverlapScratchSizeInBytes
-    );
+    optixDenoiserComputeIntensity(m_Denoiser, m_CudaStream, &colorImage,
+        m_IntensityBuffer, m_ScratchBuffer, m_DenoiserSizes.withoutOverlapScratchSizeInBytes);
     
-    // Setup input layers
     OptixDenoiserGuideLayer guideLayer{};
-    guideLayer.albedo.data = m_AlbedoBuffer;
-    guideLayer.albedo.width = width;
-    guideLayer.albedo.height = height;
-    guideLayer.albedo.rowStrideInBytes = rowStride;
-    guideLayer.albedo.pixelStrideInBytes = pixelStride;
-    guideLayer.albedo.format = OPTIX_PIXEL_FORMAT_FLOAT4;
-    
-    guideLayer.normal.data = m_NormalBuffer;
-    guideLayer.normal.width = width;
-    guideLayer.normal.height = height;
-    guideLayer.normal.rowStrideInBytes = rowStride;
-    guideLayer.normal.pixelStrideInBytes = pixelStride;
-    guideLayer.normal.format = OPTIX_PIXEL_FORMAT_FLOAT4;
+    guideLayer.albedo = {m_AlbedoBuffer, width, height, rowStride, pixelStride, OPTIX_PIXEL_FORMAT_FLOAT4};
+    guideLayer.normal = {m_NormalBuffer, width, height, rowStride, pixelStride, OPTIX_PIXEL_FORMAT_FLOAT4};
     
     OptixDenoiserLayer layer{};
     layer.input = colorImage;
-    layer.output.data = m_OutputBuffer;
-    layer.output.width = width;
-    layer.output.height = height;
-    layer.output.rowStrideInBytes = rowStride;
-    layer.output.pixelStrideInBytes = pixelStride;
-    layer.output.format = OPTIX_PIXEL_FORMAT_FLOAT4;
+    layer.output = {m_OutputBuffer, width, height, rowStride, pixelStride, OPTIX_PIXEL_FORMAT_FLOAT4};
     
-    // Invoke denoiser
-    OptixResult res = optixDenoiserInvoke(
-        m_Denoiser,
-        m_CudaStream,
-        &params,
+    OptixResult res = optixDenoiserInvoke(m_Denoiser, m_CudaStream, &params,
         m_StateBuffer, m_DenoiserSizes.stateSizeInBytes,
-        &guideLayer,
-        &layer, 1,
-        0, 0,  // Input offset
-        m_ScratchBuffer, m_DenoiserSizes.withoutOverlapScratchSizeInBytes
-    );
+        &guideLayer, &layer, 1, 0, 0,
+        m_ScratchBuffer, m_DenoiserSizes.withoutOverlapScratchSizeInBytes);
     
     if (res != OPTIX_SUCCESS) {
         LUCENT_CORE_ERROR("OptiXDenoiser: optixDenoiserInvoke failed with error {}", static_cast<int>(res));
         return false;
     }
     
-    // Synchronize CUDA
+    // Step 4: Copy output buffer back to CUDA array (GPU-to-GPU)
+    cudaMemcpy2DToArray(m_SharedOutput.cudaArray, 0, 0, reinterpret_cast<void*>(m_OutputBuffer),
+        width * 4 * sizeof(float), width * 4 * sizeof(float), height, cudaMemcpyDeviceToDevice);
+    
     cudaStreamSynchronize(m_CudaStream);
     
-    // Upload denoised result back to the INPUT color image (we modify it in place)
-    // This way the subsequent blit will use the denoised data
-    UploadCudaToImage(m_OutputBuffer, inputColor, width, height, cmd);
+    // Step 5: Blit shared output to the OUTPUT image (handles format conversion)
+    // This preserves the accumulation buffer for future samples
+    VkCommandBuffer finalCmd = m_Device->BeginSingleTimeCommands();
     
-    return true;
-}
-
-bool OptiXDenoiser::DownloadImageToCuda(Image* image, CUdeviceptr cudaBuffer, uint32_t width, uint32_t height, VkCommandBuffer cmd) {
-    (void)cmd;  // We use synchronous copies for now
+    TransitionImageLayout(finalCmd, m_SharedOutput.vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    output->TransitionLayout(finalCmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     
-    VkDevice device = m_Context->GetDevice();
-    size_t bufferSize = static_cast<size_t>(width) * height * 4 * sizeof(float);
+    // Use blit instead of copy to handle format conversion (R32G32B32A32_SFLOAT -> R16G16B16A16_SFLOAT)
+    VkImageBlit blitRegion{};
+    blitRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blitRegion.srcOffsets[0] = {0, 0, 0};
+    blitRegion.srcOffsets[1] = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
+    blitRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blitRegion.dstOffsets[0] = {0, 0, 0};
+    blitRegion.dstOffsets[1] = {static_cast<int32_t>(output->GetWidth()), static_cast<int32_t>(output->GetHeight()), 1};
     
-    // Create a staging buffer
-    VkBufferCreateInfo bufferInfo{};
-    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = bufferSize;
-    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    vkCmdBlitImage(finalCmd, m_SharedOutput.vkImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        output->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion, VK_FILTER_LINEAR);
     
-    VkBuffer stagingBuffer;
-    if (vkCreateBuffer(device, &bufferInfo, nullptr, &stagingBuffer) != VK_SUCCESS) {
-        return false;
-    }
+    output->TransitionLayout(finalCmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    TransitionImageLayout(finalCmd, m_SharedOutput.vkImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
     
-    VkMemoryRequirements memReqs;
-    vkGetBufferMemoryRequirements(device, stagingBuffer, &memReqs);
+    m_Device->EndSingleTimeCommands(finalCmd);
     
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = m_Device->FindMemoryType(memReqs.memoryTypeBits, 
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    
-    VkDeviceMemory stagingMemory;
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &stagingMemory) != VK_SUCCESS) {
-        vkDestroyBuffer(device, stagingBuffer, nullptr);
-        return false;
-    }
-    vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0);
-    
-    // Create one-shot command buffer to copy image to buffer
-    VkCommandPool cmdPool = m_Device->GetGraphicsCommandPool();
-    VkCommandBuffer copyCmd;
-    VkCommandBufferAllocateInfo cmdAllocInfo{};
-    cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmdAllocInfo.commandPool = cmdPool;
-    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmdAllocInfo.commandBufferCount = 1;
-    vkAllocateCommandBuffers(device, &cmdAllocInfo, &copyCmd);
-    
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(copyCmd, &beginInfo);
-    
-    // Transition image to transfer src
-    image->TransitionLayout(copyCmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    
-    // Copy image to buffer
-    VkBufferImageCopy region{};
-    region.bufferOffset = 0;
-    region.bufferRowLength = 0;
-    region.bufferImageHeight = 0;
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.mipLevel = 0;
-    region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
-    region.imageOffset = {0, 0, 0};
-    region.imageExtent = {width, height, 1};
-    
-    vkCmdCopyImageToBuffer(copyCmd, image->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        stagingBuffer, 1, &region);
-    
-    // Transition back to general
-    image->TransitionLayout(copyCmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-    
-    vkEndCommandBuffer(copyCmd);
-    
-    // Submit and wait
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &copyCmd;
-    
-    vkQueueSubmit(m_Context->GetGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_Context->GetGraphicsQueue());
-    
-    vkFreeCommandBuffers(device, cmdPool, 1, &copyCmd);
-    
-    // Map staging buffer and copy to CUDA
-    void* data;
-    vkMapMemory(device, stagingMemory, 0, bufferSize, 0, &data);
-    cudaMemcpy(reinterpret_cast<void*>(cudaBuffer), data, bufferSize, cudaMemcpyHostToDevice);
-    vkUnmapMemory(device, stagingMemory);
-    
-    // Cleanup
-    vkDestroyBuffer(device, stagingBuffer, nullptr);
-    vkFreeMemory(device, stagingMemory, nullptr);
-    
-    return true;
-}
-
-void OptiXDenoiser::UploadCudaToImage(CUdeviceptr cudaBuffer, Image* image, uint32_t width, uint32_t height, VkCommandBuffer cmd) {
     (void)cmd;
+    (void)device;
+    (void)bufferSize;
     
-    VkDevice device = m_Context->GetDevice();
-    size_t bufferSize = static_cast<size_t>(width) * height * 4 * sizeof(float);
+    m_DenoisePerformed = true;
+    return true;
+}
+
+void OptiXDenoiser::TransitionImageLayout(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout) {
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
     
-    // Create staging buffer
-    VkBufferCreateInfo bufferInfo{};
-    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = bufferSize;
-    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     
-    VkBuffer stagingBuffer;
-    if (vkCreateBuffer(device, &bufferInfo, nullptr, &stagingBuffer) != VK_SUCCESS) {
-        return;
-    }
+    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+void OptiXDenoiser::ResizeSharedImages(uint32_t width, uint32_t height) {
+    // Destroy old shared images
+    DestroySharedImage(m_SharedColor);
+    DestroySharedImage(m_SharedAlbedo);
+    DestroySharedImage(m_SharedNormal);
+    DestroySharedImage(m_SharedOutput);
     
-    VkMemoryRequirements memReqs;
-    vkGetBufferMemoryRequirements(device, stagingBuffer, &memReqs);
-    
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = m_Device->FindMemoryType(memReqs.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    
-    VkDeviceMemory stagingMemory;
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &stagingMemory) != VK_SUCCESS) {
-        vkDestroyBuffer(device, stagingBuffer, nullptr);
-        return;
-    }
-    vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0);
-    
-    // Copy CUDA buffer to staging
-    void* data;
-    vkMapMemory(device, stagingMemory, 0, bufferSize, 0, &data);
-    cudaMemcpy(data, reinterpret_cast<void*>(cudaBuffer), bufferSize, cudaMemcpyDeviceToHost);
-    vkUnmapMemory(device, stagingMemory);
-    
-    // Create one-shot command buffer
-    VkCommandPool cmdPool = m_Device->GetGraphicsCommandPool();
-    VkCommandBuffer copyCmd;
-    VkCommandBufferAllocateInfo cmdAllocInfo{};
-    cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmdAllocInfo.commandPool = cmdPool;
-    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmdAllocInfo.commandBufferCount = 1;
-    vkAllocateCommandBuffers(device, &cmdAllocInfo, &copyCmd);
-    
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(copyCmd, &beginInfo);
-    
-    // Transition image to transfer dst
-    image->TransitionLayout(copyCmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    
-    // Copy buffer to image
-    VkBufferImageCopy region{};
-    region.bufferOffset = 0;
-    region.bufferRowLength = 0;
-    region.bufferImageHeight = 0;
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.mipLevel = 0;
-    region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
-    region.imageOffset = {0, 0, 0};
-    region.imageExtent = {width, height, 1};
-    
-    vkCmdCopyBufferToImage(copyCmd, stagingBuffer, image->GetHandle(), 
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    
-    // Transition back to general
-    image->TransitionLayout(copyCmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-    
-    vkEndCommandBuffer(copyCmd);
-    
-    // Submit and wait
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &copyCmd;
-    
-    vkQueueSubmit(m_Context->GetGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_Context->GetGraphicsQueue());
-    
-    vkFreeCommandBuffers(device, cmdPool, 1, &copyCmd);
-    
-    // Cleanup
-    vkDestroyBuffer(device, stagingBuffer, nullptr);
-    vkFreeMemory(device, stagingMemory, nullptr);
+    // Create new shared images with external memory
+    CreateSharedImage(m_SharedColor, width, height, "OptiXSharedColor");
+    CreateSharedImage(m_SharedAlbedo, width, height, "OptiXSharedAlbedo");
+    CreateSharedImage(m_SharedNormal, width, height, "OptiXSharedNormal");
+    CreateSharedImage(m_SharedOutput, width, height, "OptiXSharedOutput");
 }
 
 bool OptiXDenoiser::CreateSharedImage(CudaVulkanImage& img, uint32_t width, uint32_t height, const char* debugName) {
@@ -651,14 +538,38 @@ bool OptiXDenoiser::CreateSharedImage(CudaVulkanImage& img, uint32_t width, uint
     memDesc.handle.win32.handle = handle;
     memDesc.size = memReqs.size;
     
-    if (cudaImportExternalMemory(&img.cudaExtMem, &memDesc) != cudaSuccess) {
-        LUCENT_CORE_ERROR("OptiXDenoiser: Failed to import memory to CUDA");
+    cudaError_t err = cudaImportExternalMemory(&img.cudaExtMem, &memDesc);
+    if (err != cudaSuccess) {
+        LUCENT_CORE_ERROR("OptiXDenoiser: Failed to import memory to CUDA: {}", cudaGetErrorString(err));
+        return false;
+    }
+    
+    // Create mipmapped array from external memory
+    cudaExternalMemoryMipmappedArrayDesc arrayDesc{};
+    arrayDesc.offset = 0;
+    arrayDesc.formatDesc = cudaCreateChannelDesc<float4>();
+    arrayDesc.extent = make_cudaExtent(width, height, 0);
+    arrayDesc.flags = 0;
+    arrayDesc.numLevels = 1;
+    
+    err = cudaExternalMemoryGetMappedMipmappedArray(&img.cudaMipArray, img.cudaExtMem, &arrayDesc);
+    if (err != cudaSuccess) {
+        LUCENT_CORE_ERROR("OptiXDenoiser: Failed to get CUDA mipmapped array: {}", cudaGetErrorString(err));
+        return false;
+    }
+    
+    // Get the base level array
+    err = cudaGetMipmappedArrayLevel(&img.cudaArray, img.cudaMipArray, 0);
+    if (err != cudaSuccess) {
+        LUCENT_CORE_ERROR("OptiXDenoiser: Failed to get CUDA array level: {}", cudaGetErrorString(err));
         return false;
     }
 #endif
     
     img.width = width;
     img.height = height;
+    
+    LUCENT_CORE_DEBUG("OptiXDenoiser: Created shared image {} ({}x{})", debugName, width, height);
     
     return true;
 }

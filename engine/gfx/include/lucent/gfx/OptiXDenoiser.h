@@ -39,6 +39,10 @@ public:
 
     // Check if OptiX is available and initialized
     bool IsAvailable() const { return m_Initialized; }
+    
+    // Check if denoise was performed this frame (skip normal blit if true)
+    bool WasDenoisePerformed() const { return m_DenoisePerformed; }
+    void ResetDenoiseFlag() { m_DenoisePerformed = false; }
 
     // Resize denoiser buffers (call when viewport size changes)
     bool Resize(uint32_t width, uint32_t height);
@@ -72,21 +76,17 @@ private:
     bool CreateSharedImage(CudaVulkanImage& img, uint32_t width, uint32_t height, const char* debugName);
     void DestroySharedImage(CudaVulkanImage& img);
     
-    // Import Vulkan semaphore to CUDA
-    bool CreateSharedSemaphore();
+    // GPU-only image layout transitions
+    void TransitionImageLayout(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout);
     
-    // Convert Vulkan image to CUDA buffer for denoising
-    void CopyImageToCudaBuffer(cudaArray_t srcArray, void* dstBuffer, uint32_t width, uint32_t height);
-    void CopyCudaBufferToImage(void* srcBuffer, cudaArray_t dstArray, uint32_t width, uint32_t height);
-    
-    // Staging buffer transfers (CPU roundtrip for simplicity)
-    bool DownloadImageToCuda(Image* image, CUdeviceptr cudaBuffer, uint32_t width, uint32_t height, VkCommandBuffer cmd);
-    void UploadCudaToImage(CUdeviceptr cudaBuffer, Image* image, uint32_t width, uint32_t height, VkCommandBuffer cmd);
+    // Resize shared Vulkan-CUDA images
+    void ResizeSharedImages(uint32_t width, uint32_t height);
 
 private:
     VulkanContext* m_Context = nullptr;
     Device* m_Device = nullptr;
     bool m_Initialized = false;
+    bool m_DenoisePerformed = false;
     
     // CUDA context
     CUcontext m_CudaContext = nullptr;
@@ -113,9 +113,6 @@ private:
     CudaVulkanImage m_SharedNormal;
     CudaVulkanImage m_SharedOutput;
     
-    // CPU staging buffer for simple Vulkan-CUDA transfer
-    std::unique_ptr<float[]> m_StagingBuffer;
-    size_t m_StagingBufferSize = 0;
     
     // Synchronization
     cudaExternalSemaphore_t m_CudaWaitSemaphore = nullptr;

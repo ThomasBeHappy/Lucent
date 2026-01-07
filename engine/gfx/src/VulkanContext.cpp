@@ -19,6 +19,19 @@ static const std::vector<const char*> s_Vulkan13Extensions = {
     VK_KHR_MAINTENANCE_4_EXTENSION_NAME,
 };
 
+// Optional CUDA/OptiX interop extensions
+static const std::vector<const char*> s_ExternalMemoryExtensions = {
+    VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+    VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
+#ifdef _WIN32
+    VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+    VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
+#else
+    VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+    VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+#endif
+};
+
 // Optional RT extensions
 static const std::vector<const char*> s_RayTracingExtensions = {
     VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
@@ -333,6 +346,14 @@ bool VulkanContext::CreateLogicalDevice(const VulkanContextConfig& config) {
         for (const char* ext : s_RayTracingExtensions) {
             deviceExtensions.push_back(ext);
         }
+    }
+    
+    // Add external memory extensions for CUDA/OptiX interop
+    if (CheckDeviceExtensionSupport(m_PhysicalDevice, s_ExternalMemoryExtensions)) {
+        for (const char* ext : s_ExternalMemoryExtensions) {
+            deviceExtensions.push_back(ext);
+        }
+        LUCENT_CORE_INFO("  External memory (CUDA interop): ENABLED");
     }
     
     // Build feature chain

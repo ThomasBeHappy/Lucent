@@ -26,12 +26,36 @@
 #include <GLFW/glfw3.h>
 
 #include <glm/gtc/type_ptr.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 #include <filesystem>
 #include <algorithm>
 #include <cmath>
 
 namespace lucent {
+
+namespace {
+
+static bool NearlyEqualVec3(const glm::vec3& a, const glm::vec3& b, float eps) {
+    glm::vec3 d = a - b;
+    return (d.x * d.x + d.y * d.y + d.z * d.z) <= (eps * eps);
+}
+
+static bool NearlyEqualTransform(const glm::vec3& posA, const glm::vec3& rotA, const glm::vec3& scaleA,
+                                 const glm::vec3& posB, const glm::vec3& rotB, const glm::vec3& scaleB) {
+    // Translation/scale are in world/local units. Rotation is in degrees.
+    // Use slightly looser epsilon for rotation to avoid constant dirty from decomposition jitter.
+    const float posEps = 1e-4f;
+    const float rotEps = 1e-3f;
+    const float scaleEps = 1e-4f;
+
+    if (!NearlyEqualVec3(posA, posB, posEps)) return false;
+    if (!NearlyEqualVec3(rotA, rotB, rotEps)) return false;
+    if (!NearlyEqualVec3(scaleA, scaleB, scaleEps)) return false;
+    return true;
+}
+
+} // namespace
 
 EditorUI::~EditorUI() {
     Shutdown();
@@ -971,10 +995,22 @@ void EditorUI::DrawGizmo() {
     ImGuizmo::SetRect(m_ViewportPosition.x, m_ViewportPosition.y, m_ViewportSize.x, m_ViewportSize.y);
     
     // Get camera matrices
-    float aspectRatio = m_ViewportSize.x / m_ViewportSize.y;
-    m_EditorCamera->SetAspectRatio(aspectRatio);
+    if (m_ViewportSize.y <= 0.0f) {
+        m_UsingGizmo = false;
+        return;
+    }
+
+    // IMPORTANT: Do NOT mutate the shared editor camera here.
+    // The viewport renderer owns camera aspect based on the render target; changing it here (only when selected)
+    // can cause constant accumulation resets. We only need matrices for ImGuizmo, so build a local projection.
+    const float aspectRatio = m_ViewportSize.x / m_ViewportSize.y;
     glm::mat4 view = m_EditorCamera->GetViewMatrix();
-    glm::mat4 projection = m_EditorCamera->GetProjectionMatrix();
+    glm::mat4 projection = glm::perspective(
+        glm::radians(m_EditorCamera->GetFOV()),
+        aspectRatio,
+        m_EditorCamera->GetNearClip(),
+        m_EditorCamera->GetFarClip()
+    );
     
     // ImGuizmo expects OpenGL-style projection (Y-up), but Vulkan is Y-down
     // Flip the Y axis in the projection matrix for ImGuizmo
@@ -982,6 +1018,11 @@ void EditorUI::DrawGizmo() {
     
     // Get transform matrix
     glm::mat4 transformMatrix = transform->GetLocalMatrix();
+
+    // Snapshot current component values so we can detect actual changes robustly.
+    const glm::vec3 beforePos = transform->position;
+    const glm::vec3 beforeRot = transform->rotation;
+    const glm::vec3 beforeScale = transform->scale;
     
     // Determine operation
     ImGuizmo::OPERATION operation = ImGuizmo::TRANSLATE;
@@ -1038,14 +1079,17 @@ void EditorUI::DrawGizmo() {
             glm::value_ptr(rotation),
             glm::value_ptr(scale)
         );
-        
-        transform->position = translation;
-        transform->rotation = rotation;
-        transform->scale = scale;
-        
-        // Reset accumulation for traced modes when objects move
-        m_Renderer->GetSettings().MarkDirty();
-        m_SceneDirty = true;
+
+        // Only commit + mark dirty if the transform actually changed (avoid constant dirty when merely selected).
+        if (!NearlyEqualTransform(beforePos, beforeRot, beforeScale, translation, rotation, scale)) {
+            transform->position = translation;
+            transform->rotation = rotation;
+            transform->scale = scale;
+
+            // Reset accumulation for traced modes when objects move
+            m_Renderer->GetSettings().MarkDirty();
+            m_SceneDirty = true;
+        }
     }
     
     // Detect gizmo end - create undo command
@@ -1053,9 +1097,8 @@ void EditorUI::DrawGizmo() {
         UndoStack::Get().EndMergeWindow();
         
         // Only create command if transform actually changed
-        if (m_GizmoStartPosition != transform->position ||
-            m_GizmoStartRotation != transform->rotation ||
-            m_GizmoStartScale != transform->scale) {
+        if (!NearlyEqualTransform(m_GizmoStartPosition, m_GizmoStartRotation, m_GizmoStartScale,
+                                  transform->position, transform->rotation, transform->scale)) {
             
             TransformCommand::TransformState before{
                 m_GizmoStartPosition,

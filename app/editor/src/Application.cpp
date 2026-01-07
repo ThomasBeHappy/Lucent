@@ -501,46 +501,51 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
             // Determine which image to blit from (denoised or raw accumulation)
             gfx::Image* srcImage = tracer->GetAccumulationImage();
             
+            bool skipBlit = false;
 #ifdef LUCENT_ENABLE_OPTIX
             // Apply OptiX AI denoiser if enabled
             if (settings.denoiser == gfx::DenoiserType::OptiX && m_Renderer.IsOptiXDenoiserAvailable()) {
                 auto* denoiser = m_Renderer.GetOptiXDenoiser();
                 if (denoiser) {
-                    // OptiX denoising with albedo + normal AOV guides
-                    // Note: Full implementation requires Vulkan-CUDA interop
-                    denoiser->Denoise(
+                    denoiser->ResetDenoiseFlag();
+                    // OptiX writes directly to offscreen, skip blit if successful
+                    if (denoiser->Denoise(
                         tracer->GetAccumulationImage(),
                         tracer->GetAlbedoImage(),
                         tracer->GetNormalImage(),
                         offscreen, cmd, VK_NULL_HANDLE, VK_NULL_HANDLE
-                    );
+                    )) {
+                        skipBlit = denoiser->WasDenoisePerformed();
+                    }
                 }
             }
 #endif
             
-            // Transition offscreen to transfer dst (from SHADER_READ_ONLY_OPTIMAL after EndOffscreenPass)
-            offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            
-            // Transition accumulation to transfer src
-            srcImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            
-            // Blit accumulation to offscreen
-            VkImageBlit blitRegion{};
-            blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            blitRegion.srcSubresource.layerCount = 1;
-            blitRegion.srcOffsets[1] = { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 };
-            blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            blitRegion.dstSubresource.layerCount = 1;
-            blitRegion.dstOffsets[1] = { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 };
-            
-            vkCmdBlitImage(cmd, 
-                srcImage->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                offscreen->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                1, &blitRegion, VK_FILTER_NEAREST);
-            
-            // Transition back to shader read for composite pass
-            srcImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-            offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            if (!skipBlit) {
+                // Transition offscreen to transfer dst (from SHADER_READ_ONLY_OPTIMAL after EndOffscreenPass)
+                offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                
+                // Transition accumulation to transfer src
+                srcImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                
+                // Blit accumulation to offscreen
+                VkImageBlit blitRegion{};
+                blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                blitRegion.srcSubresource.layerCount = 1;
+                blitRegion.srcOffsets[1] = { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 };
+                blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                blitRegion.dstSubresource.layerCount = 1;
+                blitRegion.dstOffsets[1] = { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 };
+                
+                vkCmdBlitImage(cmd, 
+                    srcImage->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    offscreen->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    1, &blitRegion, VK_FILTER_NEAREST);
+                
+                // Transition back to shader read for composite pass
+                srcImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+                offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            }
         }
     } else if (renderMode == gfx::RenderMode::RayTraced &&
                m_Renderer.GetTracerRayKHR() &&
@@ -566,46 +571,51 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
             // Determine which image to blit from (denoised or raw accumulation)
             gfx::Image* srcImage = tracer->GetAccumulationImage();
             
+            bool skipBlit = false;
 #ifdef LUCENT_ENABLE_OPTIX
             // Apply OptiX AI denoiser if enabled
             if (settings.denoiser == gfx::DenoiserType::OptiX && m_Renderer.IsOptiXDenoiserAvailable()) {
                 auto* denoiser = m_Renderer.GetOptiXDenoiser();
                 if (denoiser) {
-                    // OptiX denoising with albedo + normal AOV guides
-                    // Note: Full implementation requires Vulkan-CUDA interop
-                    denoiser->Denoise(
+                    denoiser->ResetDenoiseFlag();
+                    // OptiX writes directly to offscreen, skip blit if successful
+                    if (denoiser->Denoise(
                         tracer->GetAccumulationImage(),
                         tracer->GetAlbedoImage(),
                         tracer->GetNormalImage(),
                         offscreen, cmd, VK_NULL_HANDLE, VK_NULL_HANDLE
-                    );
+                    )) {
+                        skipBlit = denoiser->WasDenoisePerformed();
+                    }
                 }
             }
 #endif
             
-            // Transition offscreen to transfer dst (from SHADER_READ_ONLY_OPTIMAL after EndOffscreenPass)
-            offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            
-            // Transition accumulation to transfer src
-            srcImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            
-            // Blit accumulation to offscreen
-            VkImageBlit blitRegion{};
-            blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            blitRegion.srcSubresource.layerCount = 1;
-            blitRegion.srcOffsets[1] = { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 };
-            blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            blitRegion.dstSubresource.layerCount = 1;
-            blitRegion.dstOffsets[1] = { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 };
-            
-            vkCmdBlitImage(cmd, 
-                srcImage->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                offscreen->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                1, &blitRegion, VK_FILTER_NEAREST);
-            
-            // Transition back to shader read for composite pass
-            srcImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-            offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            if (!skipBlit) {
+                // Transition offscreen to transfer dst (from SHADER_READ_ONLY_OPTIMAL after EndOffscreenPass)
+                offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                
+                // Transition accumulation to transfer src
+                srcImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                
+                // Blit accumulation to offscreen
+                VkImageBlit blitRegion{};
+                blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                blitRegion.srcSubresource.layerCount = 1;
+                blitRegion.srcOffsets[1] = { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 };
+                blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                blitRegion.dstSubresource.layerCount = 1;
+                blitRegion.dstOffsets[1] = { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 };
+                
+                vkCmdBlitImage(cmd, 
+                    srcImage->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    offscreen->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    1, &blitRegion, VK_FILTER_NEAREST);
+                
+                // Transition back to shader read for composite pass
+                srcImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+                offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            }
         }
     } else {
         // =========================================================================

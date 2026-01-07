@@ -158,6 +158,16 @@ private:
     // Multi-selection
     std::vector<scene::EntityID> m_SelectedEntities;
     
+    // Clipboard for entity copy/paste
+    struct ClipboardEntity {
+        std::string name;
+        scene::TransformComponent transform;
+        std::optional<scene::CameraComponent> camera;
+        std::optional<scene::LightComponent> light;
+        std::optional<scene::MeshRendererComponent> meshRenderer;
+    };
+    std::vector<ClipboardEntity> m_Clipboard;
+    
     VkDescriptorPool m_ImGuiPool = VK_NULL_HANDLE;
     
     // Viewport texture
