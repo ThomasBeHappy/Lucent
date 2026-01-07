@@ -1042,6 +1042,10 @@ void EditorUI::DrawGizmo() {
         transform->position = translation;
         transform->rotation = rotation;
         transform->scale = scale;
+        
+        // Reset accumulation for traced modes when objects move
+        m_Renderer->GetSettings().MarkDirty();
+        m_SceneDirty = true;
     }
     
     // Detect gizmo end - create undo command
@@ -1287,9 +1291,16 @@ void EditorUI::DrawComponentsPanel(scene::Entity entity) {
     auto* transform = entity.GetComponent<scene::TransformComponent>();
     if (transform) {
     if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::DragFloat3("Position", &transform->position.x, 0.1f);
-            ImGui::DragFloat3("Rotation", &transform->rotation.x, 1.0f);
-            ImGui::DragFloat3("Scale", &transform->scale.x, 0.1f);
+            bool transformChanged = false;
+            transformChanged |= ImGui::DragFloat3("Position", &transform->position.x, 0.1f);
+            transformChanged |= ImGui::DragFloat3("Rotation", &transform->rotation.x, 1.0f);
+            transformChanged |= ImGui::DragFloat3("Scale", &transform->scale.x, 0.1f);
+            
+            // Reset accumulation for traced modes when objects move
+            if (transformChanged) {
+                m_Renderer->GetSettings().MarkDirty();
+                m_SceneDirty = true;
+            }
         }
     }
     

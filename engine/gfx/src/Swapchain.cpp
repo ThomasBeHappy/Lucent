@@ -45,13 +45,14 @@ bool Swapchain::AcquireNextImage(VkSemaphore signalSemaphore, uint32_t& imageInd
         &imageIndex
     );
     
-    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_NOT_READY) {
         m_NeedsRecreate = true;
         return false;
     }
     
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
         LUCENT_CORE_ERROR("Failed to acquire swapchain image: {}", static_cast<int>(result));
+        m_NeedsRecreate = true; // Try recreating on any failure
         return false;
     }
     
@@ -114,6 +115,12 @@ bool Swapchain::CreateSwapchain() {
     VkSurfaceFormatKHR surfaceFormat = ChooseSurfaceFormat(support.formats);
     VkPresentModeKHR presentMode = ChoosePresentMode(support.presentModes);
     VkExtent2D extent = ChooseExtent(support.capabilities);
+    
+    // Don't create swapchain with zero extent (e.g., window minimized)
+    if (extent.width == 0 || extent.height == 0) {
+        m_NeedsRecreate = true;
+        return false;
+    }
     
     uint32_t imageCount = support.capabilities.minImageCount + 1;
     if (support.capabilities.maxImageCount > 0 && imageCount > support.capabilities.maxImageCount) {

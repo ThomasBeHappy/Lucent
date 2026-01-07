@@ -89,6 +89,13 @@ public:
     void SetGizmoMode(GizmoMode mode) { m_GizmoMode = mode; }
     bool IsUsingGizmo() const { return m_UsingGizmo; }
     
+    // Scene dirty flag (for tracer BVH update)
+    bool ConsumeSceneDirty() { 
+        bool dirty = m_SceneDirty; 
+        m_SceneDirty = false; 
+        return dirty; 
+    }
+    
     // Render mode
     RenderMode GetRenderMode() const { return m_RenderMode; }
     void SetRenderMode(RenderMode mode) { m_RenderMode = mode; }

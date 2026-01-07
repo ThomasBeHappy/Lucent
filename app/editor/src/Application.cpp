@@ -336,6 +336,11 @@ void Application::Run() {
             }
         }
         
+        // Check if scene was modified in EditorUI (object transforms changed)
+        if (m_EditorUI.ConsumeSceneDirty()) {
+            m_TracerSceneDirty = true;
+        }
+        
         RenderFrame();
     }
     
