@@ -1,5 +1,6 @@
 #include "lucent/gfx/Renderer.h"
 #include "lucent/gfx/DebugUtils.h"
+#include <array>
 
 namespace lucent::gfx {
 
@@ -325,6 +326,9 @@ bool Renderer::CreatePipelines() {
         .SetDepthAttachmentFormat(VK_FORMAT_D32_SFLOAT)
         .SetDepthStencil(true, true, VK_COMPARE_OP_LESS_OR_EQUAL)
         .SetLayout(m_TrianglePipelineLayout);
+    if (!UseDynamicRendering()) {
+        triangleBuilder.SetRenderPass(m_OffscreenRenderPass);
+    }
     
     m_TrianglePipeline = triangleBuilder.Build(device);
     if (!m_TrianglePipeline) {
@@ -364,6 +368,9 @@ bool Renderer::CreatePipelines() {
         .SetDepthAttachmentFormat(VK_FORMAT_D32_SFLOAT)
         .SetDepthStencil(true, true, VK_COMPARE_OP_LESS_OR_EQUAL)
         .SetLayout(m_GridPipelineLayout);
+    if (!UseDynamicRendering()) {
+        gridBuilder.SetRenderPass(m_OffscreenRenderPass);
+    }
     
     m_GridPipeline = gridBuilder.Build(device);
     if (!m_GridPipeline) {
@@ -417,6 +424,9 @@ bool Renderer::CreatePipelines() {
         .SetDepthStencil(true, true, VK_COMPARE_OP_LESS_OR_EQUAL)
         .SetRasterizer(VK_POLYGON_MODE_FILL, VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
         .SetLayout(m_MeshPipelineLayout);
+    if (!UseDynamicRendering()) {
+        meshBuilder.SetRenderPass(m_OffscreenRenderPass);
+    }
     
     m_MeshPipeline = meshBuilder.Build(device);
     if (!m_MeshPipeline) {
@@ -434,6 +444,9 @@ bool Renderer::CreatePipelines() {
         .SetDepthStencil(true, true, VK_COMPARE_OP_LESS_OR_EQUAL)
         .SetRasterizer(VK_POLYGON_MODE_LINE, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
         .SetLayout(m_MeshPipelineLayout);
+    if (!UseDynamicRendering()) {
+        wireframeBuilder.SetRenderPass(m_OffscreenRenderPass);
+    }
     
     m_MeshWireframePipeline = wireframeBuilder.Build(device);
     if (!m_MeshWireframePipeline) {
@@ -474,6 +487,9 @@ bool Renderer::CreatePipelines() {
         .SetDepthAttachmentFormat(VK_FORMAT_D32_SFLOAT)
         .SetDepthStencil(true, false, VK_COMPARE_OP_LESS_OR_EQUAL) // Depth test but no write
         .SetLayout(m_SkyboxPipelineLayout);
+    if (!UseDynamicRendering()) {
+        skyboxBuilder.SetRenderPass(m_OffscreenRenderPass);
+    }
     
     m_SkyboxPipeline = skyboxBuilder.Build(device);
     if (!m_SkyboxPipeline) {
@@ -506,6 +522,9 @@ bool Renderer::CreatePipelines() {
         .AddShaderStage(VK_SHADER_STAGE_FRAGMENT_BIT, m_CompositeFragShader)
         .SetColorAttachmentFormat(m_Swapchain.GetFormat())
         .SetLayout(m_CompositePipelineLayout);
+    if (!UseDynamicRendering()) {
+        compositeBuilder.SetRenderPass(m_SwapchainRenderPass);
+    }
     
     m_CompositePipeline = compositeBuilder.Build(device);
     if (!m_CompositePipeline) {
@@ -680,6 +699,12 @@ void Renderer::RecreateSwapchain() {
     CreateOffscreenResources();
     CreateSampler();
     
+    // Recreate framebuffers if using legacy path
+    if (!UseDynamicRendering()) {
+        DestroyFramebuffers();
+        CreateFramebuffers();
+    }
+    
     // Update descriptor set
     DescriptorWriter writer;
     writer.WriteImage(0, m_OffscreenColor.GetView(), m_OffscreenSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -689,6 +714,408 @@ void Renderer::RecreateSwapchain() {
     m_PendingHeight = 0;
     
     LUCENT_CORE_INFO("Swapchain recreated: {}x{}", width, height);
+}
+
+bool Renderer::UseDynamicRendering() const {
+    return m_Context->GetDeviceFeatures().dynamicRendering;
+}
+
+bool Renderer::CreateRenderPasses() {
+    VkDevice device = m_Context->GetDevice();
+    
+    // Offscreen render pass (HDR color + depth)
+    {
+        VkAttachmentDescription colorAttachment{};
+        colorAttachment.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        
+        VkAttachmentDescription depthAttachment{};
+        depthAttachment.format = VK_FORMAT_D32_SFLOAT;
+        depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        
+        VkAttachmentReference colorRef{};
+        colorRef.attachment = 0;
+        colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        
+        VkAttachmentReference depthRef{};
+        depthRef.attachment = 1;
+        depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &colorRef;
+        subpass.pDepthStencilAttachment = &depthRef;
+        
+        VkSubpassDependency dependency{};
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        dependency.srcAccessMask = 0;
+        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        
+        std::array<VkAttachmentDescription, 2> attachments = { colorAttachment, depthAttachment };
+        
+        VkRenderPassCreateInfo renderPassInfo{};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        renderPassInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+        renderPassInfo.pAttachments = attachments.data();
+        renderPassInfo.subpassCount = 1;
+        renderPassInfo.pSubpasses = &subpass;
+        renderPassInfo.dependencyCount = 1;
+        renderPassInfo.pDependencies = &dependency;
+        
+        if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &m_OffscreenRenderPass) != VK_SUCCESS) {
+            LUCENT_CORE_ERROR("Failed to create offscreen render pass");
+            return false;
+        }
+    }
+    
+    // Swapchain render pass (color only, for ImGui)
+    {
+        VkAttachmentDescription colorAttachment{};
+        colorAttachment.format = m_Swapchain.GetFormat();
+        colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        
+        VkAttachmentReference colorRef{};
+        colorRef.attachment = 0;
+        colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &colorRef;
+        
+        VkSubpassDependency dependency{};
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.srcAccessMask = 0;
+        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        
+        VkRenderPassCreateInfo renderPassInfo{};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        renderPassInfo.attachmentCount = 1;
+        renderPassInfo.pAttachments = &colorAttachment;
+        renderPassInfo.subpassCount = 1;
+        renderPassInfo.pSubpasses = &subpass;
+        renderPassInfo.dependencyCount = 1;
+        renderPassInfo.pDependencies = &dependency;
+        
+        if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &m_SwapchainRenderPass) != VK_SUCCESS) {
+            LUCENT_CORE_ERROR("Failed to create swapchain render pass");
+            return false;
+        }
+    }
+    
+    LUCENT_CORE_INFO("Legacy render passes created");
+    return true;
+}
+
+bool Renderer::CreateFramebuffers() {
+    VkDevice device = m_Context->GetDevice();
+    VkExtent2D extent = m_Swapchain.GetExtent();
+    
+    // Offscreen framebuffer
+    {
+        std::array<VkImageView, 2> attachments = {
+            m_OffscreenColor.GetView(),
+            m_OffscreenDepth.GetView()
+        };
+        
+        VkFramebufferCreateInfo framebufferInfo{};
+        framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        framebufferInfo.renderPass = m_OffscreenRenderPass;
+        framebufferInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+        framebufferInfo.pAttachments = attachments.data();
+        framebufferInfo.width = extent.width;
+        framebufferInfo.height = extent.height;
+        framebufferInfo.layers = 1;
+        
+        if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &m_OffscreenFramebuffer) != VK_SUCCESS) {
+            LUCENT_CORE_ERROR("Failed to create offscreen framebuffer");
+            return false;
+        }
+    }
+    
+    // Swapchain framebuffers
+    {
+        m_SwapchainFramebuffers.resize(m_Swapchain.GetImageCount());
+        
+        for (size_t i = 0; i < m_Swapchain.GetImageCount(); i++) {
+            VkImageView attachment = m_Swapchain.GetImageView(static_cast<uint32_t>(i));
+            
+            VkFramebufferCreateInfo framebufferInfo{};
+            framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            framebufferInfo.renderPass = m_SwapchainRenderPass;
+            framebufferInfo.attachmentCount = 1;
+            framebufferInfo.pAttachments = &attachment;
+            framebufferInfo.width = extent.width;
+            framebufferInfo.height = extent.height;
+            framebufferInfo.layers = 1;
+            
+            if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &m_SwapchainFramebuffers[i]) != VK_SUCCESS) {
+                LUCENT_CORE_ERROR("Failed to create swapchain framebuffer {}", i);
+                return false;
+            }
+        }
+    }
+    
+    LUCENT_CORE_INFO("Legacy framebuffers created");
+    return true;
+}
+
+void Renderer::DestroyRenderPasses() {
+    VkDevice device = m_Context->GetDevice();
+    
+    if (m_OffscreenRenderPass != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(device, m_OffscreenRenderPass, nullptr);
+        m_OffscreenRenderPass = VK_NULL_HANDLE;
+    }
+    if (m_SwapchainRenderPass != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(device, m_SwapchainRenderPass, nullptr);
+        m_SwapchainRenderPass = VK_NULL_HANDLE;
+    }
+}
+
+void Renderer::DestroyFramebuffers() {
+    VkDevice device = m_Context->GetDevice();
+    
+    if (m_OffscreenFramebuffer != VK_NULL_HANDLE) {
+        vkDestroyFramebuffer(device, m_OffscreenFramebuffer, nullptr);
+        m_OffscreenFramebuffer = VK_NULL_HANDLE;
+    }
+    
+    for (auto framebuffer : m_SwapchainFramebuffers) {
+        if (framebuffer != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(device, framebuffer, nullptr);
+        }
+    }
+    m_SwapchainFramebuffers.clear();
+}
+
+void Renderer::BeginOffscreenPass(VkCommandBuffer cmd, const glm::vec4& clearColor) {
+    VkExtent2D extent = m_Swapchain.GetExtent();
+    
+    if (UseDynamicRendering()) {
+        // Vulkan 1.3 path
+        m_OffscreenColor.TransitionLayout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        
+        VkRenderingAttachmentInfo colorAttachment{};
+        colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        colorAttachment.imageView = m_OffscreenColor.GetView();
+        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachment.clearValue.color = { { clearColor.r, clearColor.g, clearColor.b, clearColor.a } };
+        
+        VkRenderingAttachmentInfo depthAttachment{};
+        depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        depthAttachment.imageView = m_OffscreenDepth.GetView();
+        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.clearValue.depthStencil = { 1.0f, 0 };
+        
+        VkRenderingInfo renderInfo{};
+        renderInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        renderInfo.renderArea.offset = { 0, 0 };
+        renderInfo.renderArea.extent = extent;
+        renderInfo.layerCount = 1;
+        renderInfo.colorAttachmentCount = 1;
+        renderInfo.pColorAttachments = &colorAttachment;
+        renderInfo.pDepthAttachment = &depthAttachment;
+        
+        vkCmdBeginRendering(cmd, &renderInfo);
+    } else {
+        // Vulkan 1.1/1.2 fallback
+        std::array<VkClearValue, 2> clearValues{};
+        clearValues[0].color = { { clearColor.r, clearColor.g, clearColor.b, clearColor.a } };
+        clearValues[1].depthStencil = { 1.0f, 0 };
+        
+        VkRenderPassBeginInfo renderPassInfo{};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        renderPassInfo.renderPass = m_OffscreenRenderPass;
+        renderPassInfo.framebuffer = m_OffscreenFramebuffer;
+        renderPassInfo.renderArea.offset = { 0, 0 };
+        renderPassInfo.renderArea.extent = extent;
+        renderPassInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
+        renderPassInfo.pClearValues = clearValues.data();
+        
+        vkCmdBeginRenderPass(cmd, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+    }
+    
+    // Set viewport and scissor
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    
+    VkRect2D scissor{};
+    scissor.offset = { 0, 0 };
+    scissor.extent = extent;
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+}
+
+void Renderer::EndOffscreenPass(VkCommandBuffer cmd) {
+    if (UseDynamicRendering()) {
+        vkCmdEndRendering(cmd);
+        m_OffscreenColor.TransitionLayout(cmd, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    } else {
+        vkCmdEndRenderPass(cmd);
+        // Render pass handles the transition to SHADER_READ_ONLY_OPTIMAL
+    }
+}
+
+void Renderer::TransitionSwapchainToRenderTarget(VkCommandBuffer cmd) {
+    if (UseDynamicRendering()) {
+        // Vulkan 1.3 path
+        VkImage swapchainImage = m_Swapchain.GetImage(m_CurrentImageIndex);
+        
+        VkImageMemoryBarrier2 barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+        barrier.srcAccessMask = 0;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = swapchainImage;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+        
+        VkDependencyInfo depInfo{};
+        depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        depInfo.imageMemoryBarrierCount = 1;
+        depInfo.pImageMemoryBarriers = &barrier;
+        
+        vkCmdPipelineBarrier2(cmd, &depInfo);
+    }
+    // Legacy path: render pass handles the transition
+}
+
+void Renderer::BeginSwapchainPass(VkCommandBuffer cmd, const glm::vec4& clearColor) {
+    VkExtent2D extent = m_Swapchain.GetExtent();
+    
+    if (UseDynamicRendering()) {
+        // Vulkan 1.3 path
+        VkRenderingAttachmentInfo colorAttachment{};
+        colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        colorAttachment.imageView = m_Swapchain.GetImageView(m_CurrentImageIndex);
+        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachment.clearValue.color = { { clearColor.r, clearColor.g, clearColor.b, clearColor.a } };
+        
+        VkRenderingInfo renderInfo{};
+        renderInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        renderInfo.renderArea.offset = { 0, 0 };
+        renderInfo.renderArea.extent = extent;
+        renderInfo.layerCount = 1;
+        renderInfo.colorAttachmentCount = 1;
+        renderInfo.pColorAttachments = &colorAttachment;
+        
+        vkCmdBeginRendering(cmd, &renderInfo);
+    } else {
+        // Vulkan 1.1/1.2 fallback
+        VkClearValue clearValue{};
+        clearValue.color = { { clearColor.r, clearColor.g, clearColor.b, clearColor.a } };
+        
+        VkRenderPassBeginInfo renderPassInfo{};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        renderPassInfo.renderPass = m_SwapchainRenderPass;
+        renderPassInfo.framebuffer = m_SwapchainFramebuffers[m_CurrentImageIndex];
+        renderPassInfo.renderArea.offset = { 0, 0 };
+        renderPassInfo.renderArea.extent = extent;
+        renderPassInfo.clearValueCount = 1;
+        renderPassInfo.pClearValues = &clearValue;
+        
+        vkCmdBeginRenderPass(cmd, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+    }
+    
+    // Set viewport and scissor
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    
+    VkRect2D scissor{};
+    scissor.offset = { 0, 0 };
+    scissor.extent = extent;
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+}
+
+void Renderer::EndSwapchainPass(VkCommandBuffer cmd) {
+    if (UseDynamicRendering()) {
+        vkCmdEndRendering(cmd);
+    } else {
+        vkCmdEndRenderPass(cmd);
+    }
+}
+
+void Renderer::TransitionSwapchainToPresent(VkCommandBuffer cmd) {
+    if (UseDynamicRendering()) {
+        // Vulkan 1.3 path
+        VkImage swapchainImage = m_Swapchain.GetImage(m_CurrentImageIndex);
+        
+        VkImageMemoryBarrier2 barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+        barrier.dstAccessMask = 0;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = swapchainImage;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+        
+        VkDependencyInfo depInfo{};
+        depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        depInfo.imageMemoryBarrierCount = 1;
+        depInfo.pImageMemoryBarriers = &barrier;
+        
+        vkCmdPipelineBarrier2(cmd, &depInfo);
+    }
+    // Legacy path: render pass handles the transition to PRESENT_SRC_KHR
 }
 
 } // namespace lucent::gfx

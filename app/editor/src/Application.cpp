@@ -73,7 +73,12 @@ bool Application::Init(const ApplicationConfig& config) {
     m_EditorUI.SetEditorCamera(&m_EditorCamera);
     
     // Initialize material system
-    material::MaterialAssetManager::Get().Init(&m_Device);
+    // Set the offscreen render pass for legacy Vulkan 1.1/1.2 mode
+    material::MaterialAssetManager::Get().SetRenderPass(m_Renderer.GetOffscreenRenderPass());
+    
+    // Use the same assets path as the content browser
+    std::filesystem::path assetsPath = std::filesystem::current_path() / "Assets";
+    material::MaterialAssetManager::Get().Init(&m_Device, assetsPath.string());
     
     m_Running = true;
     m_LastFrameTime = glfwGetTime();
@@ -391,57 +396,13 @@ bool Application::InitWindow(const ApplicationConfig& config) {
 
 void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
     gfx::Image* offscreen = m_Renderer.GetOffscreenImage();
-    gfx::Image* depth = m_Renderer.GetDepthImage();
     
     VkExtent2D extent = { offscreen->GetWidth(), offscreen->GetHeight() };
     
     LUCENT_GPU_SCOPE(cmd, "ScenePass");
     
-    // Transition offscreen to color attachment
-    offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    
-    // Begin dynamic rendering
-    VkRenderingAttachmentInfo colorAttachment{};
-    colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    colorAttachment.imageView = offscreen->GetView();
-    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    colorAttachment.clearValue.color = { { 0.02f, 0.02f, 0.03f, 1.0f } };
-    
-    VkRenderingAttachmentInfo depthAttachment{};
-    depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    depthAttachment.imageView = depth->GetView();
-    depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depthAttachment.clearValue.depthStencil = { 1.0f, 0 };
-    
-    VkRenderingInfo renderInfo{};
-    renderInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    renderInfo.renderArea.offset = { 0, 0 };
-    renderInfo.renderArea.extent = extent;
-    renderInfo.layerCount = 1;
-    renderInfo.colorAttachmentCount = 1;
-    renderInfo.pColorAttachments = &colorAttachment;
-    renderInfo.pDepthAttachment = &depthAttachment;
-    
-    vkCmdBeginRendering(cmd, &renderInfo);
-    
-    // Set viewport and scissor
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    
-    VkRect2D scissor{};
-    scissor.offset = { 0, 0 };
-    scissor.extent = extent;
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    // Begin offscreen render pass (handles transitions and viewport setup)
+    m_Renderer.BeginOffscreenPass(cmd, glm::vec4(0.02f, 0.02f, 0.03f, 1.0f));
     
     // Update camera aspect ratio based on viewport size
     float aspectRatio = static_cast<float>(extent.width) / static_cast<float>(extent.height);
@@ -463,10 +424,8 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
     // Render scene meshes
     RenderMeshes(cmd, viewProj);
     
-    vkCmdEndRendering(cmd);
-    
-    // Transition offscreen to shader read
-    offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // End offscreen render pass
+    m_Renderer.EndOffscreenPass(cmd);
 }
 
 void Application::RenderFrame() {
@@ -475,10 +434,7 @@ void Application::RenderFrame() {
     }
     
     VkCommandBuffer cmd = m_Renderer.GetCurrentCommandBuffer();
-    gfx::Swapchain* swapchain = m_Renderer.GetSwapchain();
     gfx::Image* offscreen = m_Renderer.GetOffscreenImage();
-    
-    VkExtent2D extent = swapchain->GetExtent();
     
     // =========================================================================
     // Pass 1: Render scene to offscreen image (viewport content)
@@ -503,83 +459,20 @@ void Application::RenderFrame() {
     {
         LUCENT_GPU_SCOPE(cmd, "ImGuiPass");
         
-        uint32_t imageIndex = m_Renderer.GetCurrentImageIndex();
-        VkImage swapchainImage = swapchain->GetImage(imageIndex);
-        VkImageView swapchainView = swapchain->GetImageView(imageIndex);
+        // Transition swapchain to render target (only needed for Vulkan 1.3 path)
+        m_Renderer.TransitionSwapchainToRenderTarget(cmd);
         
-        // Transition swapchain image to color attachment
-        VkImageMemoryBarrier2 barrier{};
-        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-        barrier.srcAccessMask = 0;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.image = swapchainImage;
-        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barrier.subresourceRange.baseMipLevel = 0;
-        barrier.subresourceRange.levelCount = 1;
-        barrier.subresourceRange.baseArrayLayer = 0;
-        barrier.subresourceRange.layerCount = 1;
-        
-        VkDependencyInfo depInfo{};
-        depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        depInfo.imageMemoryBarrierCount = 1;
-        depInfo.pImageMemoryBarriers = &barrier;
-        
-        vkCmdPipelineBarrier2(cmd, &depInfo);
-        
-        // Begin rendering to swapchain
-        VkRenderingAttachmentInfo colorAttachment{};
-        colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        colorAttachment.imageView = swapchainView;
-        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        colorAttachment.clearValue.color = { { 0.1f, 0.1f, 0.1f, 1.0f } };
-        
-        VkRenderingInfo renderInfo{};
-        renderInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        renderInfo.renderArea.offset = { 0, 0 };
-        renderInfo.renderArea.extent = extent;
-        renderInfo.layerCount = 1;
-        renderInfo.colorAttachmentCount = 1;
-        renderInfo.pColorAttachments = &colorAttachment;
-        
-        vkCmdBeginRendering(cmd, &renderInfo);
-        
-        // Set viewport and scissor
-        VkViewport viewport{};
-        viewport.x = 0.0f;
-        viewport.y = 0.0f;
-        viewport.width = static_cast<float>(extent.width);
-        viewport.height = static_cast<float>(extent.height);
-        viewport.minDepth = 0.0f;
-        viewport.maxDepth = 1.0f;
-        vkCmdSetViewport(cmd, 0, 1, &viewport);
-        
-        VkRect2D scissor{};
-        scissor.offset = { 0, 0 };
-        scissor.extent = extent;
-        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        // Begin swapchain render pass (handles transitions and viewport setup)
+        m_Renderer.BeginSwapchainPass(cmd, glm::vec4(0.1f, 0.1f, 0.1f, 1.0f));
         
         // Render ImGui
         m_EditorUI.Render(cmd);
         
-        vkCmdEndRendering(cmd);
+        // End swapchain render pass
+        m_Renderer.EndSwapchainPass(cmd);
         
-        // Transition swapchain image to present
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
-        barrier.dstAccessMask = 0;
-        barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        // Transition swapchain to present (only needed for Vulkan 1.3 path)
+        m_Renderer.TransitionSwapchainToPresent(cmd);
     }
     
     m_Renderer.EndFrame();

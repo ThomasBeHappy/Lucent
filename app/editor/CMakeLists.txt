@@ -13,6 +13,7 @@ add_executable(editor
     src/Win32FileDialogs.cpp
     src/EditorSettings.cpp
     src/MaterialGraphPanel.cpp
+    src/UndoStack.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/editor.rc
 )
 

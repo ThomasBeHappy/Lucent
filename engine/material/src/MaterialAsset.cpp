@@ -3,6 +3,9 @@
 #include "lucent/core/Log.h"
 #include <fstream>
 #include <sstream>
+#include <filesystem>
+#include <cctype>
+#include <algorithm>
 
 namespace lucent::material {
 
@@ -162,6 +165,11 @@ bool MaterialAsset::CreatePipeline(const std::vector<uint32_t>& fragmentSpirv) {
         .SetRasterizer(VK_POLYGON_MODE_FILL, VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
         .SetLayout(m_PipelineLayout);
     
+    // Set render pass for legacy mode (Vulkan 1.1/1.2)
+    if (m_RenderPass != VK_NULL_HANDLE) {
+        builder.SetRenderPass(m_RenderPass);
+    }
+    
     m_Pipeline = builder.Build(device);
     
     if (m_Pipeline == VK_NULL_HANDLE) {
@@ -203,14 +211,27 @@ void MaterialAsset::DestroyPipeline() {
 // MaterialAssetManager
 // ============================================================================
 
-bool MaterialAssetManager::Init(gfx::Device* device) {
+bool MaterialAssetManager::Init(gfx::Device* device, const std::string& assetsPath) {
     m_Device = device;
+    
+    // Set up materials directory
+    m_MaterialsPath = assetsPath + "/materials";
+    
+    // Create materials directory if it doesn't exist
+    try {
+        std::filesystem::create_directories(m_MaterialsPath);
+    } catch (const std::exception& e) {
+        LUCENT_CORE_WARN("Could not create materials directory: {}", e.what());
+    }
     
     // Create default material
     m_DefaultMaterial = std::make_unique<MaterialAsset>();
     if (!m_DefaultMaterial->Init(device)) {
         return false;
     }
+    
+    // Set render pass for legacy mode
+    m_DefaultMaterial->SetRenderPass(m_RenderPass);
     
     // Compile default material
     if (!m_DefaultMaterial->Recompile()) {
@@ -227,6 +248,31 @@ void MaterialAssetManager::Shutdown() {
     m_Device = nullptr;
 }
 
+std::string MaterialAssetManager::GenerateUniquePath(const std::string& baseName) {
+    // Sanitize the name (remove special characters)
+    std::string sanitized;
+    for (char c : baseName) {
+        if (std::isalnum(c) || c == '_' || c == '-' || c == ' ') {
+            sanitized += c;
+        }
+    }
+    if (sanitized.empty()) sanitized = "Material";
+    
+    // Replace spaces with underscores
+    std::replace(sanitized.begin(), sanitized.end(), ' ', '_');
+    
+    // Find a unique filename
+    std::string basePath = m_MaterialsPath + "/" + sanitized;
+    std::string path = basePath + ".lmat";
+    
+    int counter = 1;
+    while (std::filesystem::exists(path)) {
+        path = basePath + "_" + std::to_string(counter++) + ".lmat";
+    }
+    
+    return path;
+}
+
 MaterialAsset* MaterialAssetManager::CreateMaterial(const std::string& name) {
     auto material = std::make_unique<MaterialAsset>();
     if (!material->Init(m_Device)) {
@@ -234,12 +280,30 @@ MaterialAsset* MaterialAssetManager::CreateMaterial(const std::string& name) {
     }
     
     material->GetGraph().SetName(name);
+    material->SetRenderPass(m_RenderPass);
     
-    // Generate a unique key
-    std::string key = "new_" + std::to_string(m_Materials.size());
+    // Create default graph
+    material->GetGraph().CreateDefault();
     
+    // Generate unique file path and save immediately
+    std::string filePath = GenerateUniquePath(name);
+    material->SetFilePath(filePath);
+    
+    // Compile the material
+    if (!material->Recompile()) {
+        LUCENT_CORE_WARN("New material failed to compile");
+    }
+    
+    // Save to disk
     MaterialAsset* ptr = material.get();
-    m_Materials[key] = std::move(material);
+    if (SaveMaterial(ptr, filePath)) {
+        LUCENT_CORE_INFO("Created material: {}", filePath);
+    } else {
+        LUCENT_CORE_WARN("Failed to save new material to: {}", filePath);
+    }
+    
+    // Store in cache using file path as key
+    m_Materials[filePath] = std::move(material);
     
     return ptr;
 }
@@ -264,6 +328,7 @@ MaterialAsset* MaterialAssetManager::LoadMaterial(const std::string& path) {
     }
     
     material->SetFilePath(path);
+    material->SetRenderPass(m_RenderPass);
     
     // Parse .lmat file
     MaterialGraph& graph = material->GetGraph();

@@ -124,6 +124,13 @@ private:
     bool RayIntersectsSphere(const glm::vec3& rayOrigin, const glm::vec3& rayDir,
                              const glm::vec3& center, float radius, float& tOut);
     
+    // Asset navigation
+    void NavigateToAsset(const std::string& path);
+    void OpenMaterialInEditor(const std::string& path);
+    
+    // Material assignment
+    void HandleMaterialDrop(const std::string& materialPath);
+    
 private:
     GLFWwindow* m_Window = nullptr;
     gfx::VulkanContext* m_Context = nullptr;

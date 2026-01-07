@@ -2,6 +2,7 @@
 #include "SceneIO.h"
 #include "Win32FileDialogs.h"
 #include "EditorSettings.h"
+#include "UndoStack.h"
 #include "lucent/gfx/VulkanContext.h"
 #include "lucent/gfx/Device.h"
 #include "lucent/gfx/Renderer.h"
@@ -101,11 +102,20 @@ bool EditorUI::Init(GLFWwindow* window, gfx::VulkanContext* context, gfx::Device
     initInfo.MinImageCount = 2;
     initInfo.ImageCount = renderer->GetSwapchain()->GetImageCount();
     initInfo.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    
+    // Check if we should use dynamic rendering (Vulkan 1.3) or legacy render pass
+    bool useDynamicRendering = renderer->UseDynamicRendering();
+    VkFormat swapchainFormat = renderer->GetSwapchain()->GetFormat();
+    
+    if (useDynamicRendering) {
     initInfo.UseDynamicRendering = true;
     initInfo.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     initInfo.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
-    VkFormat swapchainFormat = renderer->GetSwapchain()->GetFormat();
     initInfo.PipelineRenderingCreateInfo.pColorAttachmentFormats = &swapchainFormat;
+    } else {
+        initInfo.UseDynamicRendering = false;
+        initInfo.RenderPass = renderer->GetSwapchainRenderPass();
+    }
     
     ImGui_ImplVulkan_Init(&initInfo);
     
@@ -114,6 +124,11 @@ bool EditorUI::Init(GLFWwindow* window, gfx::VulkanContext* context, gfx::Device
     
     // Initialize material graph panel
     m_MaterialGraphPanel.Init(device);
+    
+    // Set up callback for navigating to assets from material graph
+    m_MaterialGraphPanel.SetNavigateToAssetCallback([this](const std::string& path) {
+        NavigateToAsset(path);
+    });
     
     LUCENT_CORE_INFO("ImGui initialized with docking support");
     return true;
@@ -556,7 +571,7 @@ void EditorUI::DrawDockspace() {
                     }
                 }
                 if (proceed) {
-                    glfwSetWindowShouldClose(m_Window, GLFW_TRUE);
+                glfwSetWindowShouldClose(m_Window, GLFW_TRUE);
                 }
             }
             ImGui::EndMenu();
@@ -823,6 +838,15 @@ void EditorUI::DrawViewportPanel() {
     // Display the offscreen render result
     if (m_ViewportDescriptor != VK_NULL_HANDLE && size.x > 0 && size.y > 0) {
         ImGui::Image((ImTextureID)m_ViewportDescriptor, size);
+        
+        // Handle material drag-drop onto meshes
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("MATERIAL_PATH")) {
+                std::string materialPath(static_cast<const char*>(payload->Data));
+                HandleMaterialDrop(materialPath);
+            }
+            ImGui::EndDragDropTarget();
+        }
     } else {
         ImGui::Text("Viewport not available");
     }
@@ -1163,7 +1187,7 @@ void EditorUI::DrawComponentsPanel(scene::Entity entity) {
     // Transform component
     auto* transform = entity.GetComponent<scene::TransformComponent>();
     if (transform) {
-        if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::DragFloat3("Position", &transform->position.x, 0.1f);
             ImGui::DragFloat3("Rotation", &transform->rotation.x, 1.0f);
             ImGui::DragFloat3("Scale", &transform->scale.x, 0.1f);
@@ -1514,11 +1538,34 @@ void EditorUI::DrawContentBrowserPanel() {
                 }
             }
             
+            // Drag source for compatible files (textures, materials)
+            if (!isDirectory && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+                std::string pathStr = entry.path().string();
+                
+                // Determine payload type based on extension
+                const char* payloadType = "ASSET_PATH";
+                if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".hdr") {
+                    payloadType = "TEXTURE_PATH";
+                } else if (ext == ".lmat") {
+                    payloadType = "MATERIAL_PATH";
+                }
+                
+                ImGui::SetDragDropPayload(payloadType, pathStr.c_str(), pathStr.size() + 1);
+                ImGui::Text("%s %s", icon, name.c_str());
+                ImGui::EndDragDropSource();
+            }
+            
             // Double-click to open
             if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 if (!isDirectory) {
-                    // Open file with default application
-                    ShellExecuteW(NULL, L"open", entry.path().wstring().c_str(), NULL, NULL, SW_SHOWNORMAL);
+                    // Handle special file types
+                    if (ext == ".lmat") {
+                        // Open material in Material Graph editor
+                        OpenMaterialInEditor(entry.path().string());
+                    } else {
+                        // Open file with default application
+                        ShellExecuteW(NULL, L"open", entry.path().wstring().c_str(), NULL, NULL, SW_SHOWNORMAL);
+                    }
                 }
             }
             
@@ -1587,7 +1634,7 @@ void EditorUI::DrawContentBrowserPanel() {
                 ImGui::SameLine();
             }
             
-            ImGui::PopID();
+        ImGui::PopID();
             itemIndex++;
         }
     }
@@ -1601,6 +1648,92 @@ void EditorUI::DrawContentBrowserPanel() {
     ImGui::PopStyleVar();
     
     ImGui::End();
+}
+
+void EditorUI::NavigateToAsset(const std::string& path) {
+    // Convert to filesystem path and navigate content browser
+    std::filesystem::path assetPath(path);
+    
+    if (std::filesystem::exists(assetPath)) {
+        // Navigate to the parent directory
+        m_ContentBrowserPath = assetPath.parent_path();
+        
+        // Make sure content browser is visible
+        m_ShowContentBrowser = true;
+        
+        LUCENT_CORE_INFO("Navigated to: {}", m_ContentBrowserPath.string());
+    } else {
+        LUCENT_CORE_WARN("Asset not found: {}", path);
+    }
+}
+
+void EditorUI::OpenMaterialInEditor(const std::string& path) {
+    // Load the material from the file
+    auto* material = material::MaterialAssetManager::Get().LoadMaterial(path);
+    
+    if (material) {
+        // Compile it if needed
+        if (!material->IsValid()) {
+            material->Recompile();
+        }
+        
+        // Set it in the material graph panel
+        m_MaterialGraphPanel.SetMaterial(material);
+        
+        // Make the panel visible
+        m_MaterialGraphPanel.SetVisible(true);
+        
+        LUCENT_CORE_INFO("Opened material: {}", path);
+    } else {
+        LUCENT_CORE_ERROR("Failed to load material: {}", path);
+    }
+}
+
+void EditorUI::HandleMaterialDrop(const std::string& materialPath) {
+    if (!m_Scene || !m_EditorCamera) return;
+    
+    // Get mouse position relative to viewport
+    ImVec2 mousePos = ImGui::GetMousePos();
+    glm::vec2 relativePos(mousePos.x - m_ViewportPosition.x, mousePos.y - m_ViewportPosition.y);
+    
+    // Check if within viewport bounds
+    if (relativePos.x < 0 || relativePos.y < 0 || 
+        relativePos.x >= m_ViewportSize.x || relativePos.y >= m_ViewportSize.y) {
+        return;
+    }
+    
+    // Pick entity under mouse
+    scene::Entity hitEntity = PickEntity(relativePos);
+    
+    if (hitEntity.IsValid()) {
+        // Check if entity has a mesh renderer
+        auto* meshRenderer = hitEntity.GetComponent<scene::MeshRendererComponent>();
+        if (meshRenderer) {
+            // Load the material to make sure it's valid
+            auto* material = material::MaterialAssetManager::Get().LoadMaterial(materialPath);
+            if (material) {
+                if (!material->IsValid()) {
+                    material->Recompile();
+                }
+                
+                // Assign the material path to the mesh renderer
+                meshRenderer->materialPath = materialPath;
+                
+                auto* tag = hitEntity.GetComponent<scene::TagComponent>();
+                std::string entityName = tag ? tag->name : "Entity";
+                
+                LUCENT_CORE_INFO("Assigned material '{}' to '{}'", 
+                    std::filesystem::path(materialPath).filename().string(), 
+                    entityName);
+            } else {
+                LUCENT_CORE_WARN("Failed to load material: {}", materialPath);
+            }
+        } else {
+            LUCENT_CORE_WARN("Entity doesn't have a MeshRenderer component");
+        }
+    } else {
+        LUCENT_CORE_DEBUG("No entity under drop position");
+    }
 }
 
 void EditorUI::DrawConsolePanel() {

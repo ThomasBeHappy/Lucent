@@ -58,11 +58,15 @@ public:
     void MarkDirty() { m_Dirty = true; }
     void ClearDirty() { m_Dirty = false; }
     
+    // Set the render pass for legacy Vulkan 1.1/1.2 support
+    void SetRenderPass(VkRenderPass renderPass) { m_RenderPass = renderPass; }
+    
 private:
     bool CreatePipeline(const std::vector<uint32_t>& fragmentSpirv);
     void DestroyPipeline();
     
     gfx::Device* m_Device = nullptr;
+    VkRenderPass m_RenderPass = VK_NULL_HANDLE; // For legacy mode (nullptr = dynamic rendering)
     MaterialGraph m_Graph;
     MaterialCompiler m_Compiler;
     
@@ -89,10 +93,10 @@ public:
         return instance;
     }
     
-    bool Init(gfx::Device* device);
+    bool Init(gfx::Device* device, const std::string& assetsPath = "assets");
     void Shutdown();
     
-    // Create a new material
+    // Create a new material (auto-saves to assets folder)
     MaterialAsset* CreateMaterial(const std::string& name = "New Material");
     
     // Load material from file
@@ -110,10 +114,22 @@ public:
     // Reload all materials (after shader changes)
     void RecompileAll();
     
+    // Set the render pass for legacy Vulkan 1.1/1.2 mode (call before creating materials)
+    void SetRenderPass(VkRenderPass renderPass) { m_RenderPass = renderPass; }
+    VkRenderPass GetRenderPass() const { return m_RenderPass; }
+    
+    // Get materials directory
+    const std::string& GetMaterialsPath() const { return m_MaterialsPath; }
+    
 private:
     MaterialAssetManager() = default;
     
+    // Generate a unique file path for a new material
+    std::string GenerateUniquePath(const std::string& baseName);
+    
     gfx::Device* m_Device = nullptr;
+    VkRenderPass m_RenderPass = VK_NULL_HANDLE;
+    std::string m_MaterialsPath;
     std::unordered_map<std::string, std::unique_ptr<MaterialAsset>> m_Materials;
     std::unique_ptr<MaterialAsset> m_DefaultMaterial;
 };

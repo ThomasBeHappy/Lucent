@@ -6,6 +6,7 @@
 #include <imgui-node-editor/imgui_node_editor.h>
 #include <string>
 #include <unordered_map>
+#include <functional>
 
 namespace lucent {
 
@@ -40,6 +41,10 @@ public:
     // Check if panel needs attention (errors)
     bool HasErrors() const { return m_Material && !m_Material->IsValid(); }
     
+    // Callback for navigating to assets (set by EditorUI)
+    using NavigateToAssetCallback = std::function<void(const std::string& path)>;
+    void SetNavigateToAssetCallback(NavigateToAssetCallback callback) { m_NavigateToAsset = callback; }
+    
 private:
     void DrawToolbar();
     void DrawNodeEditor();
@@ -54,6 +59,10 @@ private:
     // Popup menus
     void HandleContextMenu();
     void HandleNewNode(material::NodeType type, const ImVec2& position);
+    
+    // Drag-drop handling
+    void HandleDragDrop();
+    void CreateNodeFromDrop(const std::string& path, const ImVec2& position);
     
     // Link validation
     bool CanCreateLink(ax::NodeEditor::PinId startPin, ax::NodeEditor::PinId endPin);
@@ -77,6 +86,20 @@ private:
     
     // Compile status animation
     float m_CompileAnimTimer = 0.0f;
+    
+    // Asset navigation callback
+    NavigateToAssetCallback m_NavigateToAsset;
+    
+    // Deferred color picker (popups can't open inside node editor)
+    bool m_PendingColorEdit = false;
+    material::NodeID m_PendingColorNodeId = 0;
+    float m_PendingColor[3] = { 0.0f, 0.0f, 0.0f };
+    
+    // ColorRamp deferred editing
+    bool m_PendingRampColorEdit = false;
+    material::NodeID m_PendingRampNodeId = 0;
+    int m_PendingRampStopIndex = -1;
+    float m_PendingRampColor[3] = { 0.0f, 0.0f, 0.0f };
 };
 
 } // namespace lucent

@@ -145,9 +145,54 @@ void MaterialGraphPanel::DrawNodeEditor() {
         return;
     }
     
+    // Check if we're dragging a compatible payload BEFORE drawing anything
+    const ImGuiPayload* activePayload = ImGui::GetDragDropPayload();
+    bool isDraggingAsset = activePayload != nullptr &&
+        (activePayload->IsDataType("TEXTURE_PATH") ||
+         activePayload->IsDataType("ASSET_PATH"));
+    
+    bool dropped = false;
+    std::string droppedPath;
+    ImVec2 dropPos;
+    
+    // Only create drop zone when actually dragging something compatible
+    if (isDraggingAsset) {
+        ImVec2 editorSize = ImGui::GetContentRegionAvail();
+        
+        // Create a visible hint that we can drop here
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.5f, 0.8f, 0.3f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.6f, 0.9f, 0.5f));
+        ImGui::Button("##GraphDropZone", editorSize);
+        ImGui::PopStyleColor(2);
+        
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("TEXTURE_PATH")) {
+                droppedPath = std::string(static_cast<const char*>(payload->Data));
+                dropPos = ImGui::GetMousePos();
+                dropped = true;
+            }
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("ASSET_PATH")) {
+                droppedPath = std::string(static_cast<const char*>(payload->Data));
+                dropPos = ImGui::GetMousePos();
+                dropped = true;
+            }
+            ImGui::EndDragDropTarget();
+        }
+        
+        // Reset cursor to draw node editor in same position
+        ImVec2 cursorPos = ImGui::GetCursorPos();
+        ImGui::SetCursorPos(ImVec2(cursorPos.x, cursorPos.y - editorSize.y));
+    }
+    
     ed::SetCurrentEditor(m_NodeEditorContext);
     
     ed::Begin("MaterialNodeEditor", ImVec2(0.0f, 0.0f));
+    
+    // Process the drop now that we have the node editor context
+    if (dropped && !droppedPath.empty()) {
+        ImVec2 canvasPos = ed::ScreenToCanvas(dropPos);
+        CreateNodeFromDrop(droppedPath, canvasPos);
+    }
     
     material::MaterialGraph& graph = m_Material->GetGraph();
     
@@ -219,6 +264,85 @@ void MaterialGraphPanel::DrawNodeEditor() {
     
     ed::End();
     
+    // Handle deferred color pickers (must be outside node editor)
+    // ConstVec3 color picker
+    if (m_PendingColorEdit) {
+        ImGui::OpenPopup("ColorPickerPopup");
+        m_PendingColorEdit = false;
+    }
+    
+    if (ImGui::BeginPopup("ColorPickerPopup")) {
+        if (ImGui::ColorPicker3("##picker", m_PendingColor, ImGuiColorEditFlags_PickerHueWheel)) {
+            // Update the node
+            auto& colorGraph = m_Material->GetGraph();
+            const auto* colorNode = colorGraph.GetNode(m_PendingColorNodeId);
+            if (colorNode) {
+                auto* mutableNode = const_cast<material::MaterialNode*>(colorNode);
+                mutableNode->parameter = glm::vec3(m_PendingColor[0], m_PendingColor[1], m_PendingColor[2]);
+                m_Material->MarkDirty();
+            }
+        }
+        ImGui::EndPopup();
+    }
+    
+    // ColorRamp stop color picker
+    if (m_PendingRampColorEdit) {
+        ImGui::OpenPopup("RampColorPickerPopup");
+        m_PendingRampColorEdit = false;
+    }
+    
+    if (ImGui::BeginPopup("RampColorPickerPopup")) {
+        if (ImGui::ColorPicker3("##ramppicker", m_PendingRampColor, ImGuiColorEditFlags_PickerHueWheel)) {
+            // Update the color ramp node stop by modifying the blob
+            auto& rampGraph = m_Material->GetGraph();
+            const auto* rampNode = rampGraph.GetNode(m_PendingRampNodeId);
+            if (rampNode && m_PendingRampStopIndex >= 0) {
+                // Parse existing blob
+                std::string blob = std::holds_alternative<std::string>(rampNode->parameter) ? 
+                    std::get<std::string>(rampNode->parameter) : "RAMP:0.0,0.0,0.0,0.0;1.0,1.0,1.0,1.0";
+                
+                struct Stop { float t, r, g, b; };
+                std::vector<Stop> stops;
+                const std::string prefix = "RAMP:";
+                size_t start = (blob.rfind(prefix, 0) == 0) ? prefix.size() : 0;
+                while (start < blob.size()) {
+                    size_t end = blob.find(';', start);
+                    std::string token = blob.substr(start, end == std::string::npos ? std::string::npos : (end - start));
+                    if (!token.empty()) {
+                        Stop s;
+                        if (sscanf_s(token.c_str(), "%f,%f,%f,%f", &s.t, &s.r, &s.g, &s.b) == 4) {
+                            stops.push_back(s);
+                        }
+                    }
+                    if (end == std::string::npos) break;
+                    start = end + 1;
+                }
+                
+                // Update the specific stop
+                if (m_PendingRampStopIndex < (int)stops.size()) {
+                    stops[m_PendingRampStopIndex].r = m_PendingRampColor[0];
+                    stops[m_PendingRampStopIndex].g = m_PendingRampColor[1];
+                    stops[m_PendingRampStopIndex].b = m_PendingRampColor[2];
+                    
+                    // Rebuild blob
+                    std::string newBlob = "RAMP:";
+                    for (size_t i = 0; i < stops.size(); ++i) {
+                        if (i > 0) newBlob += ";";
+                        char buf[64];
+                        snprintf(buf, sizeof(buf), "%.3f,%.3f,%.3f,%.3f", 
+                            stops[i].t, stops[i].r, stops[i].g, stops[i].b);
+                        newBlob += buf;
+                    }
+                    
+                    auto* mutableNode = const_cast<material::MaterialNode*>(rampNode);
+                    mutableNode->parameter = newBlob;
+                    m_Material->MarkDirty();
+                }
+            }
+        }
+        ImGui::EndPopup();
+    }
+    
     ed::SetCurrentEditor(nullptr);
 }
 
@@ -275,11 +399,15 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
         case material::NodeType::ConstVec3: {
             glm::vec3 value = std::holds_alternative<glm::vec3>(node.parameter) ?
                               std::get<glm::vec3>(node.parameter) : glm::vec3(0.0f);
-            ImGui::SetNextItemWidth(150.0f);
-            if (ImGui::ColorEdit3("##colorval", &value.x, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel)) {
-                auto* mutableNode = const_cast<material::MaterialNode*>(&node);
-                mutableNode->parameter = value;
-                m_Material->MarkDirty();
+            
+            // Draw a color button - clicking it will open a popup outside node editor
+            ImVec4 col(value.x, value.y, value.z, 1.0f);
+            if (ImGui::ColorButton("##colorbtn", col, ImGuiColorEditFlags_NoTooltip, ImVec2(80, 20))) {
+                m_PendingColorEdit = true;
+                m_PendingColorNodeId = node.id;
+                m_PendingColor[0] = value.x;
+                m_PendingColor[1] = value.y;
+                m_PendingColor[2] = value.z;
             }
             break;
         }
@@ -287,14 +415,60 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
         case material::NodeType::NormalMap: {
             std::string path = std::holds_alternative<std::string>(node.parameter) ?
                                std::get<std::string>(node.parameter) : "";
-            char buf[256];
-            strncpy_s(buf, path.c_str(), sizeof(buf) - 1);
-            buf[sizeof(buf) - 1] = '\0';
-            ImGui::SetNextItemWidth(120.0f);
-            if (ImGui::InputText("##texpath", buf, sizeof(buf))) {
-                auto* mutableNode = const_cast<material::MaterialNode*>(&node);
-                mutableNode->parameter = std::string(buf);
-                m_Material->MarkDirty();
+            
+            // Extract just the filename for display
+            std::string displayName = path.empty() ? "(no texture)" : path;
+            size_t lastSlash = displayName.find_last_of("/\\");
+            if (lastSlash != std::string::npos) {
+                displayName = displayName.substr(lastSlash + 1);
+            }
+            
+            // Truncate if too long
+            if (displayName.length() > 18) {
+                displayName = displayName.substr(0, 15) + "...";
+            }
+            
+            // Show as clickable link
+            if (!path.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.7f, 1.0f, 1.0f));
+                if (ImGui::Selectable(displayName.c_str(), false, ImGuiSelectableFlags_None, ImVec2(130.0f, 0.0f))) {
+                    // Navigate to the asset in content browser
+                    if (m_NavigateToAsset) {
+                        m_NavigateToAsset(path);
+                    }
+                }
+                ImGui::PopStyleColor();
+                
+                // Tooltip with full path
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Click to locate: %s", path.c_str());
+                }
+            } else {
+                ImGui::TextDisabled("%s", displayName.c_str());
+            }
+            
+            // Drag-drop target on the node itself to change texture
+            if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("TEXTURE_PATH")) {
+                    std::string newPath(static_cast<const char*>(payload->Data));
+                    auto* mutableNode = const_cast<material::MaterialNode*>(&node);
+                    mutableNode->parameter = newPath;
+                    m_Material->MarkDirty();
+                    LUCENT_CORE_INFO("Updated texture node: {}", newPath);
+                }
+                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("ASSET_PATH")) {
+                    std::string newPath(static_cast<const char*>(payload->Data));
+                    // Check if it's a texture
+                    std::string ext = newPath.substr(newPath.find_last_of('.'));
+                    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".hdr" || ext == ".tga") {
+                        auto* mutableNode = const_cast<material::MaterialNode*>(&node);
+                        mutableNode->parameter = newPath;
+                        m_Material->MarkDirty();
+                        LUCENT_CORE_INFO("Updated texture node: {}", newPath);
+                    }
+                }
+                ImGui::EndDragDropTarget();
             }
             break;
         }
@@ -484,11 +658,20 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
             if (selection >= 0 && selection < (int)stops.size()) {
                 ImGui::Spacing();
                 ImGui::TextDisabled("Selected Stop");
-                float col[3] = { stops[selection].c.x, stops[selection].c.y, stops[selection].c.z };
-                if (ImGui::ColorEdit3("Color##ramp", col, ImGuiColorEditFlags_NoInputs)) {
-                    stops[selection].c = ImVec4(col[0], col[1], col[2], 1.0f);
-                    changed = true;
+                
+                // Draw color button - clicking opens popup outside node editor
+                ImVec4 stopCol = stops[selection].c;
+                if (ImGui::ColorButton("##rampcolbtn", stopCol, ImGuiColorEditFlags_NoTooltip, ImVec2(60, 16))) {
+                    m_PendingRampColorEdit = true;
+                    m_PendingRampNodeId = node.id;
+                    m_PendingRampStopIndex = selection;
+                    m_PendingRampColor[0] = stopCol.x;
+                    m_PendingRampColor[1] = stopCol.y;
+                    m_PendingRampColor[2] = stopCol.z;
                 }
+                ImGui::SameLine();
+                ImGui::TextDisabled("(click to edit)");
+                
                 float t = stops[selection].t;
                 if (selection == 0 || selection == (int)stops.size() - 1) {
                     ImGui::BeginDisabled();
@@ -733,6 +916,65 @@ bool MaterialGraphPanel::CanCreateLink(ed::PinId startPin, ed::PinId endPin) {
     material::PinID end = static_cast<material::PinID>(endPin.Get());
     
     return m_Material->GetGraph().CanCreateLink(start, end);
+}
+
+void MaterialGraphPanel::HandleDragDrop() {
+    // Suspend node editor to handle ImGui drag-drop
+    ed::Suspend();
+    
+    // Check if we're dragging something over the node editor
+    // Use the window itself as the drop target
+    if (ImGui::BeginDragDropTarget()) {
+        // Accept texture files
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("TEXTURE_PATH")) {
+            std::string path(static_cast<const char*>(payload->Data));
+            
+            // Get drop position in canvas coordinates
+            ImVec2 mousePos = ImGui::GetMousePos();
+            ImVec2 canvasPos = ed::ScreenToCanvas(mousePos);
+            
+            CreateNodeFromDrop(path, canvasPos);
+        }
+        
+        // Accept generic asset paths (we'll filter by extension)
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("ASSET_PATH")) {
+            std::string path(static_cast<const char*>(payload->Data));
+            
+            ImVec2 mousePos = ImGui::GetMousePos();
+            ImVec2 canvasPos = ed::ScreenToCanvas(mousePos);
+            
+            CreateNodeFromDrop(path, canvasPos);
+        }
+        
+        ImGui::EndDragDropTarget();
+    }
+    
+    ed::Resume();
+}
+
+void MaterialGraphPanel::CreateNodeFromDrop(const std::string& path, const ImVec2& position) {
+    if (!m_Material) return;
+    
+    material::MaterialGraph& graph = m_Material->GetGraph();
+    
+    // Determine file type by extension
+    std::string ext = path.substr(path.find_last_of('.'));
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    
+    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".hdr" || ext == ".tga" || ext == ".bmp") {
+        // Create a Texture2D node
+        material::NodeID nodeId = graph.CreateNode(material::NodeType::Texture2D, glm::vec2(position.x, position.y));
+        
+        // Set the texture path as the parameter
+        auto* node = graph.GetNode(nodeId);
+        if (node) {
+            node->parameter = path;
+            LUCENT_CORE_INFO("Created Texture2D node from drop: {}", path);
+        }
+        
+        m_Material->MarkDirty();
+    }
+    // Add more file type handling here as needed (e.g., .lmat for sub-materials)
 }
 
 } // namespace lucent
