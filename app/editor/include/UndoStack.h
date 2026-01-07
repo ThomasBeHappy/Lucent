@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <functional>
+#include <glm/glm.hpp>
 
 namespace lucent {
 
@@ -50,6 +51,9 @@ public:
     // Execute a command and push it onto the stack
     void Execute(std::unique_ptr<ICommand> command);
     
+    // Push a command without executing (for when state is already applied)
+    void Push(std::unique_ptr<ICommand> command);
+    
     // Execute without adding to stack (for internal use during undo/redo)
     void ExecuteWithoutPush(ICommand* command);
     
@@ -95,6 +99,56 @@ private:
 // ============================================================================
 // Common Command Types
 // ============================================================================
+
+// Forward declarations for scene types
+namespace scene {
+    class Scene;
+    struct TransformComponent;
+}
+
+// Transform edit command (for gizmo operations)
+class TransformCommand : public ICommand {
+public:
+    struct TransformState {
+        glm::vec3 position;
+        glm::vec3 rotation;
+        glm::vec3 scale;
+    };
+    
+    TransformCommand(scene::Scene* scene, uint32_t entityId, 
+                     const TransformState& before, const TransformState& after)
+        : m_Scene(scene)
+        , m_EntityId(entityId)
+        , m_Before(before)
+        , m_After(after) {}
+    
+    void Execute() override;
+    void Undo() override;
+    std::string GetDescription() const override { return "Transform"; }
+    
+    COMMAND_TYPE_ID(TransformCommand)
+    uint64_t GetTargetId() const override { return m_EntityId; }
+    
+    bool CanMergeWith(const ICommand* other) const override {
+        auto* o = dynamic_cast<const TransformCommand*>(other);
+        return o && o->m_EntityId == m_EntityId;
+    }
+    
+    void MergeWith(const ICommand* other) override {
+        auto* o = dynamic_cast<const TransformCommand*>(other);
+        if (o) {
+            m_After = o->m_After;
+        }
+    }
+    
+    static TransformState CaptureState(scene::TransformComponent* transform);
+    
+private:
+    scene::Scene* m_Scene;
+    uint32_t m_EntityId;
+    TransformState m_Before;
+    TransformState m_After;
+};
 
 // Generic lambda-based command for simple cases
 class LambdaCommand : public ICommand {

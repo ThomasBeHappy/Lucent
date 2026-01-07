@@ -65,6 +65,11 @@ bool Renderer::Init(VulkanContext* context, Device* device, const RendererConfig
         return false;
     }
     
+    if (!CreateShadowResources()) {
+        LUCENT_CORE_ERROR("Failed to create shadow resources");
+        return false;
+    }
+    
     LUCENT_CORE_INFO("Renderer initialized");
     return true;
 }
@@ -74,6 +79,7 @@ void Renderer::Shutdown() {
     
     m_Context->WaitIdle();
     
+    DestroyShadowResources();
     DestroyPipelines();
     DestroyFramebuffers();
     DestroyRenderPasses();
@@ -1116,6 +1122,258 @@ void Renderer::TransitionSwapchainToPresent(VkCommandBuffer cmd) {
         vkCmdPipelineBarrier2(cmd, &depInfo);
     }
     // Legacy path: render pass handles the transition to PRESENT_SRC_KHR
+}
+
+bool Renderer::CreateShadowResources() {
+    VkDevice device = m_Context->GetDevice();
+    
+    // Create shadow map depth image
+    ImageDesc shadowDesc{};
+    shadowDesc.width = SHADOW_MAP_SIZE;
+    shadowDesc.height = SHADOW_MAP_SIZE;
+    shadowDesc.format = VK_FORMAT_D32_SFLOAT;
+    shadowDesc.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    shadowDesc.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    shadowDesc.debugName = "ShadowMap";
+    
+    if (!m_ShadowMap.Init(m_Device, shadowDesc)) {
+        LUCENT_CORE_ERROR("Failed to create shadow map image");
+        return false;
+    }
+    
+    // Transition to depth attachment
+    m_Device->ImmediateSubmit([this](VkCommandBuffer cmd) {
+        m_ShadowMap.TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    });
+    
+    // Create shadow sampler with comparison and border
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    samplerInfo.compareEnable = VK_FALSE; // Using regular sampling for PCF
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    
+    if (vkCreateSampler(device, &samplerInfo, nullptr, &m_ShadowSampler) != VK_SUCCESS) {
+        LUCENT_CORE_ERROR("Failed to create shadow sampler");
+        return false;
+    }
+    
+    // Create shadow render pass (depth-only)
+    VkAttachmentDescription depthAttachment{};
+    depthAttachment.format = VK_FORMAT_D32_SFLOAT;
+    depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    
+    VkAttachmentReference depthRef{};
+    depthRef.attachment = 0;
+    depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 0;
+    subpass.pDepthStencilAttachment = &depthRef;
+    
+    VkSubpassDependency dependency{};
+    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependency.dstSubpass = 0;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependency.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependency.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    
+    VkRenderPassCreateInfo renderPassInfo{};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    renderPassInfo.attachmentCount = 1;
+    renderPassInfo.pAttachments = &depthAttachment;
+    renderPassInfo.subpassCount = 1;
+    renderPassInfo.pSubpasses = &subpass;
+    renderPassInfo.dependencyCount = 1;
+    renderPassInfo.pDependencies = &dependency;
+    
+    if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &m_ShadowRenderPass) != VK_SUCCESS) {
+        LUCENT_CORE_ERROR("Failed to create shadow render pass");
+        return false;
+    }
+    
+    // Create shadow framebuffer
+    VkFramebufferCreateInfo fbInfo{};
+    fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fbInfo.renderPass = m_ShadowRenderPass;
+    fbInfo.attachmentCount = 1;
+    VkImageView shadowView = m_ShadowMap.GetView();
+    fbInfo.pAttachments = &shadowView;
+    fbInfo.width = SHADOW_MAP_SIZE;
+    fbInfo.height = SHADOW_MAP_SIZE;
+    fbInfo.layers = 1;
+    
+    if (vkCreateFramebuffer(device, &fbInfo, nullptr, &m_ShadowFramebuffer) != VK_SUCCESS) {
+        LUCENT_CORE_ERROR("Failed to create shadow framebuffer");
+        return false;
+    }
+    
+    // Create descriptor set layout for shadow map sampling
+    VkDescriptorSetLayoutBinding shadowBinding{};
+    shadowBinding.binding = 0;
+    shadowBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    shadowBinding.descriptorCount = 1;
+    shadowBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = 1;
+    layoutInfo.pBindings = &shadowBinding;
+    
+    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_ShadowDescriptorLayout) != VK_SUCCESS) {
+        LUCENT_CORE_ERROR("Failed to create shadow descriptor layout");
+        return false;
+    }
+    
+    // Allocate descriptor set
+    m_ShadowDescriptorSet = m_DescriptorAllocator.Allocate(m_ShadowDescriptorLayout);
+    if (m_ShadowDescriptorSet == VK_NULL_HANDLE) {
+        LUCENT_CORE_ERROR("Failed to allocate shadow descriptor set");
+        return false;
+    }
+    
+    // Update descriptor set
+    DescriptorWriter writer;
+    writer.WriteImage(0, m_ShadowMap.GetView(), m_ShadowSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    writer.UpdateSet(device, m_ShadowDescriptorSet);
+    
+    // Load shadow shader
+    m_ShadowVertShader = PipelineBuilder::LoadShaderModule(device, "shaders/shadow_depth.spv");
+    if (m_ShadowVertShader == VK_NULL_HANDLE) {
+        LUCENT_CORE_ERROR("Failed to load shadow vertex shader");
+        return false;
+    }
+    
+    // Create shadow pipeline layout (just push constants)
+    VkPushConstantRange pushConstant{};
+    pushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pushConstant.offset = 0;
+    pushConstant.size = sizeof(glm::mat4) * 2; // model + lightViewProj
+    
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushConstant;
+    
+    if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &m_ShadowPipelineLayout) != VK_SUCCESS) {
+        LUCENT_CORE_ERROR("Failed to create shadow pipeline layout");
+        return false;
+    }
+    
+    // Create shadow pipeline
+    PipelineBuilder builder;
+    builder.AddShaderStage(VK_SHADER_STAGE_VERTEX_BIT, m_ShadowVertShader);
+    // No fragment shader needed for depth-only pass
+    
+    // Vertex input for mesh
+    std::vector<VkVertexInputBindingDescription> bindings = {
+        {0, sizeof(float) * 12, VK_VERTEX_INPUT_RATE_VERTEX} // pos + normal + uv + tangent
+    };
+    std::vector<VkVertexInputAttributeDescription> attributes = {
+        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, // position
+        {1, 0, VK_FORMAT_R32G32B32_SFLOAT, sizeof(float) * 3}, // normal
+        {2, 0, VK_FORMAT_R32G32_SFLOAT, sizeof(float) * 6}, // uv
+        {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, sizeof(float) * 8} // tangent
+    };
+    builder.SetVertexInput(bindings, attributes);
+    builder.SetInputAssembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+    builder.SetRasterizer(VK_POLYGON_MODE_FILL, VK_CULL_MODE_FRONT_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    builder.SetDepthStencil(true, true, VK_COMPARE_OP_LESS_OR_EQUAL);
+    builder.SetMultisample(VK_SAMPLE_COUNT_1_BIT);
+    builder.SetLayout(m_ShadowPipelineLayout);
+    builder.SetRenderPass(m_ShadowRenderPass);
+    builder.SetDepthAttachmentFormat(VK_FORMAT_D32_SFLOAT);
+    
+    m_ShadowPipeline = builder.Build(device);
+    if (m_ShadowPipeline == VK_NULL_HANDLE) {
+        LUCENT_CORE_ERROR("Failed to create shadow pipeline");
+        return false;
+    }
+    
+    LUCENT_CORE_INFO("Shadow resources created ({}x{})", SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
+    return true;
+}
+
+void Renderer::DestroyShadowResources() {
+    VkDevice device = m_Context ? m_Context->GetDevice() : VK_NULL_HANDLE;
+    if (device == VK_NULL_HANDLE) return;
+    
+    if (m_ShadowPipeline) {
+        vkDestroyPipeline(device, m_ShadowPipeline, nullptr);
+        m_ShadowPipeline = VK_NULL_HANDLE;
+    }
+    if (m_ShadowPipelineLayout) {
+        vkDestroyPipelineLayout(device, m_ShadowPipelineLayout, nullptr);
+        m_ShadowPipelineLayout = VK_NULL_HANDLE;
+    }
+    if (m_ShadowVertShader) {
+        vkDestroyShaderModule(device, m_ShadowVertShader, nullptr);
+        m_ShadowVertShader = VK_NULL_HANDLE;
+    }
+    if (m_ShadowDescriptorLayout) {
+        vkDestroyDescriptorSetLayout(device, m_ShadowDescriptorLayout, nullptr);
+        m_ShadowDescriptorLayout = VK_NULL_HANDLE;
+    }
+    if (m_ShadowFramebuffer) {
+        vkDestroyFramebuffer(device, m_ShadowFramebuffer, nullptr);
+        m_ShadowFramebuffer = VK_NULL_HANDLE;
+    }
+    if (m_ShadowRenderPass) {
+        vkDestroyRenderPass(device, m_ShadowRenderPass, nullptr);
+        m_ShadowRenderPass = VK_NULL_HANDLE;
+    }
+    if (m_ShadowSampler) {
+        vkDestroySampler(device, m_ShadowSampler, nullptr);
+        m_ShadowSampler = VK_NULL_HANDLE;
+    }
+    m_ShadowMap.Shutdown();
+}
+
+void Renderer::BeginShadowPass(VkCommandBuffer cmd) {
+    VkRenderPassBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    beginInfo.renderPass = m_ShadowRenderPass;
+    beginInfo.framebuffer = m_ShadowFramebuffer;
+    beginInfo.renderArea.offset = {0, 0};
+    beginInfo.renderArea.extent = {SHADOW_MAP_SIZE, SHADOW_MAP_SIZE};
+    
+    VkClearValue clearValue{};
+    clearValue.depthStencil = {1.0f, 0};
+    beginInfo.clearValueCount = 1;
+    beginInfo.pClearValues = &clearValue;
+    
+    vkCmdBeginRenderPass(cmd, &beginInfo, VK_SUBPASS_CONTENTS_INLINE);
+    
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(SHADOW_MAP_SIZE);
+    viewport.height = static_cast<float>(SHADOW_MAP_SIZE);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = {SHADOW_MAP_SIZE, SHADOW_MAP_SIZE};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+}
+
+void Renderer::EndShadowPass(VkCommandBuffer cmd) {
+    vkCmdEndRenderPass(cmd);
 }
 
 } // namespace lucent::gfx

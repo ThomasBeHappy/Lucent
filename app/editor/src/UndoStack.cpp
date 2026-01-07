@@ -1,5 +1,7 @@
 #include "UndoStack.h"
 #include "lucent/core/Log.h"
+#include "lucent/scene/Scene.h"
+#include "lucent/scene/Components.h"
 
 namespace lucent {
 
@@ -34,6 +36,24 @@ void UndoStack::Execute(std::unique_ptr<ICommand> command) {
     }
     
     LUCENT_CORE_DEBUG("Executed command: {} (undo stack: {})", 
+        m_UndoStack.back()->GetDescription(), m_UndoStack.size());
+}
+
+void UndoStack::Push(std::unique_ptr<ICommand> command) {
+    if (!command) return;
+    
+    // Clear redo stack (new action invalidates redo history)
+    m_RedoStack.clear();
+    
+    // Push onto undo stack without executing
+    m_UndoStack.push_back(std::move(command));
+    
+    // Trim if exceeding max size
+    if (m_MaxStackSize > 0 && m_UndoStack.size() > m_MaxStackSize) {
+        m_UndoStack.erase(m_UndoStack.begin());
+    }
+    
+    LUCENT_CORE_DEBUG("Pushed command: {} (undo stack: {})", 
         m_UndoStack.back()->GetDescription(), m_UndoStack.size());
 }
 
@@ -102,6 +122,48 @@ void UndoStack::Clear() {
     m_RedoStack.clear();
     m_InMergeWindow = false;
     LUCENT_CORE_DEBUG("Undo stack cleared");
+}
+
+// ============================================================================
+// TransformCommand Implementation
+// ============================================================================
+
+void TransformCommand::Execute() {
+    if (!m_Scene) return;
+    
+    scene::Entity entity = m_Scene->GetEntity(m_EntityId);
+    if (!entity.IsValid()) return;
+    
+    auto* transform = entity.GetComponent<scene::TransformComponent>();
+    if (!transform) return;
+    
+    transform->position = m_After.position;
+    transform->rotation = m_After.rotation;
+    transform->scale = m_After.scale;
+}
+
+void TransformCommand::Undo() {
+    if (!m_Scene) return;
+    
+    scene::Entity entity = m_Scene->GetEntity(m_EntityId);
+    if (!entity.IsValid()) return;
+    
+    auto* transform = entity.GetComponent<scene::TransformComponent>();
+    if (!transform) return;
+    
+    transform->position = m_Before.position;
+    transform->rotation = m_Before.rotation;
+    transform->scale = m_Before.scale;
+}
+
+TransformCommand::TransformState TransformCommand::CaptureState(scene::TransformComponent* transform) {
+    TransformState state;
+    if (transform) {
+        state.position = transform->position;
+        state.rotation = transform->rotation;
+        state.scale = transform->scale;
+    }
+    return state;
 }
 
 } // namespace lucent

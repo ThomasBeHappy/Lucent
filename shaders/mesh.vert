@@ -10,15 +10,17 @@ layout(location = 1) out vec3 outNormal;
 layout(location = 2) out vec2 outUV;
 layout(location = 3) out vec3 outTangent;
 layout(location = 4) out vec3 outBitangent;
+layout(location = 5) out vec4 outShadowCoord;
 
 // Push constants for per-object data
 layout(push_constant) uniform PushConstants {
     mat4 model;
     mat4 viewProj;
     vec4 baseColor;      // RGB + alpha
-    vec4 materialParams; // metallic, roughness, emissiveIntensity, unused
-    vec4 emissive;       // RGB + unused
+    vec4 materialParams; // metallic, roughness, emissiveIntensity, shadowBias
+    vec4 emissive;       // RGB + shadowEnabled
     vec4 cameraPos;      // Camera world position
+    mat4 lightViewProj;  // Light space matrix for shadows
 } pc;
 
 void main() {
@@ -32,6 +34,9 @@ void main() {
     outBitangent = cross(outNormal, outTangent) * inTangent.w;
     
     outUV = inUV;
+    
+    // Shadow coordinate (light space position)
+    outShadowCoord = pc.lightViewProj * worldPos;
     
     gl_Position = pc.viewProj * worldPos;
 }

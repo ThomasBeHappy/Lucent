@@ -86,6 +86,15 @@ public:
     VkRenderPass GetOffscreenRenderPass() const { return m_OffscreenRenderPass; }
     VkRenderPass GetSwapchainRenderPass() const { return m_SwapchainRenderPass; }
     
+    // Shadow mapping
+    void BeginShadowPass(VkCommandBuffer cmd);
+    void EndShadowPass(VkCommandBuffer cmd);
+    VkDescriptorSet GetShadowDescriptorSet() const { return m_ShadowDescriptorSet; }
+    VkPipeline GetShadowPipeline() const { return m_ShadowPipeline; }
+    VkPipelineLayout GetShadowPipelineLayout() const { return m_ShadowPipelineLayout; }
+    Image* GetShadowMap() { return &m_ShadowMap; }
+    VkSampler GetShadowSampler() const { return m_ShadowSampler; }
+    
 private:
     bool CreateFrameResources();
     bool CreateOffscreenResources();
@@ -93,11 +102,13 @@ private:
     bool CreateSampler();
     bool CreateRenderPasses();
     bool CreateFramebuffers();
+    bool CreateShadowResources();
     void DestroyFrameResources();
     void DestroyOffscreenResources();
     void DestroyPipelines();
     void DestroyRenderPasses();
     void DestroyFramebuffers();
+    void DestroyShadowResources();
     
     void RecreateSwapchain();
     
@@ -166,6 +177,18 @@ private:
     VkRenderPass m_SwapchainRenderPass = VK_NULL_HANDLE;
     VkFramebuffer m_OffscreenFramebuffer = VK_NULL_HANDLE;
     std::vector<VkFramebuffer> m_SwapchainFramebuffers;
+    
+    // Shadow mapping
+    static constexpr uint32_t SHADOW_MAP_SIZE = 2048;
+    Image m_ShadowMap;
+    VkSampler m_ShadowSampler = VK_NULL_HANDLE;
+    VkRenderPass m_ShadowRenderPass = VK_NULL_HANDLE;
+    VkFramebuffer m_ShadowFramebuffer = VK_NULL_HANDLE;
+    VkPipeline m_ShadowPipeline = VK_NULL_HANDLE;
+    VkPipelineLayout m_ShadowPipelineLayout = VK_NULL_HANDLE;
+    VkShaderModule m_ShadowVertShader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_ShadowDescriptorLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_ShadowDescriptorSet = VK_NULL_HANDLE;
 };
 
 } // namespace lucent::gfx

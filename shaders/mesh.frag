@@ -5,17 +5,22 @@ layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUV;
 layout(location = 3) in vec3 inTangent;
 layout(location = 4) in vec3 inBitangent;
+layout(location = 5) in vec4 inShadowCoord;
 
 layout(location = 0) out vec4 outColor;
+
+// Shadow map sampler
+layout(set = 0, binding = 0) uniform sampler2D shadowMap;
 
 // Push constants matching vertex shader
 layout(push_constant) uniform PushConstants {
     mat4 model;
     mat4 viewProj;
     vec4 baseColor;      // RGB + alpha
-    vec4 materialParams; // metallic, roughness, emissiveIntensity, unused
-    vec4 emissive;       // RGB + unused
+    vec4 materialParams; // metallic, roughness, emissiveIntensity, shadowBias
+    vec4 emissive;       // RGB + shadowEnabled
     vec4 cameraPos;      // Camera world position
+    mat4 lightViewProj;  // Light space matrix for shadows
 } pc;
 
 // Material parameters from push constants
@@ -24,7 +29,9 @@ layout(push_constant) uniform PushConstants {
 #define u_Metallic pc.materialParams.x
 #define u_Roughness pc.materialParams.y
 #define u_EmissiveIntensity pc.materialParams.z
+#define u_ShadowBias pc.materialParams.w
 #define u_Emissive pc.emissive.rgb
+#define u_ShadowEnabled pc.emissive.w
 #define u_CameraPos pc.cameraPos.xyz
 
 // Lighting constants
@@ -80,6 +87,38 @@ vec3 hemisphereAmbient(vec3 N) {
     return mix(ambientBottom, ambientTop, blend);
 }
 
+// Shadow calculation with PCF
+float calcShadow(vec4 shadowCoord, float bias) {
+    // Perspective divide
+    vec3 projCoords = shadowCoord.xyz / shadowCoord.w;
+    
+    // Transform to [0,1] range
+    projCoords.xy = projCoords.xy * 0.5 + 0.5;
+    
+    // Check if outside shadow map
+    if (projCoords.x < 0.0 || projCoords.x > 1.0 ||
+        projCoords.y < 0.0 || projCoords.y > 1.0 ||
+        projCoords.z > 1.0) {
+        return 1.0; // Not in shadow
+    }
+    
+    // Current fragment depth
+    float currentDepth = projCoords.z;
+    
+    // PCF (Percentage-Closer Filtering) - 3x3 kernel
+    float shadow = 0.0;
+    vec2 texelSize = 1.0 / textureSize(shadowMap, 0);
+    for (int x = -1; x <= 1; ++x) {
+        for (int y = -1; y <= 1; ++y) {
+            float pcfDepth = texture(shadowMap, projCoords.xy + vec2(x, y) * texelSize).r;
+            shadow += currentDepth - bias > pcfDepth ? 0.0 : 1.0;
+        }
+    }
+    shadow /= 9.0;
+    
+    return shadow;
+}
+
 void main() {
     vec3 N = normalize(inNormal);
     vec3 V = normalize(u_CameraPos - inWorldPos);
@@ -107,11 +146,18 @@ void main() {
     vec3 kS = F;
     vec3 kD = (1.0 - kS) * (1.0 - metallic);
     
-    // Direct lighting
-    float NdotL = max(dot(N, L), 0.0);
-    vec3 Lo = (kD * albedo / PI + specular) * lightColor * lightIntensity * NdotL;
+    // Shadow calculation
+    float shadow = 1.0;
+    if (u_ShadowEnabled > 0.5) {
+        float bias = u_ShadowBias;
+        shadow = calcShadow(inShadowCoord, bias);
+    }
     
-    // Ambient (simple hemisphere + Fresnel for metals)
+    // Direct lighting with shadow
+    float NdotL = max(dot(N, L), 0.0);
+    vec3 Lo = (kD * albedo / PI + specular) * lightColor * lightIntensity * NdotL * shadow;
+    
+    // Ambient (simple hemisphere + Fresnel for metals) - not affected by shadow
     vec3 ambient = hemisphereAmbient(N) * albedo * (1.0 - metallic) * 0.3;
     vec3 F_ambient = fresnelSchlickRoughness(max(dot(N, V), 0.0), F0, roughness);
     ambient += F_ambient * hemisphereAmbient(reflect(-V, N)) * 0.15;

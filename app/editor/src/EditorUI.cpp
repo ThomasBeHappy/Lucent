@@ -335,6 +335,9 @@ void EditorUI::BeginFrame() {
     ImGui::NewFrame();
     ImGuizmo::BeginFrame();
     
+    // Handle global keyboard shortcuts
+    HandleGlobalShortcuts();
+    
     DrawDockspace();
     
     if (m_ShowViewport) DrawViewportPanel();
@@ -578,11 +581,17 @@ void EditorUI::DrawDockspace() {
         }
         
         if (ImGui::BeginMenu("Edit")) {
-            if (ImGui::MenuItem("Undo", "Ctrl+Z", false, false)) {
-                // TODO: Implement undo stack
+            auto& undoStack = UndoStack::Get();
+            std::string undoLabel = undoStack.CanUndo() ? 
+                "Undo " + undoStack.GetUndoDescription() : "Undo";
+            std::string redoLabel = undoStack.CanRedo() ? 
+                "Redo " + undoStack.GetRedoDescription() : "Redo";
+            
+            if (ImGui::MenuItem(undoLabel.c_str(), "Ctrl+Z", false, undoStack.CanUndo())) {
+                undoStack.Undo();
             }
-            if (ImGui::MenuItem("Redo", "Ctrl+Y", false, false)) {
-                // TODO: Implement redo stack
+            if (ImGui::MenuItem(redoLabel.c_str(), "Ctrl+Y", false, undoStack.CanRedo())) {
+                undoStack.Redo();
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Cut", "Ctrl+X", false, !m_SelectedEntities.empty())) {
@@ -884,6 +893,39 @@ void EditorUI::DrawViewportPanel() {
     if (ImGui::Button(m_GizmoMode == GizmoMode::World ? "[W]orld" : "World")) {
         m_GizmoMode = GizmoMode::World;
     }
+    ImGui::SameLine();
+    ImGui::Text(" | ");
+    ImGui::SameLine();
+    
+    // Snapping toggle and settings
+    if (ImGui::Button(m_SnapEnabled ? "[Snap]" : "Snap")) {
+        m_SnapEnabled = !m_SnapEnabled;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::Text("Toggle snapping (hold Ctrl)");
+        ImGui::EndTooltip();
+    }
+    
+    // Snap settings popup
+    if (m_SnapEnabled) {
+        ImGui::SameLine();
+        if (ImGui::Button("...##snap")) {
+            ImGui::OpenPopup("SnapSettings");
+        }
+        
+        if (ImGui::BeginPopup("SnapSettings")) {
+            ImGui::Text("Snap Settings");
+            ImGui::Separator();
+            ImGui::SetNextItemWidth(80);
+            ImGui::DragFloat("Move", &m_TranslateSnap, 0.1f, 0.1f, 10.0f, "%.1f");
+            ImGui::SetNextItemWidth(80);
+            ImGui::DragFloat("Rotate", &m_RotateSnap, 1.0f, 1.0f, 90.0f, "%.0f deg");
+            ImGui::SetNextItemWidth(80);
+            ImGui::DragFloat("Scale", &m_ScaleSnap, 0.01f, 0.01f, 1.0f, "%.2f");
+            ImGui::EndPopup();
+        }
+    }
     
     ImGui::PopStyleVar(2);
     
@@ -958,7 +1000,15 @@ void EditorUI::DrawGizmo() {
         m_SnapEnabled ? snapValues : nullptr
     );
     
-    m_UsingGizmo = ImGuizmo::IsUsing();
+    bool currentlyUsing = ImGuizmo::IsUsing();
+    
+    // Detect gizmo start - capture initial state for undo
+    if (currentlyUsing && !m_UsingGizmo) {
+        m_GizmoStartPosition = transform->position;
+        m_GizmoStartRotation = transform->rotation;
+        m_GizmoStartScale = transform->scale;
+        UndoStack::Get().BeginMergeWindow();
+    }
     
     // Apply changes back to transform
     if (manipulated) {
@@ -974,6 +1024,36 @@ void EditorUI::DrawGizmo() {
         transform->rotation = rotation;
         transform->scale = scale;
     }
+    
+    // Detect gizmo end - create undo command
+    if (!currentlyUsing && m_UsingGizmo) {
+        UndoStack::Get().EndMergeWindow();
+        
+        // Only create command if transform actually changed
+        if (m_GizmoStartPosition != transform->position ||
+            m_GizmoStartRotation != transform->rotation ||
+            m_GizmoStartScale != transform->scale) {
+            
+            TransformCommand::TransformState before{
+                m_GizmoStartPosition,
+                m_GizmoStartRotation,
+                m_GizmoStartScale
+            };
+            TransformCommand::TransformState after{
+                transform->position,
+                transform->rotation,
+                transform->scale
+            };
+            
+            // Push without executing (state already applied during drag)
+            auto cmd = std::make_unique<TransformCommand>(m_Scene, selected.GetID(), before, after);
+            UndoStack::Get().Push(std::move(cmd));
+            
+            m_SceneDirty = true;
+        }
+    }
+    
+    m_UsingGizmo = currentlyUsing;
 }
 
 void EditorUI::DrawOutlinerPanel() {
@@ -2252,6 +2332,43 @@ void EditorUI::DrawModals() {
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
+    }
+}
+
+void EditorUI::HandleGlobalShortcuts() {
+    ImGuiIO& io = ImGui::GetIO();
+    
+    // Don't process shortcuts if typing in a text field
+    if (io.WantTextInput) {
+        return;
+    }
+    
+    // Ctrl+Z - Undo
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z) && !io.KeyShift) {
+        if (UndoStack::Get().CanUndo()) {
+            UndoStack::Get().Undo();
+        }
+    }
+    
+    // Ctrl+Y or Ctrl+Shift+Z - Redo
+    if ((io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) ||
+        (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z))) {
+        if (UndoStack::Get().CanRedo()) {
+            UndoStack::Get().Redo();
+        }
+    }
+    
+    // Delete - Delete selected entities
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !m_SelectedEntities.empty()) {
+        // Create undo command for delete
+        // TODO: Implement delete with undo
+        for (auto id : m_SelectedEntities) {
+            if (m_Scene) {
+                m_Scene->DestroyEntity(m_Scene->GetEntity(id));
+            }
+        }
+        ClearSelection();
+        m_SceneDirty = true;
     }
 }
 

@@ -115,6 +115,7 @@ private:
     void DrawEntityNode(scene::Entity entity);
     void DrawComponentsPanel(scene::Entity entity);
     void DrawModals();
+    void HandleGlobalShortcuts();
     
     // Picking
     void HandleViewportClick();
@@ -157,6 +158,12 @@ private:
     GizmoOperation m_GizmoOperation = GizmoOperation::Translate;
     GizmoMode m_GizmoMode = GizmoMode::Local;
     bool m_UsingGizmo = false;
+    bool m_WasUsingGizmo = false; // Track gizmo state changes
+    
+    // Gizmo undo state
+    glm::vec3 m_GizmoStartPosition{0.0f};
+    glm::vec3 m_GizmoStartRotation{0.0f};
+    glm::vec3 m_GizmoStartScale{1.0f};
     
     // Snapping
     bool m_SnapEnabled = false;
