@@ -93,6 +93,11 @@ public:
     RenderMode GetRenderMode() const { return m_RenderMode; }
     void SetRenderMode(RenderMode mode) { m_RenderMode = mode; }
     
+    // PostFX settings
+    float GetExposure() const { return m_Exposure; }
+    int GetTonemapMode() const { return m_TonemapMode; }
+    float GetGamma() const { return m_Gamma; }
+    
     // Snapping
     float GetTranslateSnap() const { return m_TranslateSnap; }
     float GetRotateSnap() const { return m_RotateSnap; }
@@ -111,6 +116,7 @@ private:
     void DrawInspectorPanel();
     void DrawContentBrowserPanel();
     void DrawConsolePanel();
+    void DrawRenderPropertiesPanel();
     
     void DrawEntityNode(scene::Entity entity);
     void DrawComponentsPanel(scene::Entity entity);
@@ -174,6 +180,11 @@ private:
     // Render mode
     RenderMode m_RenderMode = RenderMode::Shaded;
     
+    // PostFX settings
+    float m_Exposure = 1.0f;
+    int m_TonemapMode = 2; // ACES by default
+    float m_Gamma = 2.2f;
+    
     // Layout file path
     std::string m_LayoutPath = "imgui.ini";
     
@@ -183,6 +194,7 @@ private:
     bool m_ShowInspector = true;
     bool m_ShowContentBrowser = true;
     bool m_ShowConsole = true;
+    bool m_ShowRenderProperties = false;
     
     bool m_FirstFrame = true;
     

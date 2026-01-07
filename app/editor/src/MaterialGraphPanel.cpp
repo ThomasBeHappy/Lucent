@@ -1,4 +1,5 @@
 #include "MaterialGraphPanel.h"
+#include "UndoStack.h"
 #include "lucent/material/MaterialAsset.h"
 #include "lucent/core/Log.h"
 #include <imgui-node-editor/imgui_node_editor.h>
@@ -271,7 +272,8 @@ void MaterialGraphPanel::DrawNodeEditor() {
         m_PendingColorEdit = false;
     }
     
-    if (ImGui::BeginPopup("ColorPickerPopup")) {
+    bool colorPopupOpen = ImGui::BeginPopup("ColorPickerPopup");
+    if (colorPopupOpen) {
         if (ImGui::ColorPicker3("##picker", m_PendingColor, ImGuiColorEditFlags_PickerHueWheel)) {
             // Update the node
             auto& colorGraph = m_Material->GetGraph();
@@ -283,6 +285,16 @@ void MaterialGraphPanel::DrawNodeEditor() {
             }
         }
         ImGui::EndPopup();
+    } else if (m_IsEditingVec3 && m_EditingNodeId == m_PendingColorNodeId) {
+        // Popup just closed - create undo command
+        glm::vec3 afterValue(m_PendingColor[0], m_PendingColor[1], m_PendingColor[2]);
+        if (m_BeforeVec3 != afterValue) {
+            auto cmd = std::make_unique<MaterialParamCommand>(
+                m_Material, m_PendingColorNodeId, "Color", m_BeforeVec3, afterValue);
+            UndoStack::Get().Push(std::move(cmd));
+        }
+        m_IsEditingVec3 = false;
+        m_EditingNodeId = 0;
     }
     
     // ColorRamp stop color picker
@@ -394,6 +406,26 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
                 mutableNode->parameter = value;
                 m_Material->MarkDirty();
             }
+            // Track undo state
+            if (ImGui::IsItemActivated()) {
+                m_EditingNodeId = node.id;
+                m_BeforeFloat = std::holds_alternative<float>(node.parameter) ? 
+                                std::get<float>(node.parameter) : 0.0f;
+                m_IsEditingFloat = true;
+                UndoStack::Get().BeginMergeWindow();
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit() && m_IsEditingFloat && m_EditingNodeId == node.id) {
+                float afterValue = std::holds_alternative<float>(node.parameter) ? 
+                                   std::get<float>(node.parameter) : 0.0f;
+                if (m_BeforeFloat != afterValue) {
+                    auto cmd = std::make_unique<MaterialParamCommand>(
+                        m_Material, node.id, "Float", m_BeforeFloat, afterValue);
+                    UndoStack::Get().Push(std::move(cmd));
+                }
+                UndoStack::Get().EndMergeWindow();
+                m_IsEditingFloat = false;
+                m_EditingNodeId = 0;
+            }
             break;
         }
         case material::NodeType::ConstVec3: {
@@ -408,6 +440,10 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
                 m_PendingColor[0] = value.x;
                 m_PendingColor[1] = value.y;
                 m_PendingColor[2] = value.z;
+                // Save before value for undo
+                m_BeforeVec3 = value;
+                m_EditingNodeId = node.id;
+                m_IsEditingVec3 = true;
             }
             break;
         }

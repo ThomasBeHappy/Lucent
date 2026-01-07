@@ -4,6 +4,7 @@
 #include "lucent/material/MaterialAsset.h"
 #include <imgui.h>
 #include <imgui-node-editor/imgui_node_editor.h>
+#include <glm/glm.hpp>
 #include <string>
 #include <unordered_map>
 #include <functional>
@@ -100,6 +101,13 @@ private:
     material::NodeID m_PendingRampNodeId = 0;
     int m_PendingRampStopIndex = -1;
     float m_PendingRampColor[3] = { 0.0f, 0.0f, 0.0f };
+    
+    // Undo support - track "before" values when editing starts
+    material::NodeID m_EditingNodeId = 0;
+    float m_BeforeFloat = 0.0f;
+    glm::vec3 m_BeforeVec3{0.0f};
+    bool m_IsEditingFloat = false;
+    bool m_IsEditingVec3 = false;
 };
 
 } // namespace lucent

@@ -2,6 +2,8 @@
 #include "lucent/core/Log.h"
 #include "lucent/scene/Scene.h"
 #include "lucent/scene/Components.h"
+#include "lucent/material/MaterialAsset.h"
+#include "lucent/material/MaterialGraph.h"
 
 namespace lucent {
 
@@ -164,6 +166,56 @@ TransformCommand::TransformState TransformCommand::CaptureState(scene::Transform
         state.scale = transform->scale;
     }
     return state;
+}
+
+// ============================================================================
+// MaterialParamCommand Implementation
+// ============================================================================
+
+void MaterialParamCommand::Execute() {
+    if (!m_Material) return;
+    
+    auto& graph = m_Material->GetGraph();
+    material::MaterialNode* node = graph.GetNode(m_NodeId);
+    if (!node) return;
+    
+    switch (m_Type) {
+        case ParamType::Float:
+            node->parameter = m_FloatAfter;
+            break;
+        case ParamType::Vec3:
+            node->parameter = m_Vec3After;
+            break;
+        case ParamType::ColorRamp:
+            // ColorRamp handled separately if needed
+            break;
+    }
+    
+    // Trigger recompile
+    m_Material->MarkDirty();
+}
+
+void MaterialParamCommand::Undo() {
+    if (!m_Material) return;
+    
+    auto& graph = m_Material->GetGraph();
+    material::MaterialNode* node = graph.GetNode(m_NodeId);
+    if (!node) return;
+    
+    switch (m_Type) {
+        case ParamType::Float:
+            node->parameter = m_FloatBefore;
+            break;
+        case ParamType::Vec3:
+            node->parameter = m_Vec3Before;
+            break;
+        case ParamType::ColorRamp:
+            // ColorRamp handled separately if needed
+            break;
+    }
+    
+    // Trigger recompile
+    m_Material->MarkDirty();
 }
 
 } // namespace lucent

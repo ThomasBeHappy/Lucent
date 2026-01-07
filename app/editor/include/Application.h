@@ -96,6 +96,11 @@ private:
     void RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj);
     void UpdateLightMatrix();
     void RenderShadowPass(VkCommandBuffer cmd);
+    
+    // Traced mode support
+    void UpdateTracerScene();
+    void RenderTracedPath(VkCommandBuffer cmd);
+    bool m_TracerSceneDirty = true;
 };
 
 } // namespace lucent

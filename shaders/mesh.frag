@@ -33,6 +33,7 @@ layout(push_constant) uniform PushConstants {
 #define u_Emissive pc.emissive.rgb
 #define u_ShadowEnabled pc.emissive.w
 #define u_CameraPos pc.cameraPos.xyz
+#define u_Exposure pc.cameraPos.w
 
 // Lighting constants
 const vec3 lightDir = normalize(vec3(1.0, 1.0, 0.5));
@@ -165,11 +166,19 @@ void main() {
     // Emissive
     vec3 emission = u_Emissive * u_EmissiveIntensity;
     
-    // Final color
+    // Final color (HDR)
     vec3 color = ambient + Lo + emission;
     
-    // Reinhard tonemap
-    color = color / (color + vec3(1.0));
+    // Apply exposure
+    color *= u_Exposure;
+    
+    // ACES filmic tonemapping
+    float a = 2.51;
+    float b = 0.03;
+    float c = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    color = clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
     
     // Gamma correction
     color = pow(color, vec3(1.0 / 2.2));

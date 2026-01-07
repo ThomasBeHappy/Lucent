@@ -8,6 +8,8 @@ add_library(engine_gfx STATIC
     src/PipelineBuilder.cpp
     src/Renderer.cpp
     src/DebugUtils.cpp
+    src/RenderCapabilities.cpp
+    src/TracerCompute.cpp
 )
 
 target_include_directories(engine_gfx

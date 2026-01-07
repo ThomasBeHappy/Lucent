@@ -6,8 +6,12 @@
 #include "lucent/gfx/Image.h"
 #include "lucent/gfx/DescriptorAllocator.h"
 #include "lucent/gfx/PipelineBuilder.h"
+#include "lucent/gfx/RenderCapabilities.h"
+#include "lucent/gfx/RenderSettings.h"
+#include "lucent/gfx/TracerCompute.h"
 #include <glm/glm.hpp>
 #include <vector>
+#include <memory>
 
 namespace lucent::gfx {
 
@@ -68,6 +72,19 @@ public:
     
     VkPipeline GetSkyboxPipeline() const { return m_SkyboxPipeline; }
     VkPipelineLayout GetSkyboxPipelineLayout() const { return m_SkyboxPipelineLayout; }
+    
+    // Render capabilities and mode
+    const RenderCapabilities& GetCapabilities() const { return m_Capabilities; }
+    RenderMode GetRenderMode() const { return m_RenderMode; }
+    void SetRenderMode(RenderMode mode);
+    bool IsRenderModeAvailable(RenderMode mode) const { return m_Capabilities.IsModeAvailable(mode); }
+    
+    // Render settings
+    RenderSettings& GetSettings() { return m_Settings; }
+    const RenderSettings& GetSettings() const { return m_Settings; }
+    
+    // Tracer access
+    TracerCompute* GetTracerCompute() { return m_TracerCompute.get(); }
     
     // Post-processing
     VkPipeline GetPostFXPipeline() const { return m_PostFXPipeline; }
@@ -185,6 +202,14 @@ private:
     bool m_NeedsResize = false;
     uint32_t m_PendingWidth = 0;
     uint32_t m_PendingHeight = 0;
+    
+    // Render capabilities and current mode
+    RenderCapabilities m_Capabilities;
+    RenderMode m_RenderMode = RenderMode::Simple;
+    RenderSettings m_Settings;
+    
+    // Compute tracer (for Traced mode)
+    std::unique_ptr<TracerCompute> m_TracerCompute;
     
     // Legacy render pass support (Vulkan 1.1/1.2 fallback)
     VkRenderPass m_OffscreenRenderPass = VK_NULL_HANDLE;

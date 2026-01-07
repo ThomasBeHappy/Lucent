@@ -202,7 +202,7 @@ void Application::RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj) {
         pc.baseColor = glm::vec4(renderer.baseColor, 1.0f);
         pc.materialParams = glm::vec4(renderer.metallic, renderer.roughness, renderer.emissiveIntensity, m_ShadowBias);
         pc.emissive = glm::vec4(renderer.emissive, m_ShadowsEnabled ? 1.0f : 0.0f);
-        pc.cameraPos = glm::vec4(camPos, 0.0f);
+        pc.cameraPos = glm::vec4(camPos, m_EditorUI.GetExposure());
         pc.lightViewProj = m_LightViewProj;
         
         vkCmdPushConstants(cmd, currentLayout, 
@@ -322,8 +322,19 @@ void Application::Run() {
         // Process input
         ProcessInput();
         
+        // Store camera state before update
+        glm::mat4 prevViewMatrix = m_EditorCamera.GetViewMatrix();
+        
         // Update camera
         m_EditorCamera.Update(m_DeltaTime);
+        
+        // Check if camera has moved (reset accumulation for traced modes)
+        if (m_Renderer.GetRenderMode() != gfx::RenderMode::Simple) {
+            glm::mat4 newViewMatrix = m_EditorCamera.GetViewMatrix();
+            if (prevViewMatrix != newViewMatrix) {
+                m_Renderer.GetSettings().MarkDirty();
+            }
+        }
         
         RenderFrame();
     }
@@ -402,43 +413,94 @@ bool Application::InitWindow(const ApplicationConfig& config) {
 }
 
 void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
-    // Update light matrix for shadow mapping
-    UpdateLightMatrix();
-    
-    // Render shadow pass first
-    RenderShadowPass(cmd);
-    
     gfx::Image* offscreen = m_Renderer.GetOffscreenImage();
-    
     VkExtent2D extent = { offscreen->GetWidth(), offscreen->GetHeight() };
-    
-    LUCENT_GPU_SCOPE(cmd, "ScenePass");
-    
-    // Begin offscreen render pass (handles transitions and viewport setup)
-    m_Renderer.BeginOffscreenPass(cmd, glm::vec4(0.02f, 0.02f, 0.03f, 1.0f));
     
     // Update camera aspect ratio based on viewport size
     float aspectRatio = static_cast<float>(extent.width) / static_cast<float>(extent.height);
     m_EditorCamera.SetAspectRatio(aspectRatio);
     
-    // Get camera view-projection matrix
-    glm::mat4 viewProj = m_EditorCamera.GetViewProjectionMatrix();
+    // Check render mode
+    gfx::RenderMode renderMode = m_Renderer.GetRenderMode();
     
-    // Draw skybox first (renders at far plane, no depth write)
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Renderer.GetSkyboxPipeline());
-    vkCmdPushConstants(cmd, m_Renderer.GetSkyboxPipelineLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &viewProj);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
-    
-    // Draw grid
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Renderer.GetGridPipeline());
-    vkCmdPushConstants(cmd, m_Renderer.GetGridPipelineLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &viewProj);
-    vkCmdDraw(cmd, 6, 1, 0, 0);
-    
-    // Render scene meshes
-    RenderMeshes(cmd, viewProj);
-    
-    // End offscreen render pass
-    m_Renderer.EndOffscreenPass(cmd);
+    if (renderMode == gfx::RenderMode::Traced && m_Renderer.GetTracerCompute()) {
+        // =========================================================================
+        // Traced Mode: GPU compute path tracing
+        // =========================================================================
+        LUCENT_GPU_SCOPE(cmd, "TracedPass");
+        
+        // Clear offscreen to black first frame (before tracer populates it)
+        gfx::RenderSettings& settings = m_Renderer.GetSettings();
+        if (settings.accumulatedSamples == 0) {
+            m_Renderer.BeginOffscreenPass(cmd, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+            m_Renderer.EndOffscreenPass(cmd);
+        }
+        
+        // Render using compute tracer
+        RenderTracedPath(cmd);
+        
+        // Copy accumulation image to offscreen for display
+        gfx::TracerCompute* tracer = m_Renderer.GetTracerCompute();
+        if (tracer && tracer->GetAccumulationImage() && tracer->GetAccumulationImage()->GetHandle() != VK_NULL_HANDLE) {
+            // Transition offscreen to transfer dst
+            offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            
+            // Transition accumulation to transfer src
+            tracer->GetAccumulationImage()->TransitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            
+            // Blit accumulation to offscreen
+            VkImageBlit blitRegion{};
+            blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            blitRegion.srcSubresource.layerCount = 1;
+            blitRegion.srcOffsets[1] = { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 };
+            blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            blitRegion.dstSubresource.layerCount = 1;
+            blitRegion.dstOffsets[1] = { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 };
+            
+            vkCmdBlitImage(cmd, 
+                tracer->GetAccumulationImage()->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                offscreen->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1, &blitRegion, VK_FILTER_NEAREST);
+            
+            // Transition back
+            tracer->GetAccumulationImage()->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+            offscreen->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+    } else {
+        // =========================================================================
+        // Simple Mode: Standard raster PBR
+        // =========================================================================
+        
+        // Update light matrix for shadow mapping
+        UpdateLightMatrix();
+        
+        // Render shadow pass first
+        RenderShadowPass(cmd);
+        
+        LUCENT_GPU_SCOPE(cmd, "ScenePass");
+        
+        // Begin offscreen render pass (handles transitions and viewport setup)
+        m_Renderer.BeginOffscreenPass(cmd, glm::vec4(0.02f, 0.02f, 0.03f, 1.0f));
+        
+        // Get camera view-projection matrix
+        glm::mat4 viewProj = m_EditorCamera.GetViewProjectionMatrix();
+        
+        // Draw skybox first (renders at far plane, no depth write)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Renderer.GetSkyboxPipeline());
+        vkCmdPushConstants(cmd, m_Renderer.GetSkyboxPipelineLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &viewProj);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        
+        // Draw grid
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Renderer.GetGridPipeline());
+        vkCmdPushConstants(cmd, m_Renderer.GetGridPipelineLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &viewProj);
+        vkCmdDraw(cmd, 6, 1, 0, 0);
+        
+        // Render scene meshes
+        RenderMeshes(cmd, viewProj);
+        
+        // End offscreen render pass
+        m_Renderer.EndOffscreenPass(cmd);
+    }
 }
 
 void Application::RenderFrame() {
@@ -478,7 +540,7 @@ void Application::RenderFrame() {
         // Begin swapchain render pass (handles transitions and viewport setup)
         m_Renderer.BeginSwapchainPass(cmd, glm::vec4(0.1f, 0.1f, 0.1f, 1.0f));
         
-        // Render ImGui
+        // Render ImGui (PostFX is applied in composite shader)
         m_EditorUI.Render(cmd);
         
         // End swapchain render pass
@@ -679,6 +741,126 @@ void Application::RenderShadowPass(VkCommandBuffer cmd) {
     
     // End shadow render pass
     m_Renderer.EndShadowPass(cmd);
+}
+
+void Application::UpdateTracerScene() {
+    gfx::TracerCompute* tracer = m_Renderer.GetTracerCompute();
+    if (!tracer) return;
+    
+    // Build scene data for the tracer
+    std::vector<gfx::BVHBuilder::Triangle> triangles;
+    std::vector<gfx::GPUMaterial> materials;
+    
+    // Default material
+    gfx::GPUMaterial defaultMat{};
+    defaultMat.baseColor = glm::vec4(0.8f, 0.8f, 0.8f, 1.0f);
+    defaultMat.emissive = glm::vec4(0.0f);
+    defaultMat.metallic = 0.0f;
+    defaultMat.roughness = 0.5f;
+    defaultMat.ior = 1.5f;
+    defaultMat.flags = 0;
+    materials.push_back(defaultMat);
+    
+    auto view = m_Scene.GetView<scene::MeshRendererComponent, scene::TransformComponent>();
+    view.Each([&](scene::Entity entity, scene::MeshRendererComponent& renderer, scene::TransformComponent& transform) {
+        (void)entity;
+        
+        if (!renderer.visible) return;
+        
+        // Find mesh
+        auto it = m_PrimitiveMeshes.find(renderer.primitiveType);
+        if (it == m_PrimitiveMeshes.end() || !it->second) return;
+        
+        assets::Mesh* mesh = it->second.get();
+        const auto& vertices = mesh->GetCPUVertices();
+        const auto& indices = mesh->GetCPUIndices();
+        
+        if (vertices.empty() || indices.empty()) return;
+        
+        glm::mat4 modelMatrix = transform.GetLocalMatrix();
+        glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(modelMatrix)));
+        
+        // Add material for this mesh
+        uint32_t matId = static_cast<uint32_t>(materials.size());
+        gfx::GPUMaterial mat{};
+        mat.baseColor = glm::vec4(renderer.baseColor, 1.0f);
+        mat.emissive = glm::vec4(renderer.emissive, renderer.emissiveIntensity);
+        mat.metallic = renderer.metallic;
+        mat.roughness = renderer.roughness;
+        mat.ior = 1.5f;
+        mat.flags = 0;
+        materials.push_back(mat);
+        
+        // Add triangles using the Vertex struct
+        for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+            gfx::BVHBuilder::Triangle tri;
+            
+            const assets::Vertex& v0 = vertices[indices[i + 0]];
+            const assets::Vertex& v1 = vertices[indices[i + 1]];
+            const assets::Vertex& v2 = vertices[indices[i + 2]];
+            
+            // Transform positions to world space
+            tri.v0 = glm::vec3(modelMatrix * glm::vec4(v0.position, 1.0f));
+            tri.v1 = glm::vec3(modelMatrix * glm::vec4(v1.position, 1.0f));
+            tri.v2 = glm::vec3(modelMatrix * glm::vec4(v2.position, 1.0f));
+            
+            // Transform normals to world space
+            tri.n0 = glm::normalize(normalMatrix * v0.normal);
+            tri.n1 = glm::normalize(normalMatrix * v1.normal);
+            tri.n2 = glm::normalize(normalMatrix * v2.normal);
+            
+            tri.uv0 = v0.uv;
+            tri.uv1 = v1.uv;
+            tri.uv2 = v2.uv;
+            
+            tri.materialId = matId;
+            
+            triangles.push_back(tri);
+        }
+    });
+    
+    tracer->UpdateScene(triangles, materials);
+    m_TracerSceneDirty = false;
+}
+
+void Application::RenderTracedPath(VkCommandBuffer cmd) {
+    gfx::TracerCompute* tracer = m_Renderer.GetTracerCompute();
+    if (!tracer) return;
+    
+    gfx::RenderSettings& settings = m_Renderer.GetSettings();
+    
+    // Check if we need to reset accumulation
+    if (settings.ConsumeReset()) {
+        tracer->ResetAccumulation();
+    }
+    
+    // Check if scene needs to be updated
+    if (m_TracerSceneDirty) {
+        UpdateTracerScene();
+    }
+    
+    // Check if already converged
+    if (settings.IsConverged()) {
+        return; // No more samples needed
+    }
+    
+    // Build GPU camera data
+    gfx::GPUCamera gpuCamera{};
+    gpuCamera.invView = glm::inverse(m_EditorCamera.GetViewMatrix());
+    gpuCamera.invProj = glm::inverse(m_EditorCamera.GetProjectionMatrix());
+    gpuCamera.position = m_EditorCamera.GetPosition();
+    gpuCamera.fov = m_EditorCamera.GetFOV();
+    
+    gfx::Image* offscreen = m_Renderer.GetOffscreenImage();
+    gpuCamera.resolution = glm::vec2(offscreen->GetWidth(), offscreen->GetHeight());
+    gpuCamera.nearPlane = m_EditorCamera.GetNearClip();
+    gpuCamera.farPlane = m_EditorCamera.GetFarClip();
+    
+    // Trace
+    tracer->Trace(cmd, gpuCamera, settings, offscreen);
+    
+    // Increment sample count
+    settings.IncrementSamples(1);
 }
 
 } // namespace lucent

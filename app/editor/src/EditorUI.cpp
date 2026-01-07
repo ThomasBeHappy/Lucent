@@ -345,6 +345,7 @@ void EditorUI::BeginFrame() {
     if (m_ShowInspector) DrawInspectorPanel();
     if (m_ShowContentBrowser) DrawContentBrowserPanel();
     if (m_ShowConsole) DrawConsolePanel();
+    if (m_ShowRenderProperties) DrawRenderPropertiesPanel();
     
     // Draw material graph panel
     m_MaterialGraphPanel.Draw();
@@ -735,6 +736,7 @@ void EditorUI::DrawDockspace() {
             ImGui::MenuItem("Inspector", nullptr, &m_ShowInspector);
             ImGui::MenuItem("Content Browser", nullptr, &m_ShowContentBrowser);
             ImGui::MenuItem("Console", nullptr, &m_ShowConsole);
+            ImGui::MenuItem("Render Properties", nullptr, &m_ShowRenderProperties);
             
             bool matPanelVisible = m_MaterialGraphPanel.IsVisible();
             if (ImGui::MenuItem("Material Graph", nullptr, &matPanelVisible)) {
@@ -773,6 +775,23 @@ void EditorUI::DrawDockspace() {
             if (!rtSupported) {
                 ImGui::TextDisabled("(Ray tracing not supported on this GPU)");
             }
+            
+            ImGui::Separator();
+            ImGui::TextDisabled("Post Processing");
+            
+            // Exposure slider
+            ImGui::SetNextItemWidth(120);
+            ImGui::SliderFloat("Exposure", &m_Exposure, 0.1f, 5.0f, "%.2f");
+            
+            // Tonemapping options
+            const char* tonemapModes[] = { "None", "Reinhard", "ACES", "Uncharted 2", "AgX" };
+            ImGui::SetNextItemWidth(120);
+            ImGui::Combo("Tonemap", &m_TonemapMode, tonemapModes, IM_ARRAYSIZE(tonemapModes));
+            
+            // Gamma
+            ImGui::SetNextItemWidth(120);
+            ImGui::SliderFloat("Gamma", &m_Gamma, 1.0f, 3.0f, "%.2f");
+            
             ImGui::EndMenu();
         }
         
@@ -1908,6 +1927,151 @@ void EditorUI::DrawConsolePanel() {
     
     ImGui::EndChild();
     ImGui::PopStyleColor();
+    
+    ImGui::End();
+}
+
+void EditorUI::DrawRenderPropertiesPanel() {
+    ImGui::Begin("Render Properties", &m_ShowRenderProperties);
+    
+    gfx::RenderSettings& settings = m_Renderer->GetSettings();
+    const gfx::RenderCapabilities& caps = m_Renderer->GetCapabilities();
+    bool settingsChanged = false;
+    
+    // === Render Mode ===
+    ImGui::TextDisabled("Render Mode");
+    ImGui::Spacing();
+    
+    gfx::RenderMode currentMode = m_Renderer->GetRenderMode();
+    
+    // Mode dropdown
+    const char* modeNames[] = { "Simple", "Traced", "Ray Traced" };
+    int currentModeIdx = static_cast<int>(currentMode);
+    
+    if (ImGui::BeginCombo("Mode", modeNames[currentModeIdx])) {
+        for (int i = 0; i < 3; i++) {
+            gfx::RenderMode mode = static_cast<gfx::RenderMode>(i);
+            bool available = caps.IsModeAvailable(mode);
+            
+            if (!available) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
+            }
+            
+            if (ImGui::Selectable(modeNames[i], i == currentModeIdx, available ? 0 : ImGuiSelectableFlags_Disabled)) {
+                if (available && mode != currentMode) {
+                    m_Renderer->SetRenderMode(mode);
+                    settings.activeMode = mode;
+                    settings.MarkDirty();
+                }
+            }
+            
+            if (!available) {
+                ImGui::PopStyleColor();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    
+    // Show mode status
+    if (currentMode != gfx::RenderMode::Simple) {
+        ImGui::Text("Samples: %u / %u", settings.accumulatedSamples, settings.viewportSamples);
+        if (settings.IsConverged()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "(Converged)");
+        }
+    }
+    
+    ImGui::Separator();
+    
+    // === Sampling ===
+    if (ImGui::CollapsingHeader("Sampling", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::DragInt("Viewport Samples", (int*)&settings.viewportSamples, 1.0f, 1, 4096)) {
+            settingsChanged = true;
+        }
+        if (ImGui::DragInt("Final Samples", (int*)&settings.finalSamples, 1.0f, 1, 65536)) {
+            // No reset needed, final render uses this
+        }
+        if (ImGui::DragFloat("Max Frame Time (ms)", &settings.maxFrameTimeMs, 0.1f, 1.0f, 100.0f, "%.1f")) {
+            // Progressive time budget
+        }
+        if (ImGui::Checkbox("Half Resolution", &settings.useHalfRes)) {
+            settingsChanged = true;
+        }
+    }
+    
+    // === Bounces (for Traced/RayTraced modes) ===
+    if (currentMode != gfx::RenderMode::Simple) {
+        if (ImGui::CollapsingHeader("Light Paths", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::DragInt("Max Bounces", (int*)&settings.maxBounces, 0.1f, 0, 32)) {
+                settingsChanged = true;
+            }
+            if (ImGui::DragInt("Diffuse", (int*)&settings.diffuseBounces, 0.1f, 0, 32)) {
+                settingsChanged = true;
+            }
+            if (ImGui::DragInt("Specular", (int*)&settings.specularBounces, 0.1f, 0, 32)) {
+                settingsChanged = true;
+            }
+            if (ImGui::DragInt("Transmission", (int*)&settings.transmissionBounces, 0.1f, 0, 32)) {
+                settingsChanged = true;
+            }
+        }
+    }
+    
+    // === Clamping ===
+    if (currentMode != gfx::RenderMode::Simple) {
+        if (ImGui::CollapsingHeader("Clamping")) {
+            if (ImGui::DragFloat("Clamp Direct", &settings.clampDirect, 0.1f, 0.0f, 100.0f, settings.clampDirect == 0 ? "Off" : "%.1f")) {
+                settingsChanged = true;
+            }
+            if (ImGui::DragFloat("Clamp Indirect", &settings.clampIndirect, 0.1f, 0.0f, 100.0f, settings.clampIndirect == 0 ? "Off" : "%.1f")) {
+                settingsChanged = true;
+            }
+        }
+    }
+    
+    // === Film / Color ===
+    if (ImGui::CollapsingHeader("Film", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::DragFloat("Exposure", &settings.exposure, 0.01f, 0.01f, 10.0f, "%.2f")) {
+            m_Exposure = settings.exposure;  // Keep in sync
+        }
+        
+        const char* tonemapNames[] = { "None", "Reinhard", "ACES", "Uncharted 2", "AgX" };
+        int tonemapIdx = static_cast<int>(settings.tonemapOperator);
+        if (ImGui::Combo("Tonemap", &tonemapIdx, tonemapNames, 5)) {
+            settings.tonemapOperator = static_cast<gfx::TonemapOperator>(tonemapIdx);
+            m_TonemapMode = tonemapIdx;  // Keep in sync
+        }
+        
+        if (ImGui::DragFloat("Gamma", &settings.gamma, 0.01f, 1.0f, 3.0f, "%.2f")) {
+            m_Gamma = settings.gamma;  // Keep in sync
+        }
+    }
+    
+    // === Denoise ===
+    if (currentMode != gfx::RenderMode::Simple) {
+        if (ImGui::CollapsingHeader("Denoise")) {
+            ImGui::Checkbox("Enable Denoise", &settings.enableDenoise);
+            if (settings.enableDenoise) {
+                ImGui::DragFloat("Strength", &settings.denoiseStrength, 0.01f, 0.0f, 1.0f, "%.2f");
+            }
+            ImGui::TextDisabled("(Not yet implemented)");
+        }
+    }
+    
+    // === Shadows (Simple mode) ===
+    if (currentMode == gfx::RenderMode::Simple) {
+        if (ImGui::CollapsingHeader("Shadows", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("Enable Shadows", &settings.enableShadows);
+            if (settings.enableShadows) {
+                ImGui::DragFloat("Shadow Bias", &settings.shadowBias, 0.0001f, 0.0f, 0.1f, "%.4f");
+            }
+        }
+    }
+    
+    // Mark dirty if settings changed
+    if (settingsChanged) {
+        settings.MarkDirty();
+    }
     
     ImGui::End();
 }

@@ -13,6 +13,16 @@ bool Renderer::Init(VulkanContext* context, Device* device, const RendererConfig
     m_Device = device;
     m_Config = config;
     
+    // Build render capabilities from device features
+    m_Capabilities = RenderCapabilities::FromDeviceFeatures(
+        context->GetDeviceFeatures(), 
+        VK_API_VERSION_1_3  // We request 1.3, actual support may be lower
+    );
+    
+    // Select best available render mode
+    m_RenderMode = m_Capabilities.GetBestMode();
+    LUCENT_CORE_INFO("Initial render mode: {}", RenderModeName(m_RenderMode));
+    
     // Initialize debug utils
     DebugUtils::Init(context->GetInstance());
     
@@ -70,6 +80,19 @@ bool Renderer::Init(VulkanContext* context, Device* device, const RendererConfig
         return false;
     }
     
+    // Initialize compute tracer if Traced mode is available
+    if (m_Capabilities.tracedAvailable) {
+        m_TracerCompute = std::make_unique<TracerCompute>();
+        if (!m_TracerCompute->Init(m_Context, m_Device)) {
+            LUCENT_CORE_WARN("Failed to initialize compute tracer, Traced mode disabled");
+            m_TracerCompute.reset();
+            m_Capabilities.tracedAvailable = false;
+            if (m_RenderMode == RenderMode::Traced) {
+                m_RenderMode = RenderMode::Simple;
+            }
+        }
+    }
+    
     LUCENT_CORE_INFO("Renderer initialized");
     return true;
 }
@@ -78,6 +101,12 @@ void Renderer::Shutdown() {
     if (!m_Context) return;
     
     m_Context->WaitIdle();
+    
+    // Shutdown tracer
+    if (m_TracerCompute) {
+        m_TracerCompute->Shutdown();
+        m_TracerCompute.reset();
+    }
     
     DestroyShadowResources();
     DestroyPipelines();
@@ -530,11 +559,18 @@ bool Renderer::CreatePipelines() {
         return false;
     }
     
-    // Create composite pipeline layout
+    // Create composite pipeline layout with push constants for PostFX settings
+    VkPushConstantRange compositePushConstant{};
+    compositePushConstant.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    compositePushConstant.offset = 0;
+    compositePushConstant.size = sizeof(float) * 4; // exposure, tonemapMode, gamma, unused
+    
     VkPipelineLayoutCreateInfo compositeLayoutInfo{};
     compositeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     compositeLayoutInfo.setLayoutCount = 1;
     compositeLayoutInfo.pSetLayouts = &m_CompositeDescriptorLayout;
+    compositeLayoutInfo.pushConstantRangeCount = 1;
+    compositeLayoutInfo.pPushConstantRanges = &compositePushConstant;
     
     if (vkCreatePipelineLayout(device, &compositeLayoutInfo, nullptr, &m_CompositePipelineLayout) != VK_SUCCESS) {
         return false;
@@ -820,6 +856,21 @@ void Renderer::RecreateSwapchain() {
 
 bool Renderer::UseDynamicRendering() const {
     return m_Context->GetDeviceFeatures().dynamicRendering;
+}
+
+void Renderer::SetRenderMode(RenderMode mode) {
+    if (!m_Capabilities.IsModeAvailable(mode)) {
+        LUCENT_CORE_WARN("Render mode {} not available, keeping current mode {}", 
+            RenderModeName(mode), RenderModeName(m_RenderMode));
+        return;
+    }
+    
+    if (m_RenderMode != mode) {
+        LUCENT_CORE_INFO("Render mode changed: {} -> {}", 
+            RenderModeName(m_RenderMode), RenderModeName(mode));
+        m_RenderMode = mode;
+        // TODO: Reset accumulation buffers when switching to/from traced modes
+    }
 }
 
 bool Renderer::CreateRenderPasses() {

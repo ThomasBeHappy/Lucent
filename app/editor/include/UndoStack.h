@@ -172,5 +172,68 @@ private:
     UndoFunc m_UndoFunc;
 };
 
+// Forward declaration
+namespace material {
+    class MaterialAsset;
+    struct MaterialNode;
+}
+
+// Material parameter edit command
+class MaterialParamCommand : public ICommand {
+public:
+    enum class ParamType { Float, Vec3, ColorRamp };
+    
+    // Float parameter constructor
+    MaterialParamCommand(material::MaterialAsset* material, uint64_t nodeId, 
+                         const std::string& paramName, float before, float after)
+        : m_Material(material)
+        , m_NodeId(nodeId)
+        , m_ParamName(paramName)
+        , m_Type(ParamType::Float)
+        , m_FloatBefore(before)
+        , m_FloatAfter(after) {}
+    
+    // Vec3 parameter constructor
+    MaterialParamCommand(material::MaterialAsset* material, uint64_t nodeId,
+                         const std::string& paramName, const glm::vec3& before, const glm::vec3& after)
+        : m_Material(material)
+        , m_NodeId(nodeId)
+        , m_ParamName(paramName)
+        , m_Type(ParamType::Vec3)
+        , m_Vec3Before(before)
+        , m_Vec3After(after) {}
+    
+    void Execute() override;
+    void Undo() override;
+    std::string GetDescription() const override { return "Material: " + m_ParamName; }
+    
+    COMMAND_TYPE_ID(MaterialParamCommand)
+    uint64_t GetTargetId() const override { return m_NodeId; }
+    
+    bool CanMergeWith(const ICommand* other) const override {
+        auto* o = dynamic_cast<const MaterialParamCommand*>(other);
+        return o && o->m_NodeId == m_NodeId && o->m_ParamName == m_ParamName;
+    }
+    
+    void MergeWith(const ICommand* other) override {
+        auto* o = dynamic_cast<const MaterialParamCommand*>(other);
+        if (o) {
+            if (m_Type == ParamType::Float) m_FloatAfter = o->m_FloatAfter;
+            else if (m_Type == ParamType::Vec3) m_Vec3After = o->m_Vec3After;
+        }
+    }
+    
+private:
+    material::MaterialAsset* m_Material;
+    uint64_t m_NodeId;
+    std::string m_ParamName;
+    ParamType m_Type;
+    
+    float m_FloatBefore = 0.0f;
+    float m_FloatAfter = 0.0f;
+    glm::vec3 m_Vec3Before{0.0f};
+    glm::vec3 m_Vec3After{0.0f};
+};
+
 } // namespace lucent
 

@@ -71,6 +71,10 @@ public:
     gfx::Buffer* GetVertexBuffer() { return &m_VertexBuffer; }
     gfx::Buffer* GetIndexBuffer() { return &m_IndexBuffer; }
     
+    // CPU-side geometry access (for path tracing)
+    const std::vector<Vertex>& GetCPUVertices() const { return m_CPUVertices; }
+    const std::vector<uint32_t>& GetCPUIndices() const { return m_CPUIndices; }
+    
 private:
     gfx::Device* m_Device = nullptr;
     
@@ -83,6 +87,10 @@ private:
     std::vector<Submesh> m_Submeshes;
     AABB m_Bounds;
     std::string m_Name;
+    
+    // CPU-side copies for path tracing
+    std::vector<Vertex> m_CPUVertices;
+    std::vector<uint32_t> m_CPUIndices;
 };
 
 // Primitive mesh generators

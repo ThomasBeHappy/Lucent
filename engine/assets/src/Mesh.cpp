@@ -33,6 +33,10 @@ bool Mesh::Create(gfx::Device* device,
     m_VertexCount = static_cast<uint32_t>(vertices.size());
     m_IndexCount = static_cast<uint32_t>(indices.size());
     
+    // Store CPU copies for path tracing
+    m_CPUVertices = vertices;
+    m_CPUIndices = indices;
+    
     // Calculate bounds
     m_Bounds = AABB();
     for (const auto& v : vertices) {
