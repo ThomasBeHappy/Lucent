@@ -69,6 +69,24 @@ if(LUCENT_EDITOR_DOWNLOAD_FONTAWESOME)
     )
 endif()
 
+# -----------------------------------------------------------------------------
+# Editor UI font (Roboto) - copy into output folder for packaging/distribution
+# -----------------------------------------------------------------------------
+set(LUCENT_EDITOR_FONTS_SRC_DIR "${CMAKE_SOURCE_DIR}/Assets/Fonts")
+set(LUCENT_EDITOR_ROBOTO_TTF "${LUCENT_EDITOR_FONTS_SRC_DIR}/Roboto.ttf")
+
+if(EXISTS "${LUCENT_EDITOR_ROBOTO_TTF}")
+    add_custom_command(TARGET editor POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:editor>/Assets/Fonts"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${LUCENT_EDITOR_ROBOTO_TTF}"
+                "$<TARGET_FILE_DIR:editor>/Assets/Fonts/Roboto.ttf"
+        COMMENT "Copying Roboto.ttf to output Assets/Fonts"
+    )
+else()
+    message(STATUS "Roboto.ttf not found at ${LUCENT_EDITOR_ROBOTO_TTF} (skipping copy)")
+endif()
+
 # Copy shaders to output directory
 add_custom_command(TARGET editor POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory

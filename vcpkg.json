@@ -15,7 +15,8 @@
         "imguizmo",
         "stb",
         "imgui-node-editor",
-        "tinygltf"
+        "tinygltf",
+        "assimp"
     ],
     "builtin-baseline": "2c2afe98de8b2824cd22253cfcd44f687252bb84"
 }

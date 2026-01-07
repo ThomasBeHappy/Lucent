@@ -1,5 +1,6 @@
 find_package(Stb REQUIRED)
 find_path(TINYGLTF_INCLUDE_DIRS "tiny_gltf.h")
+find_package(assimp CONFIG REQUIRED)
 
 add_library(engine_assets STATIC
     src/Mesh.cpp
@@ -23,6 +24,7 @@ target_link_libraries(engine_assets PUBLIC
     Lucent::Core
     Lucent::Gfx
     glm::glm
+    assimp::assimp
 )
 
 target_include_directories(engine_assets PRIVATE

@@ -6,6 +6,10 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <assimp/Importer.hpp>
+#include <assimp/scene.h>
+#include <assimp/postprocess.h>
+
 #define TINYGLTF_IMPLEMENTATION
 #define TINYGLTF_NO_STB_IMAGE        // We already have stb_image in Texture.cpp
 #define TINYGLTF_NO_STB_IMAGE_WRITE
@@ -14,6 +18,26 @@
 #include <filesystem>
 
 namespace lucent::assets {
+
+static glm::mat4 AiToGlm(const aiMatrix4x4& m) {
+    // Assimp is row-major; glm is column-major. Convert explicitly.
+    glm::mat4 out(1.0f);
+    out[0][0] = m.a1; out[1][0] = m.a2; out[2][0] = m.a3; out[3][0] = m.a4;
+    out[0][1] = m.b1; out[1][1] = m.b2; out[2][1] = m.b3; out[3][1] = m.b4;
+    out[0][2] = m.c1; out[1][2] = m.c2; out[2][2] = m.c3; out[3][2] = m.c4;
+    out[0][3] = m.d1; out[1][3] = m.d2; out[2][3] = m.d3; out[3][3] = m.d4;
+    return out;
+}
+
+static glm::vec3 AiToGlm(const aiVector3D& v) {
+    return glm::vec3(v.x, v.y, v.z);
+}
+
+static glm::vec3 SafeNormalize(const glm::vec3& v) {
+    float len = glm::length(v);
+    if (len <= 1e-12f) return glm::vec3(0, 1, 0);
+    return v / len;
+}
 
 // Helper to load image data for tinygltf using our own stb_image
 static bool LoadImageData(tinygltf::Image* image, const int image_idx, std::string* err,
@@ -519,11 +543,206 @@ std::unique_ptr<Model> ModelLoader::LoadGLTF(gfx::Device* device, const std::str
 }
 
 std::unique_ptr<Model> ModelLoader::LoadOBJ(gfx::Device* device, const std::string& path) {
-    // TODO: Implement OBJ loading if needed
-    (void)device;
-    m_LastError = "OBJ loading not yet implemented: " + path;
-    LUCENT_CORE_ERROR("{}", m_LastError);
-    return nullptr;
+    // Route through Assimp to support OBJ (and unify codepaths)
+    return LoadAssimp(device, path);
+}
+
+std::unique_ptr<Model> ModelLoader::LoadAssimp(gfx::Device* device, const std::string& path) {
+    Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile(
+        path,
+        aiProcess_Triangulate |
+        aiProcess_GenSmoothNormals |
+        aiProcess_CalcTangentSpace |
+        aiProcess_JoinIdenticalVertices |
+        aiProcess_ImproveCacheLocality |
+        aiProcess_SortByPType |
+        aiProcess_LimitBoneWeights |
+        aiProcess_OptimizeMeshes
+    );
+
+    if (!scene || !scene->mRootNode) {
+        m_LastError = std::string("Failed to load model (Assimp): ") + importer.GetErrorString();
+        LUCENT_CORE_ERROR("{}", m_LastError);
+        return nullptr;
+    }
+
+    std::filesystem::path filePath(path);
+    auto model = std::make_unique<Model>();
+    model->name = filePath.stem().string();
+    model->sourcePath = path;
+
+    // Materials (best-effort)
+    model->materials.reserve(scene->mNumMaterials > 0 ? scene->mNumMaterials : 1);
+    for (uint32_t i = 0; i < scene->mNumMaterials; i++) {
+        const aiMaterial* matIn = scene->mMaterials[i];
+        MaterialData mat;
+        aiString name;
+        if (matIn->Get(AI_MATKEY_NAME, name) == AI_SUCCESS) {
+            mat.name = name.C_Str();
+        } else {
+            mat.name = "Material_" + std::to_string(i);
+        }
+
+        aiColor4D diffuse(1, 1, 1, 1);
+        if (aiGetMaterialColor(matIn, AI_MATKEY_COLOR_DIFFUSE, &diffuse) == AI_SUCCESS) {
+            mat.baseColorFactor = glm::vec4(diffuse.r, diffuse.g, diffuse.b, diffuse.a);
+        }
+
+        // NOTE: don't cast aiColor3D to aiColor4D* (will overwrite stack).
+        aiColor3D emissive(0, 0, 0);
+        if (matIn->Get(AI_MATKEY_COLOR_EMISSIVE, emissive) == AI_SUCCESS) {
+            mat.emissiveFactor = glm::vec3(emissive.r, emissive.g, emissive.b);
+        }
+
+        float shininess = 0.0f;
+        if (aiGetMaterialFloat(matIn, AI_MATKEY_SHININESS, &shininess) == AI_SUCCESS) {
+            // Roughness approximation from phong shininess
+            mat.roughnessFactor = glm::clamp(1.0f - (shininess / 256.0f), 0.05f, 1.0f);
+        }
+
+        model->materials.push_back(mat);
+    }
+    if (model->materials.empty()) {
+        MaterialData defaultMat;
+        defaultMat.name = "Default";
+        model->materials.push_back(defaultMat);
+    }
+
+    // Meshes
+    model->meshes.reserve(scene->mNumMeshes);
+    for (uint32_t meshIdx = 0; meshIdx < scene->mNumMeshes; meshIdx++) {
+        const aiMesh* meshIn = scene->mMeshes[meshIdx];
+        if (!meshIn || meshIn->mNumVertices == 0) continue;
+
+        std::vector<Vertex> vertices;
+        std::vector<uint32_t> indices;
+        vertices.reserve(meshIn->mNumVertices);
+        indices.reserve(meshIn->mNumFaces * 3);
+
+        for (uint32_t v = 0; v < meshIn->mNumVertices; v++) {
+            Vertex out{};
+            out.position = AiToGlm(meshIn->mVertices[v]);
+
+            if (meshIn->HasNormals()) {
+                out.normal = SafeNormalize(AiToGlm(meshIn->mNormals[v]));
+            } else {
+                out.normal = glm::vec3(0, 1, 0);
+            }
+
+            if (meshIn->HasTextureCoords(0)) {
+                out.uv = glm::vec2(meshIn->mTextureCoords[0][v].x, meshIn->mTextureCoords[0][v].y);
+            } else {
+                out.uv = glm::vec2(0.0f);
+            }
+
+            if (meshIn->HasTangentsAndBitangents()) {
+                glm::vec3 t = SafeNormalize(AiToGlm(meshIn->mTangents[v]));
+                out.tangent = glm::vec4(t, 1.0f);
+            } else {
+                out.tangent = glm::vec4(1, 0, 0, 1);
+            }
+
+            vertices.push_back(out);
+        }
+
+        for (uint32_t f = 0; f < meshIn->mNumFaces; f++) {
+            const aiFace& face = meshIn->mFaces[f];
+            if (face.mNumIndices != 3) continue;
+            indices.push_back(face.mIndices[0]);
+            indices.push_back(face.mIndices[1]);
+            indices.push_back(face.mIndices[2]);
+        }
+
+        auto mesh = std::make_unique<Mesh>();
+        std::string meshName = meshIn->mName.length > 0 ? meshIn->mName.C_Str() : (model->name + "_mesh" + std::to_string(meshIdx));
+        if (mesh->Create(device, vertices, indices, meshName)) {
+            uint32_t matIndex = meshIn->mMaterialIndex < model->materials.size() ? meshIn->mMaterialIndex : 0;
+            mesh->AddSubmesh(0, static_cast<uint32_t>(indices.size()), matIndex);
+            model->bounds.Expand(mesh->GetBounds().min);
+            model->bounds.Expand(mesh->GetBounds().max);
+            model->meshes.push_back(std::move(mesh));
+        }
+    }
+
+    // Cameras
+    model->cameras.reserve(scene->mNumCameras);
+    for (uint32_t i = 0; i < scene->mNumCameras; i++) {
+        const aiCamera* camIn = scene->mCameras[i];
+        if (!camIn) continue;
+        CameraData cam;
+        cam.name = camIn->mName.C_Str();
+        cam.perspective = true;
+        cam.fov = glm::degrees(camIn->mHorizontalFOV); // best-effort (assimp stores horizontal)
+        cam.nearClip = camIn->mClipPlaneNear;
+        cam.farClip = camIn->mClipPlaneFar > 0.0f ? camIn->mClipPlaneFar : 10000.0f;
+        model->cameras.push_back(cam);
+    }
+
+    // Lights
+    model->lights.reserve(scene->mNumLights);
+    for (uint32_t i = 0; i < scene->mNumLights; i++) {
+        const aiLight* lIn = scene->mLights[i];
+        if (!lIn) continue;
+        LightData l;
+        l.name = lIn->mName.C_Str();
+        l.color = glm::vec3(lIn->mColorDiffuse.r, lIn->mColorDiffuse.g, lIn->mColorDiffuse.b);
+        l.intensity = 1.0f;
+        l.range = 0.0f;
+        if (lIn->mType == aiLightSource_DIRECTIONAL) {
+            l.type = LightData::Type::Directional;
+        } else if (lIn->mType == aiLightSource_SPOT) {
+            l.type = LightData::Type::Spot;
+            l.innerAngle = lIn->mAngleInnerCone;
+            l.outerAngle = lIn->mAngleOuterCone;
+        } else {
+            l.type = LightData::Type::Point;
+        }
+        model->lights.push_back(l);
+    }
+
+    // Nodes
+    std::unordered_map<std::string, int32_t> cameraByName;
+    for (int32_t i = 0; i < static_cast<int32_t>(model->cameras.size()); i++) {
+        cameraByName[model->cameras[i].name] = i;
+    }
+    std::unordered_map<std::string, int32_t> lightByName;
+    for (int32_t i = 0; i < static_cast<int32_t>(model->lights.size()); i++) {
+        lightByName[model->lights[i].name] = i;
+    }
+
+    std::function<uint32_t(aiNode*)> buildNode = [&](aiNode* n) -> uint32_t {
+        NodeData node;
+        node.name = (n->mName.length > 0) ? n->mName.C_Str() : ("Node_" + std::to_string(model->nodes.size()));
+        node.localTransform = AiToGlm(n->mTransformation);
+
+        if (n->mNumMeshes > 0) {
+            node.meshIndex = static_cast<int32_t>(n->mMeshes[0]); // best-effort (first mesh)
+        }
+
+        auto camIt = cameraByName.find(node.name);
+        if (camIt != cameraByName.end()) node.cameraIndex = camIt->second;
+        auto lightIt = lightByName.find(node.name);
+        if (lightIt != lightByName.end()) node.lightIndex = lightIt->second;
+
+        uint32_t thisIdx = static_cast<uint32_t>(model->nodes.size());
+        model->nodes.push_back(node);
+
+        for (uint32_t c = 0; c < n->mNumChildren; c++) {
+            uint32_t childIdx = buildNode(n->mChildren[c]);
+            model->nodes[thisIdx].children.push_back(childIdx);
+        }
+
+        return thisIdx;
+    };
+
+    uint32_t rootIdx = buildNode(scene->mRootNode);
+    model->rootNodes.push_back(rootIdx);
+
+    LUCENT_CORE_INFO("Loaded model '{}' via Assimp: {} meshes, {} materials, {} cameras, {} lights, {} nodes",
+        model->name, model->meshes.size(), model->materials.size(), model->cameras.size(), model->lights.size(), model->nodes.size());
+
+    return model;
 }
 
 } // namespace lucent::assets

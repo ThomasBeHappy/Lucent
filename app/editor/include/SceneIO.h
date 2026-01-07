@@ -32,6 +32,11 @@ bool LoadScene(scene::Scene* scene, const std::string& filepath);
 // Returns number of entities created, or -1 on error
 int ImportGLTF(scene::Scene* scene, gfx::Device* device, const std::string& filepath);
 
+// Import a model file into existing scene (adds entities, does not clear).
+// Supported: .gltf/.glb (tinygltf), .obj/.fbx and many others (Assimp).
+// Returns number of entities created, or -1 on error.
+int ImportModel(scene::Scene* scene, gfx::Device* device, const std::string& filepath);
+
 // Get last error message
 const std::string& GetLastError();
 

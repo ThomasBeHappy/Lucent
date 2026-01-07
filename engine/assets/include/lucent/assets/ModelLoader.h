@@ -97,6 +97,9 @@ class ModelLoader : public NonCopyable {
 public:
     ModelLoader() = default;
     
+    // Load most formats via Assimp (fbx/obj/etc)
+    std::unique_ptr<Model> LoadAssimp(gfx::Device* device, const std::string& path);
+
     // Load a glTF or GLB file
     std::unique_ptr<Model> LoadGLTF(gfx::Device* device, const std::string& path);
     

@@ -207,8 +207,8 @@ void EditorUI::SetupFonts() {
     const std::filesystem::path exeFontsDir = GetExecutableDir() / "Assets" / "Fonts";
     const std::filesystem::path cwdFontsDir = std::filesystem::current_path() / "Assets" / "Fonts";
     
-    const std::filesystem::path uiFontPathA = exeFontsDir / "Inter-Regular.ttf";
-    const std::filesystem::path uiFontPathB = cwdFontsDir / "Inter-Regular.ttf";
+    const std::filesystem::path uiFontPathA = exeFontsDir / "Roboto.ttf";
+    const std::filesystem::path uiFontPathB = cwdFontsDir / "Roboto.ttf";
     const std::filesystem::path iconFontPathA = exeFontsDir / "fa-solid-900.ttf";
     const std::filesystem::path iconFontPathB = cwdFontsDir / "fa-solid-900.ttf";
     
@@ -1069,11 +1069,25 @@ void EditorUI::DrawViewportPanel() {
     if (m_ViewportDescriptor != VK_NULL_HANDLE && size.x > 0 && size.y > 0) {
         ImGui::Image((ImTextureID)m_ViewportDescriptor, size);
         
-        // Handle material drag-drop onto meshes
+        // Handle drag-drop onto viewport
         if (ImGui::BeginDragDropTarget()) {
             if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("MATERIAL_PATH")) {
                 std::string materialPath(static_cast<const char*>(payload->Data));
                 HandleMaterialDrop(materialPath);
+            }
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("MODEL_PATH")) {
+                if (m_Scene && m_Device) {
+                    std::string modelPath(static_cast<const char*>(payload->Data));
+                    int added = SceneIO::ImportModel(m_Scene, m_Device, modelPath);
+                    if (added < 0) {
+                        LUCENT_CORE_ERROR("Import model failed: {}", SceneIO::GetLastError());
+                        Win32FileDialogs::ShowError(L"Import Model", L"Import failed. See console for details.");
+                    } else {
+                        m_SceneDirty = true;
+                        if (m_Renderer) m_Renderer->GetSettings().MarkDirty();
+                        LUCENT_CORE_INFO("Imported {} entities from model: {}", added, modelPath);
+                    }
+                }
             }
             ImGui::EndDragDropTarget();
         }
@@ -1760,8 +1774,9 @@ void EditorUI::DrawContentBrowserPanel() {
     const char* importLabel = m_IconFontLoaded ? (LUCENT_ICON_IMPORT " Import") : "Import";
     if (ImGui::Button(importLabel)) {
         std::string path = Win32FileDialogs::OpenFile(L"Import Asset", 
-            {{L"All Supported", L"*.png;*.jpg;*.hdr;*.obj;*.lucent"}, 
+            {{L"All Supported", L"*.png;*.jpg;*.hdr;*.obj;*.fbx;*.gltf;*.glb;*.lucent"}, 
              {L"Images", L"*.png;*.jpg;*.hdr"},
+             {L"Models", L"*.obj;*.fbx;*.gltf;*.glb"},
              {L"All Files", L"*.*"}});
         if (!path.empty()) {
             std::filesystem::path src(path);
@@ -1911,7 +1926,7 @@ void EditorUI::DrawContentBrowserPanel() {
                 }
             }
             
-            // Drag source for compatible files (textures, materials)
+            // Drag source for compatible files (textures, materials, models)
             if (!isDirectory && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
                 std::string pathStr = entry.path().string();
                 
@@ -1921,6 +1936,8 @@ void EditorUI::DrawContentBrowserPanel() {
                     payloadType = "TEXTURE_PATH";
                 } else if (ext == ".lmat") {
                     payloadType = "MATERIAL_PATH";
+                } else if (ext == ".obj" || ext == ".fbx" || ext == ".gltf" || ext == ".glb") {
+                    payloadType = "MODEL_PATH";
                 }
                 
                 ImGui::SetDragDropPayload(payloadType, pathStr.c_str(), pathStr.size() + 1);
