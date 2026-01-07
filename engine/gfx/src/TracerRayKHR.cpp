@@ -34,7 +34,8 @@ bool TracerRayKHR::Init(VulkanContext* context, Device* device) {
     VkDescriptorPoolSize poolSizes[] = {
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
+        // vertices, indices, materials, primitiveMaterialIds
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
     };
     
@@ -56,12 +57,13 @@ bool TracerRayKHR::Init(VulkanContext* context, Device* device) {
         { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }, // vertices
         { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }, // indices
         { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }, // materials
-        { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }  // camera
+        { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr },  // camera
+        { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr } // per-primitive material ids
     };
     
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 6;
+    layoutInfo.bindingCount = 7;
     layoutInfo.pBindings = bindings;
     
     if (vkCreateDescriptorSetLayout(context->GetDevice(), &layoutInfo, nullptr, &m_DescriptorLayout) != VK_SUCCESS) {
@@ -102,6 +104,7 @@ void TracerRayKHR::Shutdown() {
     // Destroy buffers
     m_VertexBuffer.Shutdown();
     m_IndexBuffer.Shutdown();
+    m_PrimitiveMaterialBuffer.Shutdown();
     m_MaterialBuffer.Shutdown();
     m_SBTBuffer.Shutdown();
     m_CameraBuffer.Shutdown();
@@ -120,12 +123,23 @@ void TracerRayKHR::Shutdown() {
     // Destroy shaders
     if (m_RaygenShader != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, m_RaygenShader, nullptr);
+        m_RaygenShader = VK_NULL_HANDLE;
     }
     if (m_MissShader != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, m_MissShader, nullptr);
+        m_MissShader = VK_NULL_HANDLE;
     }
     if (m_ClosestHitShader != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, m_ClosestHitShader, nullptr);
+        m_ClosestHitShader = VK_NULL_HANDLE;
+    }
+    if (m_ShadowMissShader != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, m_ShadowMissShader, nullptr);
+        m_ShadowMissShader = VK_NULL_HANDLE;
+    }
+    if (m_ShadowClosestHitShader != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, m_ShadowClosestHitShader, nullptr);
+        m_ShadowClosestHitShader = VK_NULL_HANDLE;
     }
     
     // Destroy descriptor resources
@@ -177,8 +191,10 @@ bool TracerRayKHR::CreateRayTracingPipeline() {
     m_RaygenShader = PipelineBuilder::LoadShaderModule(device, "shaders/rt_raygen.rgen.spv");
     m_MissShader = PipelineBuilder::LoadShaderModule(device, "shaders/rt_miss.rmiss.spv");
     m_ClosestHitShader = PipelineBuilder::LoadShaderModule(device, "shaders/rt_closesthit.rchit.spv");
+    m_ShadowMissShader = PipelineBuilder::LoadShaderModule(device, "shaders/rt_shadow_miss.rmiss.spv");
+    m_ShadowClosestHitShader = PipelineBuilder::LoadShaderModule(device, "shaders/rt_shadow.rchit.spv");
     
-    if (!m_RaygenShader || !m_MissShader || !m_ClosestHitShader) {
+    if (!m_RaygenShader || !m_MissShader || !m_ClosestHitShader || !m_ShadowMissShader || !m_ShadowClosestHitShader) {
         LUCENT_CORE_ERROR("TracerRayKHR: Failed to load ray tracing shaders");
         return false;
     }
@@ -202,7 +218,7 @@ bool TracerRayKHR::CreateRayTracingPipeline() {
     }
     
     // Shader stages
-    VkPipelineShaderStageCreateInfo stages[3] = {};
+    VkPipelineShaderStageCreateInfo stages[5] = {};
     
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
@@ -218,9 +234,19 @@ bool TracerRayKHR::CreateRayTracingPipeline() {
     stages[2].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
     stages[2].module = m_ClosestHitShader;
     stages[2].pName = "main";
+
+    stages[3].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[3].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
+    stages[3].module = m_ShadowMissShader;
+    stages[3].pName = "main";
+
+    stages[4].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[4].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+    stages[4].module = m_ShadowClosestHitShader;
+    stages[4].pName = "main";
     
     // Shader groups
-    VkRayTracingShaderGroupCreateInfoKHR groups[3] = {};
+    VkRayTracingShaderGroupCreateInfoKHR groups[5] = {};
     
     // Raygen group
     groups[0].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
@@ -238,22 +264,40 @@ bool TracerRayKHR::CreateRayTracingPipeline() {
     groups[1].anyHitShader = VK_SHADER_UNUSED_KHR;
     groups[1].intersectionShader = VK_SHADER_UNUSED_KHR;
     
-    // Closest hit group
+    // Shadow miss group
     groups[2].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
-    groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
-    groups[2].generalShader = VK_SHADER_UNUSED_KHR;
-    groups[2].closestHitShader = 2;
+    groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[2].generalShader = 3;
+    groups[2].closestHitShader = VK_SHADER_UNUSED_KHR;
     groups[2].anyHitShader = VK_SHADER_UNUSED_KHR;
     groups[2].intersectionShader = VK_SHADER_UNUSED_KHR;
+
+    // Primary closest hit group
+    groups[3].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+    groups[3].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+    groups[3].generalShader = VK_SHADER_UNUSED_KHR;
+    groups[3].closestHitShader = 2;
+    groups[3].anyHitShader = VK_SHADER_UNUSED_KHR;
+    groups[3].intersectionShader = VK_SHADER_UNUSED_KHR;
+
+    // Shadow closest hit group
+    groups[4].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+    groups[4].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+    groups[4].generalShader = VK_SHADER_UNUSED_KHR;
+    groups[4].closestHitShader = 4;
+    groups[4].anyHitShader = VK_SHADER_UNUSED_KHR;
+    groups[4].intersectionShader = VK_SHADER_UNUSED_KHR;
     
     // Create ray tracing pipeline
     VkRayTracingPipelineCreateInfoKHR pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
-    pipelineInfo.stageCount = 3;
+    pipelineInfo.stageCount = 5;
     pipelineInfo.pStages = stages;
-    pipelineInfo.groupCount = 3;
+    pipelineInfo.groupCount = 5;
     pipelineInfo.pGroups = groups;
-    pipelineInfo.maxPipelineRayRecursionDepth = m_Context->GetDeviceFeatures().maxRayRecursionDepth;
+    // Need recursion for shadow rays from closest-hit
+    uint32_t maxDepth = m_Context->GetDeviceFeatures().maxRayRecursionDepth;
+    pipelineInfo.maxPipelineRayRecursionDepth = (maxDepth >= 2) ? 2 : 1;
     pipelineInfo.layout = m_PipelineLayout;
     
     if (vkCreateRayTracingPipelinesKHR(device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline) != VK_SUCCESS) {
@@ -275,7 +319,8 @@ bool TracerRayKHR::CreateShaderBindingTable() {
     uint32_t handleAlignment = features.shaderGroupBaseAlignment;
     uint32_t alignedHandleSize = (handleSize + handleAlignment - 1) & ~(handleAlignment - 1);
     
-    uint32_t groupCount = 3; // raygen, miss, hit
+    // raygen (1) + miss (2 ray types) + hit (2 ray types)
+    uint32_t groupCount = 5;
     uint32_t sbtSize = groupCount * alignedHandleSize;
     
     // Get shader group handles
@@ -317,11 +362,11 @@ bool TracerRayKHR::CreateShaderBindingTable() {
     
     m_MissRegion.deviceAddress = sbtAddress + alignedHandleSize;
     m_MissRegion.stride = alignedHandleSize;
-    m_MissRegion.size = alignedHandleSize;
+    m_MissRegion.size = 2 * alignedHandleSize;
     
-    m_HitRegion.deviceAddress = sbtAddress + 2 * alignedHandleSize;
+    m_HitRegion.deviceAddress = sbtAddress + 3 * alignedHandleSize;
     m_HitRegion.stride = alignedHandleSize;
-    m_HitRegion.size = alignedHandleSize;
+    m_HitRegion.size = 2 * alignedHandleSize;
     
     m_CallableRegion = {};
     
@@ -342,7 +387,7 @@ bool TracerRayKHR::CreateDescriptorSets() {
         LUCENT_CORE_ERROR("TracerRayKHR: Failed to allocate descriptor set");
         return false;
     }
-    
+    m_DescriptorsDirty = true;
     return true;
 }
 
@@ -373,6 +418,7 @@ bool TracerRayKHR::CreateAccumulationImage(uint32_t width, uint32_t height) {
     
     m_AccumWidth = width;
     m_AccumHeight = height;
+    m_DescriptorsDirty = true;
     
     LUCENT_CORE_DEBUG("TracerRayKHR: Accumulation image created: {}x{}", width, height);
     return true;
@@ -391,6 +437,13 @@ bool TracerRayKHR::BuildBLAS(const std::vector<BVHBuilder::Triangle>& triangles)
         positions.push_back(tri.v0);
         positions.push_back(tri.v1);
         positions.push_back(tri.v2);
+    }
+
+    // Per-primitive material ids (one per triangle, indexed by gl_PrimitiveID)
+    std::vector<uint32_t> materialIds;
+    materialIds.reserve(triangles.size());
+    for (const auto& tri : triangles) {
+        materialIds.push_back(tri.materialId);
     }
     
     BufferDesc vbDesc{};
@@ -427,6 +480,19 @@ bool TracerRayKHR::BuildBLAS(const std::vector<BVHBuilder::Triangle>& triangles)
         return false;
     }
     m_IndexBuffer.Upload(indices.data(), ibDesc.size);
+
+    // Create primitive material id buffer (shader-readable)
+    BufferDesc pmDesc{};
+    pmDesc.size = materialIds.size() * sizeof(uint32_t);
+    pmDesc.usage = BufferUsage::Storage;
+    pmDesc.hostVisible = true;
+    pmDesc.debugName = "RTPrimitiveMaterialIds";
+    m_PrimitiveMaterialBuffer.Shutdown();
+    if (!m_PrimitiveMaterialBuffer.Init(m_Device, pmDesc)) {
+        LUCENT_CORE_ERROR("TracerRayKHR: Failed to create primitive material id buffer");
+        return false;
+    }
+    m_PrimitiveMaterialBuffer.Upload(materialIds.data(), pmDesc.size);
     
     // Geometry description
     VkAccelerationStructureGeometryKHR geometry{};
@@ -696,6 +762,7 @@ void TracerRayKHR::UpdateScene(const std::vector<BVHBuilder::Triangle>& triangle
     if (m_MaterialBuffer.Init(m_Device, matDesc)) {
         m_MaterialBuffer.Upload(packedMaterials.data(), matDesc.size);
     }
+    m_DescriptorsDirty = true;
     
     // Create pipeline and SBT if not done yet
     if (m_Pipeline == VK_NULL_HANDLE) {
@@ -724,84 +791,100 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
     
     // Update camera
     m_CameraBuffer.Upload(&camera, sizeof(GPUCamera));
-    
-    // Update descriptors
-    VkDevice device = m_Context->GetDevice();
-    
-    VkWriteDescriptorSetAccelerationStructureKHR asWrite{};
-    asWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
-    asWrite.accelerationStructureCount = 1;
-    asWrite.pAccelerationStructures = &m_TLAS.handle;
-    
-    VkDescriptorImageInfo imageInfo{};
-    imageInfo.imageView = m_AccumulationImage.GetView();
-    imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    
-    VkDescriptorBufferInfo vertexInfo{};
-    vertexInfo.buffer = m_VertexBuffer.GetHandle();
-    vertexInfo.offset = 0;
-    vertexInfo.range = m_VertexBuffer.GetSize();
-    
-    VkDescriptorBufferInfo indexInfo{};
-    indexInfo.buffer = m_IndexBuffer.GetHandle();
-    indexInfo.offset = 0;
-    indexInfo.range = m_IndexBuffer.GetSize();
-    
-    VkDescriptorBufferInfo materialInfo{};
-    materialInfo.buffer = m_MaterialBuffer.GetHandle();
-    materialInfo.offset = 0;
-    materialInfo.range = m_MaterialBuffer.GetSize();
-    
-    VkDescriptorBufferInfo cameraInfo{};
-    cameraInfo.buffer = m_CameraBuffer.GetHandle();
-    cameraInfo.offset = 0;
-    cameraInfo.range = sizeof(GPUCamera);
-    
-    VkWriteDescriptorSet writes[6] = {};
-    
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].pNext = &asWrite;
-    writes[0].dstSet = m_DescriptorSet;
-    writes[0].dstBinding = 0;
-    writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-    
-    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = m_DescriptorSet;
-    writes[1].dstBinding = 1;
-    writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[1].pImageInfo = &imageInfo;
-    
-    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[2].dstSet = m_DescriptorSet;
-    writes[2].dstBinding = 2;
-    writes[2].descriptorCount = 1;
-    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[2].pBufferInfo = &vertexInfo;
-    
-    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[3].dstSet = m_DescriptorSet;
-    writes[3].dstBinding = 3;
-    writes[3].descriptorCount = 1;
-    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[3].pBufferInfo = &indexInfo;
-    
-    writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[4].dstSet = m_DescriptorSet;
-    writes[4].dstBinding = 4;
-    writes[4].descriptorCount = 1;
-    writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[4].pBufferInfo = &materialInfo;
-    
-    writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[5].dstSet = m_DescriptorSet;
-    writes[5].dstBinding = 5;
-    writes[5].descriptorCount = 1;
-    writes[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    writes[5].pBufferInfo = &cameraInfo;
-    
-    vkUpdateDescriptorSets(device, 6, writes, 0, nullptr);
+
+    // Update descriptors only when they actually changed (scene updated, image resized, descriptor set allocated).
+    // Updating every frame can trip validation (descriptor set still in use by an in-flight command buffer).
+    if (m_DescriptorsDirty) {
+        VkDevice device = m_Context->GetDevice();
+
+        VkWriteDescriptorSetAccelerationStructureKHR asWrite{};
+        asWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+        asWrite.accelerationStructureCount = 1;
+        asWrite.pAccelerationStructures = &m_TLAS.handle;
+
+        VkDescriptorImageInfo imageInfo{};
+        imageInfo.imageView = m_AccumulationImage.GetView();
+        imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorBufferInfo vertexInfo{};
+        vertexInfo.buffer = m_VertexBuffer.GetHandle();
+        vertexInfo.offset = 0;
+        vertexInfo.range = m_VertexBuffer.GetSize();
+
+        VkDescriptorBufferInfo indexInfo{};
+        indexInfo.buffer = m_IndexBuffer.GetHandle();
+        indexInfo.offset = 0;
+        indexInfo.range = m_IndexBuffer.GetSize();
+
+        VkDescriptorBufferInfo materialInfo{};
+        materialInfo.buffer = m_MaterialBuffer.GetHandle();
+        materialInfo.offset = 0;
+        materialInfo.range = m_MaterialBuffer.GetSize();
+
+        VkDescriptorBufferInfo primMatInfo{};
+        primMatInfo.buffer = m_PrimitiveMaterialBuffer.GetHandle();
+        primMatInfo.offset = 0;
+        primMatInfo.range = m_PrimitiveMaterialBuffer.GetSize();
+
+        VkDescriptorBufferInfo cameraInfo{};
+        cameraInfo.buffer = m_CameraBuffer.GetHandle();
+        cameraInfo.offset = 0;
+        cameraInfo.range = sizeof(GPUCamera);
+
+        VkWriteDescriptorSet writes[7] = {};
+
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].pNext = &asWrite;
+        writes[0].dstSet = m_DescriptorSet;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = m_DescriptorSet;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[1].pImageInfo = &imageInfo;
+
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = m_DescriptorSet;
+        writes[2].dstBinding = 2;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[2].pBufferInfo = &vertexInfo;
+
+        writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[3].dstSet = m_DescriptorSet;
+        writes[3].dstBinding = 3;
+        writes[3].descriptorCount = 1;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[3].pBufferInfo = &indexInfo;
+
+        writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[4].dstSet = m_DescriptorSet;
+        writes[4].dstBinding = 4;
+        writes[4].descriptorCount = 1;
+        writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[4].pBufferInfo = &materialInfo;
+
+        writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[5].dstSet = m_DescriptorSet;
+        writes[5].dstBinding = 5;
+        writes[5].descriptorCount = 1;
+        writes[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[5].pBufferInfo = &cameraInfo;
+
+        writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[6].dstSet = m_DescriptorSet;
+        writes[6].dstBinding = 6;
+        writes[6].descriptorCount = 1;
+        writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[6].pBufferInfo = &primMatInfo;
+
+        vkUpdateDescriptorSets(device, 7, writes, 0, nullptr);
+        m_DescriptorsDirty = false;
+    }
     
     // Bind pipeline
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_Pipeline);

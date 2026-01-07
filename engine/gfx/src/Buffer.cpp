@@ -35,7 +35,16 @@ bool Buffer::Init(Device* device, const BufferDesc& desc) {
             bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
             break;
         case BufferUsage::AccelerationStructure:
+            // Ray tracing buffers often serve multiple purposes:
+            // - AS storage (BLAS/TLAS buffers)
+            // - AS build input (vertex/index/instance buffers)
+            // - Shader-readable data (bound as storage buffers in shaders)
+            //
+            // In this codebase BufferUsage::AccelerationStructure is only used by TracerRayKHR,
+            // so we include all required flags here.
             bufferInfo.usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                               VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
             break;
         case BufferUsage::ShaderBindingTable:

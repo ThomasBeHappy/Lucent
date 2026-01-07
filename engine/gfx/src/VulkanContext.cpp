@@ -1,5 +1,6 @@
 #include "lucent/gfx/VulkanContext.h"
 #include "lucent/gfx/Swapchain.h"
+#include "lucent/gfx/VkResultUtils.h"
 #include <set>
 #include <algorithm>
 
@@ -94,7 +95,10 @@ void VulkanContext::Shutdown() {
 
 void VulkanContext::WaitIdle() const {
     if (m_Device != VK_NULL_HANDLE) {
-        vkDeviceWaitIdle(m_Device);
+        VkResult res = vkDeviceWaitIdle(m_Device);
+        if (res != VK_SUCCESS) {
+            LUCENT_CORE_ERROR("vkDeviceWaitIdle failed: {} ({})", VkResultToString(res), static_cast<int>(res));
+        }
     }
 }
 
@@ -336,6 +340,16 @@ bool VulkanContext::CreateLogicalDevice(const VulkanContextConfig& config) {
     deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     deviceFeatures2.features.fillModeNonSolid = VK_TRUE;  // Enable wireframe mode
     
+    // Enable robust buffer access when supported (helps prevent GPU hangs on OOB in shaders)
+    VkPhysicalDeviceFeatures coreFeatures{};
+    vkGetPhysicalDeviceFeatures(m_PhysicalDevice, &coreFeatures);
+    if (coreFeatures.robustBufferAccess) {
+        deviceFeatures2.features.robustBufferAccess = VK_TRUE;
+        LUCENT_CORE_INFO("  robustBufferAccess: ENABLED");
+    } else {
+        LUCENT_CORE_WARN("  robustBufferAccess: NOT AVAILABLE");
+    }
+    
     // Vulkan 1.2 features - only request if device supports them
     VkPhysicalDeviceVulkan12Features vulkan12Features{};
     vulkan12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
@@ -345,6 +359,8 @@ bool VulkanContext::CreateLogicalDevice(const VulkanContextConfig& config) {
     vulkan12Features.descriptorIndexing = VK_TRUE;
     vulkan12Features.runtimeDescriptorArray = VK_TRUE;
     vulkan12Features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+    // Required for our RT shaders using `layout(scalar)` storage buffers with vec3 arrays
+    vulkan12Features.scalarBlockLayout = VK_TRUE;
     vulkan12Features.timelineSemaphore = VK_TRUE;
     
     deviceFeatures2.pNext = &vulkan12Features;

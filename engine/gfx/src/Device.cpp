@@ -1,4 +1,5 @@
 #include "lucent/gfx/Device.h"
+#include "lucent/gfx/VkResultUtils.h"
 
 namespace lucent::gfx {
 
@@ -115,8 +116,16 @@ void Device::EndSingleTimeCommands(VkCommandBuffer commandBuffer, VkCommandPool 
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
     
-    vkQueueSubmit(m_Context->GetGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_Context->GetGraphicsQueue());
+    VkResult submitRes = vkQueueSubmit(m_Context->GetGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+    if (submitRes != VK_SUCCESS) {
+        LUCENT_CORE_ERROR("Device::EndSingleTimeCommands vkQueueSubmit failed: {} ({})",
+            VkResultToString(submitRes), static_cast<int>(submitRes));
+    }
+    VkResult idleRes = vkQueueWaitIdle(m_Context->GetGraphicsQueue());
+    if (idleRes != VK_SUCCESS) {
+        LUCENT_CORE_ERROR("Device::EndSingleTimeCommands vkQueueWaitIdle failed: {} ({})",
+            VkResultToString(idleRes), static_cast<int>(idleRes));
+    }
     
     vkFreeCommandBuffers(m_Context->GetDevice(), pool, 1, &commandBuffer);
 }
@@ -145,7 +154,11 @@ void Device::ImmediateSubmit(std::function<void(VkCommandBuffer)>&& function) {
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &m_ImmediateCommandBuffer;
     
-    vkQueueSubmit(m_Context->GetGraphicsQueue(), 1, &submitInfo, m_ImmediateFence);
+    VkResult submitRes = vkQueueSubmit(m_Context->GetGraphicsQueue(), 1, &submitInfo, m_ImmediateFence);
+    if (submitRes != VK_SUCCESS) {
+        LUCENT_CORE_ERROR("Device::ImmediateSubmit vkQueueSubmit failed: {} ({})",
+            VkResultToString(submitRes), static_cast<int>(submitRes));
+    }
 }
 
 uint32_t Device::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const {

@@ -15,6 +15,10 @@ layout(set = 0, binding = 4, scalar) readonly buffer Materials {
     vec4 materials[];  // 3 vec4s per material: baseColor, emissive, props
 };
 
+layout(set = 0, binding = 6, scalar) readonly buffer PrimitiveMaterials {
+    uint materialIds[];
+};
+
 layout(push_constant) uniform PushConstants {
     uint frameIndex;
     uint sampleIndex;
@@ -76,17 +80,32 @@ void main() {
         normal = -normal;
     }
     
-    // Get material (simplified - use material 0 for now)
-    uint matIdx = 0;
+    // Material lookup: per-primitive material id (packed as 3 vec4s per material)
+    uint matCount = max(1u, uint(materials.length()) / 3u);
+    uint matIdx = materialIds[primIdx];
+    matIdx = min(matIdx, matCount - 1u);
     vec4 baseColor = materials[matIdx * 3 + 0];
     vec4 emissive = materials[matIdx * 3 + 1];
     
-    // Simple diffuse shading
+    // Simple diffuse shading with hard shadow to a fixed directional light
     vec3 lightDir = normalize(vec3(1.0, 1.0, 0.5));
     float NdotL = max(dot(normal, lightDir), 0.0);
+
+    // Shadow ray: payload=1 on miss (visible), 0 on hit (occluded)
+    payload = vec3(1.0);
+    vec3 shadowOrigin = hitPos + normal * 0.001;
+    float shadowTMin = 0.001;
+    float shadowTMax = 10000.0;
+    traceRayEXT(topLevelAS,
+                gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+                0xFF,
+                1, 2, 1,
+                shadowOrigin, shadowTMin, lightDir, shadowTMax,
+                0);
+    float visibility = payload.x;
     
     // Combine direct lighting and ambient
-    vec3 diffuse = baseColor.rgb * (NdotL * 0.7 + 0.3);
+    vec3 diffuse = baseColor.rgb * (NdotL * visibility * 0.7 + 0.3);
     
     // Add emission
     payload = diffuse + emissive.rgb * emissive.a;

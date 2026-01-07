@@ -1,6 +1,7 @@
 #include "Application.h"
 #include "EditorSettings.h"
 #include "lucent/gfx/DebugUtils.h"
+#include "lucent/gfx/VkResultUtils.h"
 #include "lucent/scene/Components.h"
 #include "lucent/material/MaterialAsset.h"
 #include <GLFW/glfw3.h>
@@ -603,6 +604,14 @@ void Application::RenderFrame() {
     }
     
     m_Renderer.EndFrame();
+
+    // Stop cleanly on fatal Vulkan errors (prevents infinite retry loops / driver resets)
+    if (m_Renderer.HasFatalError()) {
+        LUCENT_CORE_ERROR("Fatal renderer error, stopping: {} ({})",
+            gfx::VkResultToString(m_Renderer.GetLastError()),
+            static_cast<int>(m_Renderer.GetLastError()));
+        m_Running = false;
+    }
 }
 
 void Application::FramebufferResizeCallback(GLFWwindow* window, int width, int height) {

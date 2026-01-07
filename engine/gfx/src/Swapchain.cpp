@@ -1,4 +1,5 @@
 #include "lucent/gfx/Swapchain.h"
+#include "lucent/gfx/VkResultUtils.h"
 #include <algorithm>
 
 namespace lucent::gfx {
@@ -57,7 +58,7 @@ bool Swapchain::AcquireNextImage(VkSemaphore signalSemaphore, uint32_t& imageInd
     }
     
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
-        LUCENT_CORE_ERROR("Failed to acquire swapchain image: {}", static_cast<int>(result));
+        LUCENT_CORE_ERROR("vkAcquireNextImageKHR failed: {} ({})", VkResultToString(result), static_cast<int>(result));
         m_NeedsRecreate = true; // Try recreating on any failure
         return false;
     }
@@ -86,7 +87,7 @@ bool Swapchain::Present(VkSemaphore waitSemaphore, uint32_t imageIndex) {
     }
     
     if (result != VK_SUCCESS) {
-        LUCENT_CORE_ERROR("Failed to present swapchain image: {}", static_cast<int>(result));
+        LUCENT_CORE_ERROR("vkQueuePresentKHR failed: {} ({})", VkResultToString(result), static_cast<int>(result));
         return false;
     }
     

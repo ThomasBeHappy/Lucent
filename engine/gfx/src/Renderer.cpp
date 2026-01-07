@@ -1,5 +1,6 @@
 #include "lucent/gfx/Renderer.h"
 #include "lucent/gfx/DebugUtils.h"
+#include "lucent/gfx/VkResultUtils.h"
 #include <array>
 
 namespace lucent::gfx {
@@ -166,6 +167,9 @@ void Renderer::Shutdown() {
 }
 
 bool Renderer::BeginFrame() {
+    if (m_FatalError) {
+        return false;
+    }
     if (m_NeedsResize) {
         RecreateSwapchain();
         m_NeedsResize = false;
@@ -186,9 +190,6 @@ bool Renderer::BeginFrame() {
         LUCENT_CORE_ERROR("Failed to acquire swapchain image");
         return false;
     }
-    
-    // Reset fence only after we know we'll submit work
-    vkResetFences(device, 1, &frame.inFlightFence);
     
     // Reset and begin command buffer
     vkResetCommandBuffer(frame.commandBuffer, 0);
@@ -233,8 +234,16 @@ void Renderer::EndFrame() {
     submitInfo.signalSemaphoreCount = 1;
     submitInfo.pSignalSemaphores = &renderFinishedSemaphore;
     
-    if (vkQueueSubmit(m_Context->GetGraphicsQueue(), 1, &submitInfo, frame.inFlightFence) != VK_SUCCESS) {
-        LUCENT_CORE_ERROR("Failed to submit command buffer");
+    // Only reset the fence right before submission.
+    // If vkQueueSubmit fails and the fence was reset earlier, BeginFrame would block forever.
+    vkResetFences(m_Context->GetDevice(), 1, &frame.inFlightFence);
+    
+    VkResult submitRes = vkQueueSubmit(m_Context->GetGraphicsQueue(), 1, &submitInfo, frame.inFlightFence);
+    if (submitRes != VK_SUCCESS) {
+        LUCENT_CORE_ERROR("vkQueueSubmit failed: {} ({})", VkResultToString(submitRes), static_cast<int>(submitRes));
+        m_LastError = submitRes;
+        m_FatalError = true; // stop retrying; continuing can trigger GPU/driver resets
+        m_FrameStarted = false;
         return;
     }
     

@@ -82,6 +82,10 @@ public:
     RenderMode GetRenderMode() const { return m_RenderMode; }
     void SetRenderMode(RenderMode mode);
     bool IsRenderModeAvailable(RenderMode mode) const { return m_Capabilities.IsModeAvailable(mode); }
+
+    // Fatal Vulkan error handling (e.g. submit failure / device lost)
+    bool HasFatalError() const { return m_FatalError; }
+    VkResult GetLastError() const { return m_LastError; }
     
     // Render settings
     RenderSettings& GetSettings() { return m_Settings; }
@@ -231,6 +235,10 @@ private:
     
     // Per-swapchain-image semaphores (to avoid semaphore reuse before present completes)
     std::vector<VkSemaphore> m_ImageRenderFinishedSemaphores;
+
+    // Error tracking (prevents infinite retry loops that can TDR the GPU/driver)
+    bool m_FatalError = false;
+    VkResult m_LastError = VK_SUCCESS;
     
     // Shadow mapping
     static constexpr uint32_t SHADOW_MAP_SIZE = 2048;

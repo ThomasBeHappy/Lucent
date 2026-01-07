@@ -118,6 +118,7 @@ private:
     // Scene data
     Buffer m_VertexBuffer;
     Buffer m_IndexBuffer;
+    Buffer m_PrimitiveMaterialBuffer;
     Buffer m_MaterialBuffer;
     uint32_t m_TriangleCount = 0;
     
@@ -126,11 +127,14 @@ private:
     VkDescriptorSet m_DescriptorSet = VK_NULL_HANDLE;
     VkPipelineLayout m_PipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_Pipeline = VK_NULL_HANDLE;
+    bool m_DescriptorsDirty = true;
     
     // Shader modules
     VkShaderModule m_RaygenShader = VK_NULL_HANDLE;
     VkShaderModule m_MissShader = VK_NULL_HANDLE;
     VkShaderModule m_ClosestHitShader = VK_NULL_HANDLE;
+    VkShaderModule m_ShadowMissShader = VK_NULL_HANDLE;
+    VkShaderModule m_ShadowClosestHitShader = VK_NULL_HANDLE;
     
     // Shader binding table
     Buffer m_SBTBuffer;
