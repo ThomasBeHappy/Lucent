@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_scalar_block_layout : enable
 
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inNormal;
@@ -11,6 +12,29 @@ layout(location = 0) out vec4 outColor;
 
 // Shadow map sampler
 layout(set = 0, binding = 0) uniform sampler2D shadowMap;
+
+// Light buffer - use scalar layout to match C++ struct packing
+struct GPULight {
+    vec3 position;
+    uint type;       // 0=Directional, 1=Point, 2=Spot, 3=Area
+    vec3 color;
+    float intensity;
+    vec3 direction;
+    float range;
+    float innerAngle;
+    float outerAngle;
+    vec2 padding;
+};
+
+layout(scalar, set = 0, binding = 1) readonly buffer LightBuffer {
+    GPULight lights[];
+};
+
+// Light types
+const uint LIGHT_DIRECTIONAL = 0u;
+const uint LIGHT_POINT = 1u;
+const uint LIGHT_SPOT = 2u;
+const uint LIGHT_AREA = 3u;
 
 // Push constants matching vertex shader
 layout(push_constant) uniform PushConstants {
@@ -35,16 +59,12 @@ layout(push_constant) uniform PushConstants {
 #define u_CameraPos pc.cameraPos.xyz
 #define u_Exposure pc.cameraPos.w
 
-// Lighting constants
-const vec3 lightDir = normalize(vec3(1.0, 1.0, 0.5));
-const vec3 lightColor = vec3(1.0, 0.98, 0.95);
-const float lightIntensity = 2.5;
-
 // Ambient/environment approximation
 const vec3 ambientTop = vec3(0.3, 0.35, 0.5);    // Sky color
 const vec3 ambientBottom = vec3(0.1, 0.08, 0.05); // Ground color
 
 const float PI = 3.14159265359;
+const float MAX_DIST = 10000.0;
 
 // Fresnel-Schlick
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
@@ -123,8 +143,6 @@ float calcShadow(vec4 shadowCoord, float bias) {
 void main() {
     vec3 N = normalize(inNormal);
     vec3 V = normalize(u_CameraPos - inWorldPos);
-    vec3 L = lightDir;
-    vec3 H = normalize(V + L);
     
     // Material properties
     vec3 albedo = u_BaseColor;
@@ -134,29 +152,75 @@ void main() {
     // Material F0 (dielectric = 0.04, metallic = albedo)
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
     
-    // Cook-Torrance BRDF
-    float NDF = distributionGGX(N, H, roughness);
-    float G = geometrySmith(N, V, L, roughness);
-    vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
-    
-    vec3 numerator = NDF * G * F;
-    float denominator = 4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.0001;
-    vec3 specular = numerator / denominator;
-    
-    // Energy conservation
-    vec3 kS = F;
-    vec3 kD = (1.0 - kS) * (1.0 - metallic);
-    
-    // Shadow calculation
-    float shadow = 1.0;
+    // Shadow calculation (for primary directional light)
+    float primaryShadow = 1.0;
     if (u_ShadowEnabled > 0.5) {
         float bias = u_ShadowBias;
-        shadow = calcShadow(inShadowCoord, bias);
+        primaryShadow = calcShadow(inShadowCoord, bias);
     }
     
-    // Direct lighting with shadow
-    float NdotL = max(dot(N, L), 0.0);
-    vec3 Lo = (kD * albedo / PI + specular) * lightColor * lightIntensity * NdotL * shadow;
+    // Accumulate lighting from all scene lights
+    vec3 Lo = vec3(0.0);
+    uint numLights = lights.length();
+    bool firstDirectional = true;  // Track if we've seen the first directional light
+    
+    for (uint i = 0; i < numLights; i++) {
+        GPULight light = lights[i];
+        
+        vec3 L;
+        float attenuation = 1.0;
+        float shadow = 1.0;
+        
+        if (light.type == LIGHT_DIRECTIONAL) {
+            L = light.direction;
+            // Use shadow map only for the FIRST directional light (matches UpdateLightMatrix)
+            if (firstDirectional) {
+                shadow = primaryShadow;
+                firstDirectional = false;
+            }
+        } else if (light.type == LIGHT_POINT || light.type == LIGHT_SPOT) {
+            vec3 toLight = light.position - inWorldPos;
+            float lightDist = length(toLight);
+            L = toLight / lightDist;
+            
+            // Distance attenuation
+            if (light.range > 0.0) {
+                attenuation = 1.0 - clamp(lightDist / light.range, 0.0, 1.0);
+                attenuation *= attenuation;
+            } else {
+                attenuation = 1.0 / (lightDist * lightDist + 1.0);
+            }
+            
+            // Spot cone
+            if (light.type == LIGHT_SPOT) {
+                float theta = dot(-L, light.direction);
+                float epsilon = light.innerAngle - light.outerAngle;
+                float spotFactor = clamp((theta - cos(light.outerAngle)) / epsilon, 0.0, 1.0);
+                attenuation *= spotFactor;
+            }
+        } else {
+            continue;
+        }
+        
+        float NdotL = max(dot(N, L), 0.0);
+        if (NdotL <= 0.0 || attenuation <= 0.0) continue;
+        
+        vec3 H = normalize(V + L);
+        
+        // Cook-Torrance BRDF
+        float NDF = distributionGGX(N, H, roughness);
+        float G = geometrySmith(N, V, L, roughness);
+        vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+        
+        vec3 numerator = NDF * G * F;
+        float denominator = 4.0 * max(dot(N, V), 0.0) * NdotL + 0.0001;
+        vec3 specular = numerator / denominator;
+        
+        vec3 kS = F;
+        vec3 kD = (1.0 - kS) * (1.0 - metallic);
+        
+        Lo += (kD * albedo / PI + specular) * light.color * light.intensity * NdotL * attenuation * shadow;
+    }
     
     // Ambient (simple hemisphere + Fresnel for metals) - not affected by shadow
     vec3 ambient = hemisphereAmbient(N) * albedo * (1.0 - metallic) * 0.3;

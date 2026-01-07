@@ -1,5 +1,6 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
+#extension GL_EXT_scalar_block_layout : enable
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelAS;
 layout(set = 0, binding = 1, rgba32f) uniform image2D accumImage;
@@ -17,6 +18,29 @@ layout(set = 0, binding = 5) uniform CameraUBO {
     float nearPlane;
     float farPlane;
 } camera;
+
+// Light buffer - use scalar layout to match C++ struct packing
+struct GPULight {
+    vec3 position;
+    uint type;       // 0=Directional, 1=Point, 2=Spot, 3=Area
+    vec3 color;
+    float intensity;
+    vec3 direction;
+    float range;
+    float innerAngle;
+    float outerAngle;
+    vec2 padding;
+};
+
+layout(scalar, set = 0, binding = 9) readonly buffer LightBuffer {
+    GPULight lights[];
+};
+
+// Light types
+const uint LIGHT_DIRECTIONAL = 0u;
+const uint LIGHT_POINT = 1u;
+const uint LIGHT_SPOT = 2u;
+const uint LIGHT_AREA = 3u;
 
 layout(push_constant) uniform PushConstants {
     uint frameIndex;
@@ -45,8 +69,10 @@ struct RayPayload {
 layout(location = 0) rayPayloadEXT RayPayload payload;
 
 const float PI = 3.14159265359;
-const vec3 LIGHT_DIR = normalize(vec3(1.0, 1.0, 0.5));
-const vec3 LIGHT_COLOR = vec3(1.0, 0.98, 0.95) * 2.5;
+const float MAX_DIST = 10000.0;
+// Soft shadow tuning (in world units / radians)
+const float SUN_ANGULAR_RADIUS = 0.00935;  // ~0.535 deg diameter -> ~0.2675 deg radius
+const float POINT_LIGHT_RADIUS = 0.15;     // makes point lights behave like small sphere lights
 
 // PCG random
 uint pcgHash(uint v) {
@@ -60,25 +86,59 @@ float randomFloat(inout uint seed) {
     return float(seed) / 4294967295.0;
 }
 
-// Sky color
+vec3 randomInUnitSphere(inout uint seed) {
+    // Not perfectly uniform, but good enough for soft shadow jitter
+    vec3 p = vec3(
+        randomFloat(seed) * 2.0 - 1.0,
+        randomFloat(seed) * 2.0 - 1.0,
+        randomFloat(seed) * 2.0 - 1.0
+    );
+    return normalize(p);
+}
+
+vec3 sampleCone(vec3 axis, float cosMaxAngle, inout uint seed) {
+    // Uniform cone sampling around axis
+    float u1 = randomFloat(seed);
+    float u2 = randomFloat(seed);
+    float cosTheta = mix(cosMaxAngle, 1.0, u1);
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    float phi = 2.0 * PI * u2;
+    
+    vec3 w = normalize(axis);
+    vec3 up = (abs(w.y) < 0.999) ? vec3(0, 1, 0) : vec3(1, 0, 0);
+    vec3 u = normalize(cross(up, w));
+    vec3 v = cross(w, u);
+    
+    return normalize(u * (cos(phi) * sinTheta) + v * (sin(phi) * sinTheta) + w * cosTheta);
+}
+
+// Sky color (simple gradient)
 vec3 getSkyColor(vec3 direction) {
     float t = 0.5 * (direction.y + 1.0);
-    vec3 skyColor = mix(vec3(1.0), vec3(0.5, 0.7, 1.0), t) * 0.5;
+    // Keep the environment relatively dim so explicit scene lights dominate (otherwise light direction changes are hard to notice).
+    vec3 skyColor = mix(vec3(1.0), vec3(0.5, 0.7, 1.0), t) * 0.05;
     
-    // Add sun
-    float sunDot = dot(direction, LIGHT_DIR);
-    if (sunDot > 0.995) {
-        skyColor += LIGHT_COLOR * 2.0;
-    } else if (sunDot > 0.98) {
-        float sunGlow = (sunDot - 0.98) / 0.015;
-        skyColor += LIGHT_COLOR * sunGlow * 0.5;
+    // Add sun disc for any directional lights
+    uint numLights = lights.length();
+    for (uint i = 0; i < numLights; i++) {
+        if (lights[i].type == LIGHT_DIRECTIONAL) {
+            float sunDot = dot(direction, lights[i].direction);
+            if (sunDot > 0.995) {
+                skyColor += lights[i].color * lights[i].intensity * 2.0;
+            } else if (sunDot > 0.98) {
+                float sunGlow = (sunDot - 0.98) / 0.015;
+                skyColor += lights[i].color * lights[i].intensity * sunGlow * 0.5;
+            }
+        }
     }
     
     return skyColor;
 }
 
 // Trace shadow ray - returns visibility (1 = lit, 0 = shadow)
-float traceShadow(vec3 origin, vec3 direction) {
+// IMPORTANT: for point/spot lights we must clamp tMax to the light distance,
+// otherwise geometry *behind the light* can incorrectly occlude it.
+float traceShadow(vec3 origin, vec3 direction, float tMax) {
     // Use a simple payload for shadow - the miss shader will set it to 1.0
     payload.radiance = vec3(0.0);  // Will be set to 1.0 on miss
     
@@ -86,7 +146,7 @@ float traceShadow(vec3 origin, vec3 direction) {
                 gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
                 0xFF,
                 1, 2, 1,  // shadow ray type
-                origin, 0.001, direction, 10000.0,
+                origin, 0.001, direction, tMax,
                 0);
     
     return payload.radiance.x;
@@ -160,14 +220,69 @@ void main() {
         // Add emissive contribution
         radiance += throughput * payload.emissive;
         
-        // Direct lighting with shadow ray
+        // Direct lighting from scene lights
         vec3 shadowOrigin = payload.hitPos + payload.hitNormal * 0.001;
-        float visibility = traceShadow(shadowOrigin, LIGHT_DIR);
         
-        float NdotL = max(dot(payload.hitNormal, LIGHT_DIR), 0.0);
-        vec3 diffuseColor = payload.albedo * (1.0 - payload.metallic);
-        vec3 directLight = diffuseColor * LIGHT_COLOR * NdotL * visibility / PI;
-        radiance += throughput * directLight;
+        uint numLights = lights.length();
+        for (uint i = 0; i < numLights; i++) {
+            GPULight light = lights[i];
+            
+            vec3 lightDir;
+            float lightDist = MAX_DIST;
+            float attenuation = 1.0;
+            vec3 sampledPos = light.position;
+            
+            if (light.type == LIGHT_DIRECTIONAL) {
+                // Soft sun: jitter direction within a small cone
+                float cosMax = cos(SUN_ANGULAR_RADIUS);
+                lightDir = sampleCone(light.direction, cosMax, seed);
+            } else if (light.type == LIGHT_POINT || light.type == LIGHT_SPOT) {
+                // Soft point/spot: treat as a small sphere light around its position
+                sampledPos = light.position + randomInUnitSphere(seed) * POINT_LIGHT_RADIUS;
+                vec3 toLight = sampledPos - payload.hitPos;
+                lightDist = length(toLight);
+                lightDir = toLight / lightDist;
+                
+                // Distance attenuation
+                if (light.range > 0.0) {
+                    attenuation = 1.0 - clamp(lightDist / light.range, 0.0, 1.0);
+                    attenuation *= attenuation;
+                } else {
+                    attenuation = 1.0 / (lightDist * lightDist + 1.0);
+                }
+                
+                // Spot cone
+                if (light.type == LIGHT_SPOT) {
+                    float theta = dot(-lightDir, light.direction);
+                    float cosInner = cos(light.innerAngle);
+                    float cosOuter = cos(light.outerAngle);
+                    float denom = max(cosInner - cosOuter, 0.0001);
+                    float spotFactor = clamp((theta - cosOuter) / denom, 0.0, 1.0);
+                    attenuation *= spotFactor;
+                }
+            } else {
+                continue;
+            }
+            
+            float NdotL = max(dot(payload.hitNormal, lightDir), 0.0);
+            if (NdotL <= 0.0 || attenuation <= 0.0) continue;
+            
+            // Shadow ray
+            float shadowTMax = (light.type == LIGHT_DIRECTIONAL) ? MAX_DIST : max(lightDist - 0.01, 0.01);
+            float visibility = traceShadow(shadowOrigin, lightDir, shadowTMax);
+            if (visibility <= 0.0) continue;
+            
+            // Check if shadow ray hits something before the light
+            // (For point/spot lights - directional lights have infinite distance)
+            if (light.type != LIGHT_DIRECTIONAL) {
+                // We need to test if occluder is closer than light
+                // For now, we use the simple visibility check
+            }
+            
+            vec3 diffuseColor = payload.albedo * (1.0 - payload.metallic);
+            vec3 directLight = diffuseColor * light.color * light.intensity * NdotL * attenuation * visibility / PI;
+            radiance += throughput * directLight;
+        }
         
         // Update throughput for next bounce
         // For metals, tint by albedo; for non-metals, mostly white specular

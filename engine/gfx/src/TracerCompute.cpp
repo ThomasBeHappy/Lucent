@@ -128,7 +128,7 @@ bool TracerCompute::Init(VulkanContext* context, Device* device) {
     // Create descriptor pool
     VkDescriptorPoolSize poolSizes[] = {
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },  // accumImage + albedoImage + normalImage
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 }, // triangles + bvh + instances + materials + lights
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
     };
     
@@ -152,12 +152,13 @@ bool TracerCompute::Init(VulkanContext* context, Device* device) {
         { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },     // materials
         { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },     // camera
         { 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },      // albedoImage
-        { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }       // normalImage
+        { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },      // normalImage
+        { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }      // lights
     };
     
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 8;
+    layoutInfo.bindingCount = 9;
     layoutInfo.pBindings = bindings;
     
     if (vkCreateDescriptorSetLayout(context->GetDevice(), &layoutInfo, nullptr, &m_DescriptorLayout) != VK_SUCCESS) {
@@ -373,7 +374,12 @@ void TracerCompute::UpdateDescriptors() {
     cameraInfo.offset = 0;
     cameraInfo.range = sizeof(GPUCamera);
     
-    VkWriteDescriptorSet writes[8] = {};
+    VkDescriptorBufferInfo lightInfo{};
+    lightInfo.buffer = m_SceneGPU.lightBuffer.GetHandle();
+    lightInfo.offset = 0;
+    lightInfo.range = m_SceneGPU.lightBuffer.GetSize();
+    
+    VkWriteDescriptorSet writes[9] = {};
     
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = m_DescriptorSet;
@@ -431,11 +437,19 @@ void TracerCompute::UpdateDescriptors() {
     writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     writes[7].pImageInfo = &normalInfo;
     
-    vkUpdateDescriptorSets(device, 8, writes, 0, nullptr);
+    writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[8].dstSet = m_DescriptorSet;
+    writes[8].dstBinding = 8;
+    writes[8].descriptorCount = 1;
+    writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[8].pBufferInfo = &lightInfo;
+    
+    vkUpdateDescriptorSets(device, 9, writes, 0, nullptr);
 }
 
 void TracerCompute::UpdateScene(const std::vector<BVHBuilder::Triangle>& inputTriangles,
-                                 const std::vector<GPUMaterial>& inputMaterials) {
+                                 const std::vector<GPUMaterial>& inputMaterials,
+                                 const std::vector<GPULight>& inputLights) {
     std::vector<BVHBuilder::Triangle> triangles = inputTriangles;
     std::vector<GPUMaterial> materials = inputMaterials;
     
@@ -499,11 +513,13 @@ void TracerCompute::UpdateScene(const std::vector<BVHBuilder::Triangle>& inputTr
     size_t bvhSize = packedNodes.size() * sizeof(glm::vec4);
     size_t matSize = packedMaterials.size() * sizeof(glm::vec4);
     size_t instSize = sizeof(glm::mat4); // Dummy instance buffer
+    size_t lightSize = std::max(inputLights.size(), size_t(1)) * sizeof(GPULight);
     
     m_SceneGPU.triangleBuffer.Shutdown();
     m_SceneGPU.bvhNodeBuffer.Shutdown();
     m_SceneGPU.instanceBuffer.Shutdown();
     m_SceneGPU.materialBuffer.Shutdown();
+    m_SceneGPU.lightBuffer.Shutdown();
     
     BufferDesc triDesc{};
     triDesc.size = triSize;
@@ -533,6 +549,13 @@ void TracerCompute::UpdateScene(const std::vector<BVHBuilder::Triangle>& inputTr
     matDesc.debugName = "TracerMaterials";
     m_SceneGPU.materialBuffer.Init(m_Device, matDesc);
     
+    BufferDesc lightDesc{};
+    lightDesc.size = lightSize;
+    lightDesc.usage = BufferUsage::Storage;
+    lightDesc.hostVisible = true;
+    lightDesc.debugName = "TracerLights";
+    m_SceneGPU.lightBuffer.Init(m_Device, lightDesc);
+    
     // Upload data
     m_SceneGPU.triangleBuffer.Upload(packedTriangles.data(), triSize);
     m_SceneGPU.bvhNodeBuffer.Upload(packedNodes.data(), bvhSize);
@@ -540,6 +563,23 @@ void TracerCompute::UpdateScene(const std::vector<BVHBuilder::Triangle>& inputTr
     
     glm::mat4 identity(1.0f);
     m_SceneGPU.instanceBuffer.Upload(&identity, sizeof(glm::mat4));
+    
+    // Upload lights (or a dummy light if empty)
+    if (!inputLights.empty()) {
+        m_SceneGPU.lightBuffer.Upload(inputLights.data(), inputLights.size() * sizeof(GPULight));
+        m_SceneGPU.lightCount = static_cast<uint32_t>(inputLights.size());
+    } else {
+        // Default directional light (sun)
+        GPULight defaultLight{};
+        defaultLight.position = glm::vec3(0.0f); // Not used for directional
+        defaultLight.type = static_cast<uint32_t>(GPULightType::Directional);
+        defaultLight.color = glm::vec3(1.0f, 0.98f, 0.95f);
+        defaultLight.intensity = 2.5f;
+        defaultLight.direction = glm::normalize(glm::vec3(1.0f, 1.0f, 0.5f));
+        defaultLight.range = 0.0f;
+        m_SceneGPU.lightBuffer.Upload(&defaultLight, sizeof(GPULight));
+        m_SceneGPU.lightCount = 1;
+    }
     
     m_SceneGPU.triangleCount = static_cast<uint32_t>(triangles.size());
     m_SceneGPU.bvhNodeCount = static_cast<uint32_t>(nodes.size());
@@ -550,8 +590,8 @@ void TracerCompute::UpdateScene(const std::vector<BVHBuilder::Triangle>& inputTr
     m_SceneDirty = false;
     m_DescriptorsDirty = true;  // Scene buffers changed, need to update descriptors
     
-    LUCENT_CORE_INFO("TracerCompute scene updated: {} triangles, {} BVH nodes, {} materials",
-        m_SceneGPU.triangleCount, m_SceneGPU.bvhNodeCount, m_SceneGPU.materialCount);
+    LUCENT_CORE_INFO("TracerCompute scene updated: {} triangles, {} BVH nodes, {} materials, {} lights",
+        m_SceneGPU.triangleCount, m_SceneGPU.bvhNodeCount, m_SceneGPU.materialCount, m_SceneGPU.lightCount);
 }
 
 void TracerCompute::Trace(VkCommandBuffer cmd, 

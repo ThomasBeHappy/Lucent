@@ -1,5 +1,6 @@
 #include "MaterialGraphPanel.h"
 #include "UndoStack.h"
+#include "EditorIcons.h"
 #include "lucent/material/MaterialAsset.h"
 #include "lucent/core/Log.h"
 #include <imgui-node-editor/imgui_node_editor.h>
@@ -10,6 +11,15 @@
 namespace ed = ax::NodeEditor;
 
 namespace lucent {
+
+namespace {
+
+static ImVec4 ThemeAccent() { return ImGui::GetStyle().Colors[ImGuiCol_CheckMark]; }
+static ImVec4 ThemeSuccess() { return ImVec4(0.33f, 0.78f, 0.47f, 1.0f); }
+static ImVec4 ThemeWarning() { return ImVec4(0.95f, 0.70f, 0.28f, 1.0f); }
+static ImVec4 ThemeError() { return ImVec4(0.92f, 0.34f, 0.34f, 1.0f); }
+
+} // namespace
 
 MaterialGraphPanel::~MaterialGraphPanel() {
     Shutdown();
@@ -65,29 +75,29 @@ void MaterialGraphPanel::Draw() {
 void MaterialGraphPanel::DrawToolbar() {
     if (ImGui::BeginMenuBar()) {
         if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("New Material", "Ctrl+N")) {
+            if (ImGui::MenuItem((LUCENT_ICON_FILE " New Material"), "Ctrl+N")) {
                 CreateNewMaterial();
             }
-            if (ImGui::MenuItem("Open Material...", "Ctrl+O")) {
+            if (ImGui::MenuItem((LUCENT_ICON_OPEN " Open Material..."), "Ctrl+O")) {
                 // TODO: Open file dialog
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Save", "Ctrl+S", false, m_Material != nullptr)) {
+            if (ImGui::MenuItem((LUCENT_ICON_SAVE " Save"), "Ctrl+S", false, m_Material != nullptr)) {
                 if (m_Material && !m_Material->GetFilePath().empty()) {
                     material::MaterialAssetManager::Get().SaveMaterial(m_Material, m_Material->GetFilePath());
                 }
             }
-            if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, m_Material != nullptr)) {
+            if (ImGui::MenuItem((LUCENT_ICON_SAVE " Save As..."), "Ctrl+Shift+S", false, m_Material != nullptr)) {
                 // TODO: Save file dialog
             }
             ImGui::EndMenu();
         }
         
         if (ImGui::BeginMenu("Edit")) {
-            if (ImGui::MenuItem("Undo", "Ctrl+Z")) {}
-            if (ImGui::MenuItem("Redo", "Ctrl+Y")) {}
+            if (ImGui::MenuItem((LUCENT_ICON_UNDO " Undo"), "Ctrl+Z")) {}
+            if (ImGui::MenuItem((LUCENT_ICON_REDO " Redo"), "Ctrl+Y")) {}
             ImGui::Separator();
-            if (ImGui::MenuItem("Delete Selected", "Delete")) {
+            if (ImGui::MenuItem((LUCENT_ICON_TRASH " Delete Selected"), "Delete")) {
                 // TODO: Delete selected nodes
             }
             ImGui::EndMenu();
@@ -108,7 +118,7 @@ void MaterialGraphPanel::DrawToolbar() {
         ImGui::SameLine();
         
         // Compile button
-        if (ImGui::Button("Compile")) {
+        if (ImGui::Button(LUCENT_ICON_PLAY " Compile")) {
             m_Material->Recompile();
             m_CompileAnimTimer = 1.0f;
         }
@@ -117,9 +127,9 @@ void MaterialGraphPanel::DrawToolbar() {
         
         // Status indicator
         if (m_Material->IsValid()) {
-            ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "[OK]");
+            ImGui::TextColored(ThemeSuccess(), "[OK]");
         } else {
-            ImGui::TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f), "[ERROR]");
+            ImGui::TextColored(ThemeError(), "[ERROR]");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("%s", m_Material->GetCompileError().c_str());
             }
@@ -127,12 +137,12 @@ void MaterialGraphPanel::DrawToolbar() {
         
         if (m_Material->IsDirty()) {
             ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.0f, 1.0f), "(unsaved)");
+            ImGui::TextColored(ThemeWarning(), "(unsaved)");
         }
     } else {
         ImGui::Text("No material selected");
         ImGui::SameLine();
-        if (ImGui::Button("Create New")) {
+        if (ImGui::Button(LUCENT_ICON_PLUS " Create New")) {
             CreateNewMaterial();
         }
     }
@@ -161,8 +171,11 @@ void MaterialGraphPanel::DrawNodeEditor() {
         ImVec2 editorSize = ImGui::GetContentRegionAvail();
         
         // Create a visible hint that we can drop here
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.5f, 0.8f, 0.3f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.6f, 0.9f, 0.5f));
+        ImVec4 accent = ImGui::GetStyle().Colors[ImGuiCol_CheckMark];
+        accent.w = 0.16f;
+        ImGui::PushStyleColor(ImGuiCol_Button, accent);
+        accent.w = 0.24f;
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, accent);
         ImGui::Button("##GraphDropZone", editorSize);
         ImGui::PopStyleColor(2);
         
@@ -466,7 +479,7 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
             
             // Show as clickable link
             if (!path.empty()) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.7f, 1.0f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, ThemeAccent());
                 if (ImGui::Selectable(displayName.c_str(), false, ImGuiSelectableFlags_None, ImVec2(130.0f, 0.0f))) {
                     // Navigate to the asset in content browser
                     if (m_NavigateToAsset) {
@@ -936,7 +949,7 @@ void MaterialGraphPanel::DrawCompileStatus() {
     // Show errors in a separate panel
     if (!m_Material->IsValid() && !m_Material->GetCompileError().empty()) {
         ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f), "Compile Error:");
+        ImGui::TextColored(ThemeError(), "Compile Error:");
         
         // Scrollable error text
         ImGui::BeginChild("ErrorLog", ImVec2(0, 100), true);

@@ -9,6 +9,7 @@
 #include <glm/glm.hpp>
 #include <vector>
 #include <string>
+#include <optional>
 
 struct GLFWwindow;
 
@@ -116,6 +117,7 @@ public:
     
 private:
     void SetupStyle();
+    void SetupFonts();
     void DrawDockspace();
     void DrawViewportPanel();
     void DrawGizmo();
@@ -227,6 +229,7 @@ private:
     // Content browser state
     std::filesystem::path m_ContentBrowserPath;
     std::string m_ContentBrowserSearch;
+    bool m_IconFontLoaded = false;
     
     // Material graph panel
     MaterialGraphPanel m_MaterialGraphPanel;

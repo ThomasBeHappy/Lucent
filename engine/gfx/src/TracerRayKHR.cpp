@@ -34,8 +34,8 @@ bool TracerRayKHR::Init(VulkanContext* context, Device* device) {
     VkDescriptorPoolSize poolSizes[] = {
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },  // accumImage + albedoImage + normalImage
-        // vertices, indices, materials, primitiveMaterialIds
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 },
+        // vertices, indices, materials, primitiveMaterialIds, lights
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
     };
     
@@ -60,12 +60,13 @@ bool TracerRayKHR::Init(VulkanContext* context, Device* device) {
         { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr },  // camera
         { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }, // per-primitive material ids
         { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr },  // albedoImage
-        { 8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr }   // normalImage
+        { 8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr },  // normalImage
+        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }  // lights
     };
     
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 9;
+    layoutInfo.bindingCount = 10;
     layoutInfo.pBindings = bindings;
     
     if (vkCreateDescriptorSetLayout(context->GetDevice(), &layoutInfo, nullptr, &m_DescriptorLayout) != VK_SUCCESS) {
@@ -782,7 +783,8 @@ bool TracerRayKHR::BuildTLAS() {
 }
 
 void TracerRayKHR::UpdateScene(const std::vector<BVHBuilder::Triangle>& triangles,
-                                const std::vector<GPUMaterial>& materials) {
+                                const std::vector<GPUMaterial>& materials,
+                                const std::vector<GPULight>& lights) {
     if (!m_Supported || triangles.empty()) return;
     
     // Build acceleration structures
@@ -815,6 +817,34 @@ void TracerRayKHR::UpdateScene(const std::vector<BVHBuilder::Triangle>& triangle
     if (m_MaterialBuffer.Init(m_Device, matDesc)) {
         m_MaterialBuffer.Upload(packedMaterials.data(), matDesc.size);
     }
+    
+    // Upload light data
+    m_LightBuffer.Shutdown();
+    size_t lightSize = std::max(lights.size(), size_t(1)) * sizeof(GPULight);
+    BufferDesc lightDesc{};
+    lightDesc.size = lightSize;
+    lightDesc.usage = BufferUsage::Storage;
+    lightDesc.hostVisible = true;
+    lightDesc.debugName = "RTLights";
+    
+    if (m_LightBuffer.Init(m_Device, lightDesc)) {
+        if (!lights.empty()) {
+            m_LightBuffer.Upload(lights.data(), lights.size() * sizeof(GPULight));
+            m_LightCount = static_cast<uint32_t>(lights.size());
+        } else {
+            // Default directional light (sun)
+            GPULight defaultLight{};
+            defaultLight.position = glm::vec3(0.0f);
+            defaultLight.type = static_cast<uint32_t>(GPULightType::Directional);
+            defaultLight.color = glm::vec3(1.0f, 0.98f, 0.95f);
+            defaultLight.intensity = 2.5f;
+            defaultLight.direction = glm::normalize(glm::vec3(1.0f, 1.0f, 0.5f));
+            defaultLight.range = 0.0f;
+            m_LightBuffer.Upload(&defaultLight, sizeof(GPULight));
+            m_LightCount = 1;
+        }
+    }
+    
     m_DescriptorsDirty = true;
     
     // Create pipeline and SBT if not done yet
@@ -825,7 +855,7 @@ void TracerRayKHR::UpdateScene(const std::vector<BVHBuilder::Triangle>& triangle
     }
     
     m_Ready = true;
-    LUCENT_CORE_INFO("TracerRayKHR: Scene updated");
+    LUCENT_CORE_INFO("TracerRayKHR: Scene updated with {} lights", m_LightCount);
 }
 
 void TracerRayKHR::Trace(VkCommandBuffer cmd,
@@ -892,7 +922,12 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
         cameraInfo.offset = 0;
         cameraInfo.range = sizeof(GPUCamera);
 
-        VkWriteDescriptorSet writes[9] = {};
+        VkDescriptorBufferInfo lightInfo{};
+        lightInfo.buffer = m_LightBuffer.GetHandle();
+        lightInfo.offset = 0;
+        lightInfo.range = m_LightBuffer.GetSize();
+
+        VkWriteDescriptorSet writes[10] = {};
 
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].pNext = &asWrite;
@@ -957,7 +992,14 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
         writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         writes[8].pImageInfo = &normalInfo;
 
-        vkUpdateDescriptorSets(device, 9, writes, 0, nullptr);
+        writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[9].dstSet = m_DescriptorSet;
+        writes[9].dstBinding = 9;
+        writes[9].descriptorCount = 1;
+        writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[9].pBufferInfo = &lightInfo;
+
+        vkUpdateDescriptorSets(device, 10, writes, 0, nullptr);
         m_DescriptorsDirty = false;
     }
     

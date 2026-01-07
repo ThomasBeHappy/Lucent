@@ -28,6 +28,7 @@ struct TransformComponent {
     TransformComponent(const glm::vec3& pos) : position(pos) {}
     
     glm::mat4 GetLocalMatrix() const {
+        // Keep transform math consistent with the editor's Euler rotation semantics via quaternion conversion.
         glm::mat4 rotationMatrix = glm::toMat4(glm::quat(glm::radians(rotation)));
         return glm::translate(glm::mat4(1.0f), position)
              * rotationMatrix

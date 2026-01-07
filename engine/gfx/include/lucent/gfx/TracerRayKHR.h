@@ -78,7 +78,8 @@ public:
     
     // Update scene - builds/updates acceleration structures
     void UpdateScene(const std::vector<BVHBuilder::Triangle>& triangles,
-                     const std::vector<GPUMaterial>& materials);
+                     const std::vector<GPUMaterial>& materials,
+                     const std::vector<GPULight>& lights = {});
     
     // Trace rays for one sample
     void Trace(VkCommandBuffer cmd,
@@ -135,7 +136,9 @@ private:
     Buffer m_IndexBuffer;
     Buffer m_PrimitiveMaterialBuffer;
     Buffer m_MaterialBuffer;
+    Buffer m_LightBuffer;
     uint32_t m_TriangleCount = 0;
+    uint32_t m_LightCount = 0;
     
     // Ray tracing pipeline
     VkDescriptorSetLayout m_DescriptorLayout = VK_NULL_HANDLE;

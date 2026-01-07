@@ -59,6 +59,27 @@ struct GPUCamera {
     float farPlane;
 };
 
+// Light types (matching scene::LightType)
+enum class GPULightType : uint32_t {
+    Directional = 0,
+    Point = 1,
+    Spot = 2,
+    Area = 3
+};
+
+// Light for GPU (48 bytes, aligned)
+struct GPULight {
+    glm::vec3 position;      // World position (point/spot) or direction (directional)
+    uint32_t type;           // GPULightType
+    glm::vec3 color;         // RGB color
+    float intensity;         // Light intensity
+    glm::vec3 direction;     // Light direction (for spot/directional)
+    float range;             // Attenuation range (point/spot)
+    float innerAngle;        // Spot inner cone angle (radians)
+    float outerAngle;        // Spot outer cone angle (radians)
+    float padding[2];        // Padding to 48 bytes
+};
+
 // Push constants for compute shader
 struct TracerPushConstants {
     uint32_t frameIndex;
@@ -74,12 +95,14 @@ struct SceneGPU {
     Buffer bvhNodeBuffer;
     Buffer instanceBuffer;
     Buffer materialBuffer;
+    Buffer lightBuffer;
     
     // Counts
     uint32_t triangleCount = 0;
     uint32_t bvhNodeCount = 0;
     uint32_t instanceCount = 0;
     uint32_t materialCount = 0;
+    uint32_t lightCount = 0;
     
     bool valid = false;
 };
@@ -119,7 +142,8 @@ public:
     
     // Update scene with pre-built triangle data
     void UpdateScene(const std::vector<BVHBuilder::Triangle>& triangles,
-                     const std::vector<GPUMaterial>& materials);
+                     const std::vector<GPUMaterial>& materials,
+                     const std::vector<GPULight>& lights = {});
     
     // Render a sample
     void Trace(VkCommandBuffer cmd, 

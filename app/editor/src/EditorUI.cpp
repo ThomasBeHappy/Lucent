@@ -3,6 +3,7 @@
 #include "Win32FileDialogs.h"
 #include "EditorSettings.h"
 #include "UndoStack.h"
+#include "EditorIcons.h"
 #include "lucent/gfx/VulkanContext.h"
 #include "lucent/gfx/Device.h"
 #include "lucent/gfx/Renderer.h"
@@ -53,6 +54,43 @@ static bool NearlyEqualTransform(const glm::vec3& posA, const glm::vec3& rotA, c
     if (!NearlyEqualVec3(rotA, rotB, rotEps)) return false;
     if (!NearlyEqualVec3(scaleA, scaleB, scaleEps)) return false;
     return true;
+}
+
+static ImVec4 WithAlpha(ImVec4 c, float a) {
+    c.w = a;
+    return c;
+}
+
+static ImVec4 MulRGB(ImVec4 c, float m) {
+    c.x *= m;
+    c.y *= m;
+    c.z *= m;
+    return c;
+}
+
+static ImVec4 ThemeAccent() {
+    // Single source of truth for "accent" usage across the editor.
+    // `SetupStyle()` assigns this to `ImGuiCol_CheckMark`.
+    return ImGui::GetStyle().Colors[ImGuiCol_CheckMark];
+}
+
+static ImVec4 ThemeSuccess() { return ImVec4(0.33f, 0.78f, 0.47f, 1.0f); }
+static ImVec4 ThemeWarning() { return ImVec4(0.95f, 0.70f, 0.28f, 1.0f); }
+static ImVec4 ThemeError() { return ImVec4(0.92f, 0.34f, 0.34f, 1.0f); }
+static ImVec4 ThemeMutedText() { return ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]; }
+
+static std::filesystem::path GetExecutableDir() {
+#if defined(_WIN32)
+    wchar_t buf[MAX_PATH]{};
+    DWORD len = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (len == 0 || len == MAX_PATH) {
+        return std::filesystem::current_path();
+    }
+    std::filesystem::path p(buf);
+    return p.parent_path();
+#else
+    return std::filesystem::current_path();
+#endif
 }
 
 } // namespace
@@ -109,6 +147,7 @@ bool EditorUI::Init(GLFWwindow* window, gfx::VulkanContext* context, gfx::Device
     // Set ini file path
     io.IniFilename = nullptr; // We'll handle saving manually
     
+    SetupFonts();
     SetupStyle();
     
     // Initialize platform/renderer backends
@@ -158,6 +197,49 @@ bool EditorUI::Init(GLFWwindow* window, gfx::VulkanContext* context, gfx::Device
     return true;
 }
 
+void EditorUI::SetupFonts() {
+    ImGuiIO& io = ImGui::GetIO();
+    m_IconFontLoaded = false;
+    
+    // Look for fonts in both:
+    // - alongside the executable (packaged builds)
+    // - the current working directory (VS debugging uses project root)
+    const std::filesystem::path exeFontsDir = GetExecutableDir() / "Assets" / "Fonts";
+    const std::filesystem::path cwdFontsDir = std::filesystem::current_path() / "Assets" / "Fonts";
+    
+    const std::filesystem::path uiFontPathA = exeFontsDir / "Inter-Regular.ttf";
+    const std::filesystem::path uiFontPathB = cwdFontsDir / "Inter-Regular.ttf";
+    const std::filesystem::path iconFontPathA = exeFontsDir / "fa-solid-900.ttf";
+    const std::filesystem::path iconFontPathB = cwdFontsDir / "fa-solid-900.ttf";
+    
+    const std::filesystem::path uiFontPath = std::filesystem::exists(uiFontPathA) ? uiFontPathA : uiFontPathB;
+    const std::filesystem::path iconFontPath = std::filesystem::exists(iconFontPathA) ? iconFontPathA : iconFontPathB;
+    
+    // Base UI font
+    ImFont* baseFont = nullptr;
+    if (!uiFontPath.empty() && std::filesystem::exists(uiFontPath)) {
+        baseFont = io.Fonts->AddFontFromFileTTF(uiFontPath.string().c_str(), 16.0f);
+    }
+    if (!baseFont) {
+        baseFont = io.Fonts->AddFontDefault();
+    }
+    io.FontDefault = baseFont;
+    
+    // Optional icon pack: merge into the base font so icons can be used inline with text.
+    // Font Awesome solid sits mostly in U+F000..U+F8FF.
+    if (!iconFontPath.empty() && std::filesystem::exists(iconFontPath)) {
+        static const ImWchar iconRanges[] = { 0xF000, 0xF8FF, 0 };
+        
+        ImFontConfig iconConfig{};
+        iconConfig.MergeMode = true;
+        iconConfig.PixelSnapH = true;
+        iconConfig.GlyphMinAdvanceX = 13.0f; // helps align icon glyph width
+        
+        ImFont* icons = io.Fonts->AddFontFromFileTTF(iconFontPath.string().c_str(), 16.0f, &iconConfig, iconRanges);
+        m_IconFontLoaded = (icons != nullptr);
+    }
+}
+
 void EditorUI::Shutdown() {
     if (!m_Context) return;
     
@@ -185,37 +267,34 @@ void EditorUI::SetupStyle() {
     ImVec4* colors = style.Colors;
     
     // ========================================================================
-    // Modern Dark Theme - Inspired by VS Code Dark+ / Figma
+    // Modern Flat Dark Theme - Neutral surfaces + subtle blue accent
     // ========================================================================
     
     // Base colors
-    const ImVec4 bg_dark      = ImVec4(0.067f, 0.067f, 0.078f, 1.0f);  // #111114
-    const ImVec4 bg_main      = ImVec4(0.098f, 0.098f, 0.118f, 1.0f);  // #19191E
-    const ImVec4 bg_light     = ImVec4(0.137f, 0.137f, 0.157f, 1.0f);  // #232328
-    const ImVec4 bg_lighter   = ImVec4(0.176f, 0.176f, 0.196f, 1.0f);  // #2D2D32
-    const ImVec4 border       = ImVec4(0.216f, 0.216f, 0.235f, 1.0f);  // #37373C
+    const ImVec4 bg_dark      = ImVec4(0.060f, 0.062f, 0.070f, 1.0f);  // ~#0F1012
+    const ImVec4 bg_main      = ImVec4(0.086f, 0.090f, 0.102f, 1.0f);  // ~#16171A
+    const ImVec4 bg_light     = ImVec4(0.110f, 0.114f, 0.132f, 1.0f);  // ~#1C1D22
+    const ImVec4 bg_lighter   = ImVec4(0.142f, 0.146f, 0.168f, 1.0f);  // ~#24262B
+    const ImVec4 border       = ImVec4(0.220f, 0.225f, 0.252f, 1.0f);  // ~#383941
     
     // Text colors
     const ImVec4 text_bright  = ImVec4(0.95f, 0.95f, 0.95f, 1.0f);
     const ImVec4 text_normal  = ImVec4(0.78f, 0.78f, 0.80f, 1.0f);
     const ImVec4 text_dim     = ImVec4(0.50f, 0.50f, 0.55f, 1.0f);
     
-    // Accent color - Electric Cyan/Teal
-    const ImVec4 accent       = ImVec4(0.25f, 0.78f, 0.85f, 1.0f);     // #40C7D9
-    const ImVec4 accent_hover = ImVec4(0.35f, 0.85f, 0.92f, 1.0f);
-    const ImVec4 accent_dim   = ImVec4(0.18f, 0.55f, 0.60f, 1.0f);
+    // Accent color - Subtle blue (used across selection, highlights, and UI affordances)
+    const ImVec4 accent       = ImVec4(0.31f, 0.64f, 0.98f, 1.0f);     // ~#4FA3FA
+    const ImVec4 accent_hover = ImVec4(0.39f, 0.71f, 1.00f, 1.0f);
+    const ImVec4 accent_dim   = ImVec4(0.22f, 0.46f, 0.74f, 1.0f);
     
-    // Secondary accent - Warm coral for warnings/selection
-    const ImVec4 highlight    = ImVec4(0.94f, 0.42f, 0.42f, 1.0f);     // #F06B6B
-    
-    // Success/positive
-    const ImVec4 success      = ImVec4(0.35f, 0.78f, 0.47f, 1.0f);     // #5AC778
+    // Secondary accent - Warm amber for warnings/attention
+    const ImVec4 highlight    = ThemeWarning();     // ~#F2B247
     
     // Backgrounds
     colors[ImGuiCol_WindowBg]             = bg_main;
-    colors[ImGuiCol_ChildBg]              = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
-    colors[ImGuiCol_PopupBg]              = ImVec4(bg_light.x, bg_light.y, bg_light.z, 0.98f);
-    colors[ImGuiCol_Border]               = border;
+    colors[ImGuiCol_ChildBg]              = WithAlpha(bg_dark, 0.55f);
+    colors[ImGuiCol_PopupBg]              = WithAlpha(bg_light, 0.98f);
+    colors[ImGuiCol_Border]               = WithAlpha(border, 0.75f);
     colors[ImGuiCol_BorderShadow]         = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
     
     // Text
@@ -223,24 +302,24 @@ void EditorUI::SetupStyle() {
     colors[ImGuiCol_TextDisabled]         = text_dim;
     
     // Headers (collapsing headers, tree nodes)
-    colors[ImGuiCol_Header]               = bg_lighter;
-    colors[ImGuiCol_HeaderHovered]        = ImVec4(accent.x, accent.y, accent.z, 0.25f);
-    colors[ImGuiCol_HeaderActive]         = ImVec4(accent.x, accent.y, accent.z, 0.35f);
+    colors[ImGuiCol_Header]               = WithAlpha(accent, 0.12f);
+    colors[ImGuiCol_HeaderHovered]        = WithAlpha(accent, 0.20f);
+    colors[ImGuiCol_HeaderActive]         = WithAlpha(accent, 0.26f);
     
     // Buttons
     colors[ImGuiCol_Button]               = bg_lighter;
-    colors[ImGuiCol_ButtonHovered]        = ImVec4(accent.x, accent.y, accent.z, 0.65f);
-    colors[ImGuiCol_ButtonActive]         = accent;
+    colors[ImGuiCol_ButtonHovered]        = WithAlpha(accent, 0.22f);
+    colors[ImGuiCol_ButtonActive]         = WithAlpha(accent, 0.32f);
     
     // Frame backgrounds (input fields, checkboxes)
     colors[ImGuiCol_FrameBg]              = bg_dark;
     colors[ImGuiCol_FrameBgHovered]       = bg_light;
-    colors[ImGuiCol_FrameBgActive]        = bg_lighter;
+    colors[ImGuiCol_FrameBgActive]        = WithAlpha(accent, 0.14f);
     
     // Tabs
     colors[ImGuiCol_Tab]                  = bg_light;
-    colors[ImGuiCol_TabHovered]           = ImVec4(accent.x, accent.y, accent.z, 0.5f);
-    colors[ImGuiCol_TabActive]            = ImVec4(accent.x, accent.y, accent.z, 0.3f);
+    colors[ImGuiCol_TabHovered]           = WithAlpha(accent, 0.28f);
+    colors[ImGuiCol_TabActive]            = bg_lighter;
     colors[ImGuiCol_TabUnfocused]         = bg_dark;
     colors[ImGuiCol_TabUnfocusedActive]   = bg_light;
     
@@ -252,42 +331,42 @@ void EditorUI::SetupStyle() {
     // Scrollbar
     colors[ImGuiCol_ScrollbarBg]          = bg_dark;
     colors[ImGuiCol_ScrollbarGrab]        = bg_lighter;
-    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(accent.x, accent.y, accent.z, 0.5f);
-    colors[ImGuiCol_ScrollbarGrabActive]  = accent;
+    colors[ImGuiCol_ScrollbarGrabHovered] = WithAlpha(accent, 0.25f);
+    colors[ImGuiCol_ScrollbarGrabActive]  = WithAlpha(accent, 0.35f);
     
     // Slider
-    colors[ImGuiCol_SliderGrab]           = accent;
-    colors[ImGuiCol_SliderGrabActive]     = accent_hover;
+    colors[ImGuiCol_SliderGrab]           = accent_dim;
+    colors[ImGuiCol_SliderGrabActive]     = accent;
     
     // Checkmarks and selection
     colors[ImGuiCol_CheckMark]            = accent;
     
     // Separators
-    colors[ImGuiCol_Separator]            = border;
-    colors[ImGuiCol_SeparatorHovered]     = accent;
-    colors[ImGuiCol_SeparatorActive]      = accent_hover;
+    colors[ImGuiCol_Separator]            = WithAlpha(border, 0.55f);
+    colors[ImGuiCol_SeparatorHovered]     = WithAlpha(accent, 0.45f);
+    colors[ImGuiCol_SeparatorActive]      = WithAlpha(accent_hover, 0.55f);
     
     // Resize grips
-    colors[ImGuiCol_ResizeGrip]           = ImVec4(accent.x, accent.y, accent.z, 0.15f);
-    colors[ImGuiCol_ResizeGripHovered]    = ImVec4(accent.x, accent.y, accent.z, 0.5f);
-    colors[ImGuiCol_ResizeGripActive]     = accent;
+    colors[ImGuiCol_ResizeGrip]           = WithAlpha(accent, 0.00f);
+    colors[ImGuiCol_ResizeGripHovered]    = WithAlpha(accent, 0.18f);
+    colors[ImGuiCol_ResizeGripActive]     = WithAlpha(accent, 0.28f);
     
     // Docking
-    colors[ImGuiCol_DockingPreview]       = ImVec4(accent.x, accent.y, accent.z, 0.5f);
-    colors[ImGuiCol_DockingEmptyBg]       = bg_dark;
+    colors[ImGuiCol_DockingPreview]       = WithAlpha(accent, 0.45f);
+    colors[ImGuiCol_DockingEmptyBg]       = bg_main;
     
     // Menu bar
-    colors[ImGuiCol_MenuBarBg]            = bg_dark;
+    colors[ImGuiCol_MenuBarBg]            = bg_main;
     
     // Tables
     colors[ImGuiCol_TableHeaderBg]        = bg_lighter;
     colors[ImGuiCol_TableBorderStrong]    = border;
-    colors[ImGuiCol_TableBorderLight]     = ImVec4(border.x, border.y, border.z, 0.5f);
+    colors[ImGuiCol_TableBorderLight]     = WithAlpha(border, 0.5f);
     colors[ImGuiCol_TableRowBg]           = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
     colors[ImGuiCol_TableRowBgAlt]        = ImVec4(1.0f, 1.0f, 1.0f, 0.02f);
     
     // Text selection
-    colors[ImGuiCol_TextSelectedBg]       = ImVec4(accent.x, accent.y, accent.z, 0.35f);
+    colors[ImGuiCol_TextSelectedBg]       = WithAlpha(accent, 0.28f);
     
     // Drag/drop
     colors[ImGuiCol_DragDropTarget]       = accent;
@@ -307,38 +386,40 @@ void EditorUI::SetupStyle() {
     colors[ImGuiCol_PlotHistogramHovered] = highlight;
     
     // ========================================================================
-    // Style Settings - Modern, rounded, spacious
+    // Style Settings - Flat, clean, consistent spacing
     // ========================================================================
     
-    // Rounding - more rounded for modern feel
-    style.WindowRounding    = 8.0f;
-    style.ChildRounding     = 6.0f;
-    style.FrameRounding     = 6.0f;
-    style.PopupRounding     = 6.0f;
-    style.ScrollbarRounding = 12.0f;
-    style.GrabRounding      = 6.0f;
-    style.TabRounding       = 6.0f;
+    // Rounding - subtle (modern flat, not boxy)
+    style.WindowRounding    = 4.0f;
+    style.ChildRounding     = 4.0f;
+    style.FrameRounding     = 3.0f;
+    style.PopupRounding     = 4.0f;
+    style.ScrollbarRounding = 6.0f;
+    style.GrabRounding      = 3.0f;
+    style.TabRounding       = 3.0f;
     
-    // Padding and spacing - more spacious
-    style.WindowPadding     = ImVec2(12, 12);
-    style.FramePadding      = ImVec2(10, 6);
+    // Padding and spacing - slightly tighter (editor-friendly)
+    style.WindowPadding     = ImVec2(10, 10);
+    style.FramePadding      = ImVec2(8, 5);
     style.CellPadding       = ImVec2(8, 4);
-    style.ItemSpacing       = ImVec2(10, 6);
+    style.ItemSpacing       = ImVec2(8, 6);
     style.ItemInnerSpacing  = ImVec2(6, 4);
     style.TouchExtraPadding = ImVec2(0, 0);
     style.IndentSpacing     = 20.0f;
-    style.ScrollbarSize     = 14.0f;
+    style.ScrollbarSize     = 12.0f;
     style.GrabMinSize       = 12.0f;
     
     // Borders
-    style.WindowBorderSize  = 1.0f;
-    style.ChildBorderSize   = 1.0f;
-    style.PopupBorderSize   = 1.0f;
-    style.FrameBorderSize   = 0.0f;
+    style.WindowBorderSize  = 0.0f;
+    style.ChildBorderSize   = 0.0f;
+    style.PopupBorderSize   = 0.0f;
+    style.FrameBorderSize   = 1.0f;
     style.TabBorderSize     = 0.0f;
     
+    style.DisabledAlpha     = 0.55f;
+    
     // Alignment
-    style.WindowTitleAlign  = ImVec2(0.5f, 0.5f); // Center titles
+    style.WindowTitleAlign  = ImVec2(0.0f, 0.5f); // Left-align titles (more standard for editors)
     style.WindowMenuButtonPosition = ImGuiDir_None; // Hide menu button
     style.ColorButtonPosition = ImGuiDir_Right;
     style.ButtonTextAlign   = ImVec2(0.5f, 0.5f);
@@ -442,13 +523,13 @@ void EditorUI::DrawDockspace() {
     // Menu bar
     if (ImGui::BeginMenuBar()) {
         // Logo / Brand
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.25f, 0.78f, 0.85f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ThemeAccent());
         ImGui::Text("LUCENT");
         ImGui::PopStyleColor();
         ImGui::Separator();
         
         if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("New Scene", "Ctrl+N")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_FILE " New Scene") : "New Scene", "Ctrl+N")) {
                 // Check for unsaved changes
                 bool proceed = true;
                 if (m_SceneDirty) {
@@ -485,7 +566,7 @@ void EditorUI::DrawDockspace() {
                     m_SceneDirty = false;
                 }
             }
-            if (ImGui::MenuItem("Open Scene...", "Ctrl+O")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_OPEN " Open Scene...") : "Open Scene...", "Ctrl+O")) {
                 bool proceed = true;
                 if (m_SceneDirty) {
                     auto result = Win32FileDialogs::ShowYesNoCancel(L"Unsaved Changes", 
@@ -519,7 +600,7 @@ void EditorUI::DrawDockspace() {
                 }
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Save Scene", "Ctrl+S")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_SAVE " Save Scene") : "Save Scene", "Ctrl+S")) {
                 if (m_Scene) {
                     if (m_CurrentScenePath.empty()) {
                         std::string path = Win32FileDialogs::SaveFile(L"Save Scene", 
@@ -535,7 +616,7 @@ void EditorUI::DrawDockspace() {
                     }
                 }
             }
-            if (ImGui::MenuItem("Save Scene As...", "Ctrl+Shift+S")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_SAVE " Save Scene As...") : "Save Scene As...", "Ctrl+Shift+S")) {
                 if (m_Scene) {
                     std::string path = Win32FileDialogs::SaveFile(L"Save Scene As", 
                         {{L"Lucent Scene", L"*.lucent"}}, L"lucent");
@@ -547,7 +628,7 @@ void EditorUI::DrawDockspace() {
                 }
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Import...")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_IMPORT " Import...") : "Import...")) {
                 std::string path = Win32FileDialogs::OpenFile(L"Import Asset", 
                     {{L"All Supported", L"*.png;*.jpg;*.hdr;*.obj"}, 
                      {L"Images", L"*.png;*.jpg;*.hdr"},
@@ -579,7 +660,7 @@ void EditorUI::DrawDockspace() {
                 ImGui::EndMenu();
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Exit", "Alt+F4")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_TRASH " Exit") : "Exit", "Alt+F4")) {
                 bool proceed = true;
                 if (m_SceneDirty) {
                     auto result = Win32FileDialogs::ShowYesNoCancel(L"Unsaved Changes", 
@@ -611,6 +692,10 @@ void EditorUI::DrawDockspace() {
                 "Undo " + undoStack.GetUndoDescription() : "Undo";
             std::string redoLabel = undoStack.CanRedo() ? 
                 "Redo " + undoStack.GetRedoDescription() : "Redo";
+            if (m_IconFontLoaded) {
+                undoLabel = std::string(LUCENT_ICON_UNDO " ") + undoLabel;
+                redoLabel = std::string(LUCENT_ICON_REDO " ") + redoLabel;
+            }
             
             if (ImGui::MenuItem(undoLabel.c_str(), "Ctrl+Z", false, undoStack.CanUndo())) {
                 undoStack.Undo();
@@ -619,24 +704,95 @@ void EditorUI::DrawDockspace() {
                 undoStack.Redo();
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Cut", "Ctrl+X", false, !m_SelectedEntities.empty())) {
-                // Copy then delete
-                // TODO: Implement clipboard
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_CUT " Cut") : "Cut", "Ctrl+X", false, !m_SelectedEntities.empty())) {
+                // Copy to clipboard then delete
+                m_Clipboard.clear();
                 for (auto id : m_SelectedEntities) {
                     if (m_Scene) {
-                        m_Scene->DestroyEntity(m_Scene->GetEntity(id));
+                        scene::Entity src = m_Scene->GetEntity(id);
+                        if (!src.IsValid()) continue;
+                        
+                        ClipboardEntity clip;
+                        auto* tag = src.GetComponent<scene::TagComponent>();
+                        clip.name = tag ? tag->name : "Entity";
+                        
+                        if (auto* t = src.GetComponent<scene::TransformComponent>()) {
+                            clip.transform = *t;
+                        }
+                        if (auto* c = src.GetComponent<scene::CameraComponent>()) {
+                            clip.camera = *c;
+                        }
+                        if (auto* l = src.GetComponent<scene::LightComponent>()) {
+                            clip.light = *l;
+                        }
+                        if (auto* m = src.GetComponent<scene::MeshRendererComponent>()) {
+                            clip.meshRenderer = *m;
+                        }
+                        m_Clipboard.push_back(clip);
+                        m_Scene->DestroyEntity(src);
                     }
                 }
                 ClearSelection();
                 m_SceneDirty = true;
             }
-            if (ImGui::MenuItem("Copy", "Ctrl+C", false, !m_SelectedEntities.empty())) {
-                // TODO: Implement clipboard
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_COPY " Copy") : "Copy", "Ctrl+C", false, !m_SelectedEntities.empty())) {
+                m_Clipboard.clear();
+                for (auto id : m_SelectedEntities) {
+                    if (m_Scene) {
+                        scene::Entity src = m_Scene->GetEntity(id);
+                        if (!src.IsValid()) continue;
+                        
+                        ClipboardEntity clip;
+                        auto* tag = src.GetComponent<scene::TagComponent>();
+                        clip.name = tag ? tag->name : "Entity";
+                        
+                        if (auto* t = src.GetComponent<scene::TransformComponent>()) {
+                            clip.transform = *t;
+                        }
+                        if (auto* c = src.GetComponent<scene::CameraComponent>()) {
+                            clip.camera = *c;
+                        }
+                        if (auto* l = src.GetComponent<scene::LightComponent>()) {
+                            clip.light = *l;
+                        }
+                        if (auto* m = src.GetComponent<scene::MeshRendererComponent>()) {
+                            clip.meshRenderer = *m;
+                        }
+                        m_Clipboard.push_back(clip);
+                    }
+                }
             }
-            if (ImGui::MenuItem("Paste", "Ctrl+V", false, false)) {
-                // TODO: Implement paste from clipboard
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_PASTE " Paste") : "Paste", "Ctrl+V", false, !m_Clipboard.empty())) {
+                if (m_Scene) {
+                    std::vector<scene::Entity> newEntities;
+                    for (const auto& clip : m_Clipboard) {
+                        scene::Entity ent = m_Scene->CreateEntity(clip.name + " (Pasted)");
+                        
+                        // Apply transform with offset
+                        if (auto* t = ent.GetComponent<scene::TransformComponent>()) {
+                            *t = clip.transform;
+                            t->position += glm::vec3(1.0f, 0.0f, 0.0f); // Offset
+                        }
+                        
+                        if (clip.camera) {
+                            ent.AddComponent<scene::CameraComponent>() = *clip.camera;
+                        }
+                        if (clip.light) {
+                            ent.AddComponent<scene::LightComponent>() = *clip.light;
+                        }
+                        if (clip.meshRenderer) {
+                            ent.AddComponent<scene::MeshRendererComponent>() = *clip.meshRenderer;
+                        }
+                        newEntities.push_back(ent);
+                    }
+                    ClearSelection();
+                    for (auto& e : newEntities) {
+                        AddToSelection(e);
+                    }
+                    m_SceneDirty = true;
+                }
             }
-            if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, !m_SelectedEntities.empty())) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_DUPLICATE " Duplicate") : "Duplicate", "Ctrl+D", false, !m_SelectedEntities.empty())) {
                 if (m_Scene) {
                     std::vector<scene::Entity> newEntities;
                     for (auto id : m_SelectedEntities) {
@@ -675,7 +831,7 @@ void EditorUI::DrawDockspace() {
                     m_SceneDirty = true;
                 }
             }
-            if (ImGui::MenuItem("Delete", "Del", false, !m_SelectedEntities.empty())) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_TRASH " Delete") : "Delete", "Del", false, !m_SelectedEntities.empty())) {
                 if (m_Scene) {
                     for (auto id : m_SelectedEntities) {
                         m_Scene->DestroyEntity(m_Scene->GetEntity(id));
@@ -692,7 +848,7 @@ void EditorUI::DrawDockspace() {
                 ClearSelection();
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Preferences...")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_SETTINGS " Preferences...") : "Preferences...")) {
                 m_ShowPreferencesModal = true;
             }
             ImGui::EndMenu();
@@ -700,7 +856,7 @@ void EditorUI::DrawDockspace() {
         
         if (ImGui::BeginMenu("Create")) {
             ImGui::TextDisabled("Primitives");
-            if (ImGui::MenuItem("Cube")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_CUBE " Cube") : "Cube")) {
                 auto e = m_Scene->CreateEntity("Cube");
                 auto& r = e.AddComponent<scene::MeshRendererComponent>();
                 r.primitiveType = scene::MeshRendererComponent::PrimitiveType::Cube;
@@ -727,23 +883,23 @@ void EditorUI::DrawDockspace() {
             }
             ImGui::Separator();
             ImGui::TextDisabled("Lighting");
-            if (ImGui::MenuItem("Point Light")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_LIGHT " Point Light") : "Point Light")) {
                 auto e = m_Scene->CreateEntity("Point Light");
                 auto& l = e.AddComponent<scene::LightComponent>();
                 l.type = scene::LightType::Point;
             }
-            if (ImGui::MenuItem("Directional Light")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_LIGHT " Directional Light") : "Directional Light")) {
                 auto e = m_Scene->CreateEntity("Directional Light");
                 auto& l = e.AddComponent<scene::LightComponent>();
                 l.type = scene::LightType::Directional;
             }
-            if (ImGui::MenuItem("Spot Light")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_LIGHT " Spot Light") : "Spot Light")) {
                 auto e = m_Scene->CreateEntity("Spot Light");
                 auto& l = e.AddComponent<scene::LightComponent>();
                 l.type = scene::LightType::Spot;
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Camera")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_CAMERA " Camera") : "Camera")) {
                 auto e = m_Scene->CreateEntity("Camera");
                 e.AddComponent<scene::CameraComponent>();
             }
@@ -820,15 +976,15 @@ void EditorUI::DrawDockspace() {
         }
         
         if (ImGui::BeginMenu("Help")) {
-            if (ImGui::MenuItem("Documentation")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_HELP " Documentation") : "Documentation")) {
                 // Open docs folder in explorer
                 ShellExecuteW(NULL, L"explore", L"docs", NULL, NULL, SW_SHOWNORMAL);
             }
-            if (ImGui::MenuItem("Keyboard Shortcuts")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_INFO " Keyboard Shortcuts") : "Keyboard Shortcuts")) {
                 m_ShowShortcutsModal = true;
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("About Lucent")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_INFO " About Lucent") : "About Lucent")) {
                 m_ShowAboutModal = true;
             }
             ImGui::EndMenu();
@@ -1127,7 +1283,7 @@ void EditorUI::DrawOutlinerPanel() {
     
     // Header with scene name
     if (m_Scene) {
-        ImGui::TextColored(ImVec4(0.5f, 0.8f, 0.9f, 1.0f), "Scene: %s", m_Scene->GetName().c_str());
+        ImGui::TextColored(WithAlpha(ThemeAccent(), 0.9f), "Scene: %s", m_Scene->GetName().c_str());
     }
     ImGui::Spacing();
     ImGui::Separator();
@@ -1145,26 +1301,29 @@ void EditorUI::DrawOutlinerPanel() {
         
         // Add entity button (more prominent)
         float buttonWidth = ImGui::GetContentRegionAvail().x;
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.5f, 0.6f, 0.5f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.78f, 0.85f, 0.7f));
-        if (ImGui::Button("+ Add Entity", ImVec2(buttonWidth, 28))) {
+        ImVec4 accent = ThemeAccent();
+        ImGui::PushStyleColor(ImGuiCol_Button, WithAlpha(accent, 0.18f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, WithAlpha(accent, 0.26f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, WithAlpha(accent, 0.34f));
+        const char* addEntityLabel = m_IconFontLoaded ? (LUCENT_ICON_PLUS " Add Entity") : "+ Add Entity";
+        if (ImGui::Button(addEntityLabel, ImVec2(buttonWidth, 28))) {
             ImGui::OpenPopup("AddEntityPopup");
         }
-        ImGui::PopStyleColor(2);
+        ImGui::PopStyleColor(3);
         
         // Add entity popup
         if (ImGui::BeginPopup("AddEntityPopup")) {
             ImGui::TextDisabled("Create New Entity");
             ImGui::Separator();
             
-            if (ImGui::MenuItem("Empty")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_FILE " Empty") : "Empty")) {
                 m_Scene->CreateEntity("New Entity");
             }
             
             ImGui::Separator();
             ImGui::TextDisabled("Primitives");
             
-            if (ImGui::MenuItem("Cube")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_CUBE " Cube") : "Cube")) {
                 auto cube = m_Scene->CreateEntity("Cube");
                 auto& renderer = cube.AddComponent<scene::MeshRendererComponent>();
                 renderer.primitiveType = scene::MeshRendererComponent::PrimitiveType::Cube;
@@ -1193,17 +1352,17 @@ void EditorUI::DrawOutlinerPanel() {
             ImGui::Separator();
             ImGui::TextDisabled("Lights & Cameras");
             
-            if (ImGui::MenuItem("Point Light")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_LIGHT " Point Light") : "Point Light")) {
                 auto light = m_Scene->CreateEntity("Point Light");
                 auto& l = light.AddComponent<scene::LightComponent>();
                 l.type = scene::LightType::Point;
             }
-            if (ImGui::MenuItem("Directional Light")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_LIGHT " Directional Light") : "Directional Light")) {
                 auto light = m_Scene->CreateEntity("Directional Light");
                 auto& l = light.AddComponent<scene::LightComponent>();
                 l.type = scene::LightType::Directional;
             }
-            if (ImGui::MenuItem("Camera")) {
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_CAMERA " Camera") : "Camera")) {
                 auto camera = m_Scene->CreateEntity("Camera");
                 auto& cam = camera.AddComponent<scene::CameraComponent>();
                 cam.primary = false;
@@ -1241,23 +1400,35 @@ void EditorUI::DrawEntityNode(scene::Entity entity) {
     // Determine icon based on components
     const char* icon = "";  // Default: empty entity
     
-    if (entity.HasComponent<scene::CameraComponent>()) {
-        icon = "[CAM]";
-    } else if (entity.HasComponent<scene::LightComponent>()) {
-        auto* light = entity.GetComponent<scene::LightComponent>();
-        if (light->type == scene::LightType::Directional) {
-            icon = "[SUN]";
-        } else {
-            icon = "[LIT]";
+    if (m_IconFontLoaded) {
+        if (entity.HasComponent<scene::CameraComponent>()) {
+            icon = LUCENT_ICON_CAMERA;
+        } else if (entity.HasComponent<scene::LightComponent>()) {
+            icon = LUCENT_ICON_LIGHT;
+        } else if (entity.HasComponent<scene::MeshRendererComponent>()) {
+            icon = LUCENT_ICON_CUBE;
         }
-    } else if (entity.HasComponent<scene::MeshRendererComponent>()) {
-        icon = "[MESH]";
+    } else {
+        // Fallback: ASCII tags for when icon font isn't present
+        if (entity.HasComponent<scene::CameraComponent>()) {
+            icon = "[CAM]";
+        } else if (entity.HasComponent<scene::LightComponent>()) {
+            auto* light = entity.GetComponent<scene::LightComponent>();
+            if (light->type == scene::LightType::Directional) {
+                icon = "[SUN]";
+            } else {
+                icon = "[LIT]";
+            }
+        } else if (entity.HasComponent<scene::MeshRendererComponent>()) {
+            icon = "[MESH]";
+        }
     }
     
     // Push colors for selection
     if (isSelected) {
-        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.25f, 0.78f, 0.85f, 0.4f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.25f, 0.78f, 0.85f, 0.5f));
+        ImVec4 accent = ThemeAccent();
+        ImGui::PushStyleColor(ImGuiCol_Header, WithAlpha(accent, 0.22f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, WithAlpha(accent, 0.28f));
     }
     
     // Format label with icon
@@ -1435,7 +1606,8 @@ void EditorUI::DrawComponentsPanel(scene::Entity entity) {
             }
             
             ImGui::SameLine();
-            if (ImGui::Button("Edit Graph", ImVec2(115.0f, 0.0f))) {
+            const char* editGraphLabel = m_IconFontLoaded ? (LUCENT_ICON_EDIT " Edit Graph") : "Edit Graph";
+            if (ImGui::Button(editGraphLabel, ImVec2(115.0f, 0.0f))) {
                 // Open material graph panel with this material
                 if (!meshRenderer->materialPath.empty()) {
                     auto* mat = material::MaterialAssetManager::Get().GetMaterial(meshRenderer->materialPath);
@@ -1485,10 +1657,10 @@ void EditorUI::DrawComponentsPanel(scene::Entity entity) {
                     ImGui::TextDisabled("Using material: %s", mat->GetGraph().GetName().c_str());
                     if (mat->IsValid()) {
                         ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "[OK]");
+                        ImGui::TextColored(ThemeSuccess(), "[OK]");
                     } else {
                         ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f), "[ERROR]");
+                        ImGui::TextColored(ThemeError(), "[ERROR]");
                     }
                 }
             }
@@ -1498,18 +1670,18 @@ void EditorUI::DrawComponentsPanel(scene::Entity entity) {
     ImGui::Separator();
     
     // Add component button
-    if (ImGui::Button("Add Component")) {
+    if (ImGui::Button(m_IconFontLoaded ? (LUCENT_ICON_PLUS " Add Component") : "Add Component")) {
         ImGui::OpenPopup("AddComponentPopup");
     }
     
     if (ImGui::BeginPopup("AddComponentPopup")) {
-        if (!entity.HasComponent<scene::CameraComponent>() && ImGui::MenuItem("Camera")) {
+        if (!entity.HasComponent<scene::CameraComponent>() && ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_CAMERA " Camera") : "Camera")) {
             entity.AddComponent<scene::CameraComponent>();
         }
-        if (!entity.HasComponent<scene::LightComponent>() && ImGui::MenuItem("Light")) {
+        if (!entity.HasComponent<scene::LightComponent>() && ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_LIGHT " Light") : "Light")) {
             entity.AddComponent<scene::LightComponent>();
         }
-        if (!entity.HasComponent<scene::MeshRendererComponent>() && ImGui::MenuItem("Mesh Renderer")) {
+        if (!entity.HasComponent<scene::MeshRendererComponent>() && ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_CUBE " Mesh Renderer") : "Mesh Renderer")) {
             entity.AddComponent<scene::MeshRendererComponent>();
         }
         ImGui::EndPopup();
@@ -1538,8 +1710,12 @@ void EditorUI::DrawContentBrowserPanel() {
     }
     ImGui::SameLine();
     
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.5f, 0.6f, 0.5f));
-    if (ImGui::Button("Import")) {
+    ImVec4 accent = ThemeAccent();
+    ImGui::PushStyleColor(ImGuiCol_Button, WithAlpha(accent, 0.18f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, WithAlpha(accent, 0.26f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, WithAlpha(accent, 0.34f));
+    const char* importLabel = m_IconFontLoaded ? (LUCENT_ICON_IMPORT " Import") : "Import";
+    if (ImGui::Button(importLabel)) {
         std::string path = Win32FileDialogs::OpenFile(L"Import Asset", 
             {{L"All Supported", L"*.png;*.jpg;*.hdr;*.obj;*.lucent"}, 
              {L"Images", L"*.png;*.jpg;*.hdr"},
@@ -1555,10 +1731,11 @@ void EditorUI::DrawContentBrowserPanel() {
             }
         }
     }
-    ImGui::PopStyleColor();
+    ImGui::PopStyleColor(3);
     
     ImGui::SameLine();
-    if (ImGui::Button("New Folder")) {
+    const char* newFolderLabel = m_IconFontLoaded ? (LUCENT_ICON_FOLDER " New Folder") : "New Folder";
+    if (ImGui::Button(newFolderLabel)) {
         // Create new folder with unique name
         int counter = 1;
         std::filesystem::path newPath = m_ContentBrowserPath / "New Folder";
@@ -1659,31 +1836,31 @@ void EditorUI::DrawContentBrowserPanel() {
             const char* icon;
             
             if (isDirectory) {
-                color = ImVec4(0.9f, 0.75f, 0.4f, 1.0f);
+                color = ThemeWarning();
                 icon = "[DIR]";
             } else if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".hdr") {
-                color = ImVec4(0.4f, 0.7f, 0.9f, 1.0f);
+                color = ThemeAccent();
                 icon = "[TEX]";
             } else if (ext == ".obj" || ext == ".fbx" || ext == ".gltf" || ext == ".glb") {
-                color = ImVec4(0.4f, 0.8f, 0.5f, 1.0f);
+                color = ThemeSuccess();
                 icon = "[OBJ]";
             } else if (ext == ".lucent") {
-                color = ImVec4(0.25f, 0.78f, 0.85f, 1.0f);
+                color = ThemeAccent();
                 icon = "[SCN]";
             } else if (ext == ".mat") {
-                color = ImVec4(0.8f, 0.5f, 0.9f, 1.0f);
+                color = ImVec4(0.72f, 0.52f, 0.95f, 1.0f);
                 icon = "[MAT]";
             } else {
-                color = ImVec4(0.6f, 0.6f, 0.6f, 1.0f);
+                color = WithAlpha(ThemeMutedText(), 1.0f);
                 icon = "[???]";
             }
             
             ImGui::BeginGroup();
             
             // Thumbnail button
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(color.x * 0.3f, color.y * 0.3f, color.z * 0.3f, 0.8f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(color.x * 0.5f, color.y * 0.5f, color.z * 0.5f, 0.9f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(color.x * 0.6f, color.y * 0.6f, color.z * 0.6f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Button, WithAlpha(MulRGB(color, 0.18f), 0.55f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, WithAlpha(MulRGB(color, 0.24f), 0.70f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, WithAlpha(MulRGB(color, 0.30f), 0.85f));
             
             if (ImGui::Button("##thumb", ImVec2(thumbnailSize, thumbnailSize))) {
                 if (isDirectory) {
@@ -1893,12 +2070,12 @@ void EditorUI::DrawConsolePanel() {
     ImGui::Begin("Console", &m_ShowConsole);
     
     // Toolbar
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.3f, 0.35f, 0.5f));
-    if (ImGui::Button("Clear")) {
+    ImGui::PushStyleColor(ImGuiCol_Button, WithAlpha(ImGui::GetStyle().Colors[ImGuiCol_Button], 0.85f));
+    if (ImGui::Button(m_IconFontLoaded ? (LUCENT_ICON_TRASH " Clear") : "Clear")) {
         // Clear console (would clear log buffer)
     }
     ImGui::SameLine();
-    if (ImGui::Button("Copy")) {
+    if (ImGui::Button(m_IconFontLoaded ? (LUCENT_ICON_COPY " Copy") : "Copy")) {
         // Copy to clipboard
     }
     ImGui::PopStyleColor();
@@ -1910,19 +2087,30 @@ void EditorUI::DrawConsolePanel() {
     // Filter buttons
     static bool showInfo = true, showWarn = true, showError = true;
     
-    ImGui::PushStyleColor(ImGuiCol_Button, showInfo ? ImVec4(0.3f, 0.7f, 0.5f, 0.6f) : ImVec4(0.2f, 0.2f, 0.2f, 0.5f));
-    if (ImGui::Button("Info")) showInfo = !showInfo;
-    ImGui::PopStyleColor();
+    ImVec4 off = WithAlpha(ImGui::GetStyle().Colors[ImGuiCol_Button], 0.60f);
+    ImVec4 info = ThemeAccent();
+    ImVec4 warn = ThemeWarning();
+    ImVec4 err = ThemeError();
+    
+    ImGui::PushStyleColor(ImGuiCol_Button, showInfo ? WithAlpha(info, 0.18f) : off);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, WithAlpha(info, 0.26f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, WithAlpha(info, 0.34f));
+    if (ImGui::Button(m_IconFontLoaded ? (LUCENT_ICON_INFO " Info") : "Info")) showInfo = !showInfo;
+    ImGui::PopStyleColor(3);
     
     ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, showWarn ? ImVec4(0.85f, 0.7f, 0.3f, 0.6f) : ImVec4(0.2f, 0.2f, 0.2f, 0.5f));
-    if (ImGui::Button("Warn")) showWarn = !showWarn;
-    ImGui::PopStyleColor();
+    ImGui::PushStyleColor(ImGuiCol_Button, showWarn ? WithAlpha(warn, 0.18f) : off);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, WithAlpha(warn, 0.26f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, WithAlpha(warn, 0.34f));
+    if (ImGui::Button(m_IconFontLoaded ? (LUCENT_ICON_WARN " Warn") : "Warn")) showWarn = !showWarn;
+    ImGui::PopStyleColor(3);
     
     ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, showError ? ImVec4(0.85f, 0.35f, 0.35f, 0.6f) : ImVec4(0.2f, 0.2f, 0.2f, 0.5f));
-    if (ImGui::Button("Error")) showError = !showError;
-    ImGui::PopStyleColor();
+    ImGui::PushStyleColor(ImGuiCol_Button, showError ? WithAlpha(err, 0.18f) : off);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, WithAlpha(err, 0.26f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, WithAlpha(err, 0.34f));
+    if (ImGui::Button(m_IconFontLoaded ? (LUCENT_ICON_ERROR " Error") : "Error")) showError = !showError;
+    ImGui::PopStyleColor(3);
     
     ImGui::SameLine();
     static bool autoScroll = true;
@@ -1931,45 +2119,47 @@ void EditorUI::DrawConsolePanel() {
     ImGui::Separator();
     
     // Log output area with colored background
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.05f, 0.05f, 0.06f, 1.0f));
+    ImVec4 consoleBg = ImGui::GetStyle().Colors[ImGuiCol_FrameBg];
+    consoleBg.w = 1.0f;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, consoleBg);
     ImGui::BeginChild("ScrollingRegion", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
     
     // Demo log messages with timestamps
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.55f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ThemeMutedText());
     ImGui::TextUnformatted("[11:00:00]");
     ImGui::PopStyleColor();
     ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.8f, 0.5f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, WithAlpha(ThemeAccent(), 0.95f));
     ImGui::TextUnformatted("[INFO]");
     ImGui::PopStyleColor();
     ImGui::SameLine();
     ImGui::TextUnformatted("Lucent Engine initialized");
     
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.55f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ThemeMutedText());
     ImGui::TextUnformatted("[11:00:00]");
     ImGui::PopStyleColor();
     ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.8f, 0.5f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, WithAlpha(ThemeAccent(), 0.95f));
     ImGui::TextUnformatted("[INFO]");
     ImGui::PopStyleColor();
     ImGui::SameLine();
     ImGui::TextUnformatted("Vulkan context initialized successfully");
     
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.55f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ThemeMutedText());
     ImGui::TextUnformatted("[11:00:00]");
     ImGui::PopStyleColor();
     ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.8f, 0.5f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, WithAlpha(ThemeAccent(), 0.95f));
     ImGui::TextUnformatted("[INFO]");
     ImGui::PopStyleColor();
     ImGui::SameLine();
     ImGui::TextUnformatted("Renderer initialized");
     
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.55f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ThemeMutedText());
     ImGui::TextUnformatted("[11:00:01]");
     ImGui::PopStyleColor();
     ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.8f, 0.5f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, WithAlpha(ThemeAccent(), 0.95f));
     ImGui::TextUnformatted("[INFO]");
     ImGui::PopStyleColor();
     ImGui::SameLine();
@@ -2008,7 +2198,7 @@ void EditorUI::DrawRenderPropertiesPanel() {
             bool available = caps.IsModeAvailable(mode);
             
             if (!available) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, ThemeMutedText());
             }
             
             if (ImGui::Selectable(modeNames[i], i == currentModeIdx, available ? 0 : ImGuiSelectableFlags_Disabled)) {
@@ -2031,7 +2221,7 @@ void EditorUI::DrawRenderPropertiesPanel() {
         ImGui::Text("Samples: %u / %u", settings.accumulatedSamples, settings.viewportSamples);
         if (settings.IsConverged()) {
             ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "(Converged)");
+            ImGui::TextColored(ThemeSuccess(), "(Converged)");
         }
     }
     
@@ -2126,7 +2316,7 @@ void EditorUI::DrawRenderPropertiesPanel() {
                     }
                     
                     if (!supported) {
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.45f, 0.45f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Text, ThemeMutedText());
                     }
 
                     if (ImGui::Selectable(denoiserNames[i], i == denoiserIdx,
@@ -2446,7 +2636,7 @@ void EditorUI::DrawModals() {
     }
     
     if (ImGui::BeginPopupModal("About Lucent", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextColored(ImVec4(0.25f, 0.78f, 0.85f, 1.0f), "LUCENT");
+        ImGui::TextColored(ThemeAccent(), "LUCENT");
         ImGui::Text("3D Editor with Vulkan Path Tracer");
         ImGui::Separator();
         ImGui::Text("Version: 0.1.0 (Development)");
@@ -2591,7 +2781,7 @@ void EditorUI::DrawModals() {
 
             ImGui::Combo("Preferred GPU", &gpuIndex, items.data(), (int)items.size());
 
-            if (ImGui::Button("Save GPU Preference")) {
+            if (ImGui::Button(m_IconFontLoaded ? (LUCENT_ICON_SAVE " Save GPU Preference") : "Save GPU Preference")) {
                 EditorSettings s = EditorSettings::Load();
                 if (gpuIndex <= 0) s.preferredGpuName.clear();
                 else s.preferredGpuName = gpuNames[gpuIndex];
@@ -2601,7 +2791,7 @@ void EditorUI::DrawModals() {
 
             if (gpuSaved) {
                 ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "Saved. Restart to apply.");
+                ImGui::TextColored(ThemeSuccess(), "Saved. Restart to apply.");
             }
         } else {
             ImGui::TextDisabled("GPU list unavailable");
@@ -2640,14 +2830,104 @@ void EditorUI::HandleGlobalShortcuts() {
     
     // Delete - Delete selected entities
     if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !m_SelectedEntities.empty()) {
-        // Create undo command for delete
-        // TODO: Implement delete with undo
         for (auto id : m_SelectedEntities) {
             if (m_Scene) {
                 m_Scene->DestroyEntity(m_Scene->GetEntity(id));
             }
         }
         ClearSelection();
+        m_SceneDirty = true;
+    }
+    
+    // Ctrl+C - Copy
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C) && !m_SelectedEntities.empty()) {
+        m_Clipboard.clear();
+        for (auto id : m_SelectedEntities) {
+            if (m_Scene) {
+                scene::Entity src = m_Scene->GetEntity(id);
+                if (!src.IsValid()) continue;
+                
+                ClipboardEntity clip;
+                auto* tag = src.GetComponent<scene::TagComponent>();
+                clip.name = tag ? tag->name : "Entity";
+                
+                if (auto* t = src.GetComponent<scene::TransformComponent>()) clip.transform = *t;
+                if (auto* c = src.GetComponent<scene::CameraComponent>()) clip.camera = *c;
+                if (auto* l = src.GetComponent<scene::LightComponent>()) clip.light = *l;
+                if (auto* m = src.GetComponent<scene::MeshRendererComponent>()) clip.meshRenderer = *m;
+                m_Clipboard.push_back(clip);
+            }
+        }
+    }
+    
+    // Ctrl+X - Cut
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X) && !m_SelectedEntities.empty()) {
+        m_Clipboard.clear();
+        for (auto id : m_SelectedEntities) {
+            if (m_Scene) {
+                scene::Entity src = m_Scene->GetEntity(id);
+                if (!src.IsValid()) continue;
+                
+                ClipboardEntity clip;
+                auto* tag = src.GetComponent<scene::TagComponent>();
+                clip.name = tag ? tag->name : "Entity";
+                
+                if (auto* t = src.GetComponent<scene::TransformComponent>()) clip.transform = *t;
+                if (auto* c = src.GetComponent<scene::CameraComponent>()) clip.camera = *c;
+                if (auto* l = src.GetComponent<scene::LightComponent>()) clip.light = *l;
+                if (auto* m = src.GetComponent<scene::MeshRendererComponent>()) clip.meshRenderer = *m;
+                m_Clipboard.push_back(clip);
+                m_Scene->DestroyEntity(src);
+            }
+        }
+        ClearSelection();
+        m_SceneDirty = true;
+    }
+    
+    // Ctrl+V - Paste
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V) && !m_Clipboard.empty() && m_Scene) {
+        std::vector<scene::Entity> newEntities;
+        for (const auto& clip : m_Clipboard) {
+            scene::Entity ent = m_Scene->CreateEntity(clip.name + " (Pasted)");
+            
+            if (auto* t = ent.GetComponent<scene::TransformComponent>()) {
+                *t = clip.transform;
+                t->position += glm::vec3(1.0f, 0.0f, 0.0f);
+            }
+            if (clip.camera) ent.AddComponent<scene::CameraComponent>() = *clip.camera;
+            if (clip.light) ent.AddComponent<scene::LightComponent>() = *clip.light;
+            if (clip.meshRenderer) ent.AddComponent<scene::MeshRendererComponent>() = *clip.meshRenderer;
+            newEntities.push_back(ent);
+        }
+        ClearSelection();
+        for (auto& e : newEntities) AddToSelection(e);
+        m_SceneDirty = true;
+    }
+    
+    // Ctrl+D - Duplicate
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D) && !m_SelectedEntities.empty() && m_Scene) {
+        std::vector<scene::Entity> newEntities;
+        for (auto id : m_SelectedEntities) {
+            scene::Entity src = m_Scene->GetEntity(id);
+            if (!src.IsValid()) continue;
+            
+            auto* tag = src.GetComponent<scene::TagComponent>();
+            scene::Entity dup = m_Scene->CreateEntity(tag ? tag->name + " Copy" : "Entity Copy");
+            
+            if (auto* t = src.GetComponent<scene::TransformComponent>()) {
+                auto* dt = dup.GetComponent<scene::TransformComponent>();
+                if (dt) {
+                    *dt = *t;
+                    dt->position += glm::vec3(1.0f, 0.0f, 0.0f);
+                }
+            }
+            if (auto* c = src.GetComponent<scene::CameraComponent>()) dup.AddComponent<scene::CameraComponent>() = *c;
+            if (auto* l = src.GetComponent<scene::LightComponent>()) dup.AddComponent<scene::LightComponent>() = *l;
+            if (auto* m = src.GetComponent<scene::MeshRendererComponent>()) dup.AddComponent<scene::MeshRendererComponent>() = *m;
+            newEntities.push_back(dup);
+        }
+        ClearSelection();
+        for (auto& e : newEntities) AddToSelection(e);
         m_SceneDirty = true;
     }
 }

@@ -502,17 +502,25 @@ bool Renderer::CreatePipelines() {
     meshPushConstant.offset = 0;
     meshPushConstant.size = sizeof(float) * 64; // 3 mat4 + 4 vec4 = 256 bytes
     
-    // Create descriptor set layout for shadow map (set 0, binding 0)
-    VkDescriptorSetLayoutBinding shadowBinding{};
-    shadowBinding.binding = 0;
-    shadowBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    shadowBinding.descriptorCount = 1;
-    shadowBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Create descriptor set layout for mesh shader (shadow map + lights)
+    VkDescriptorSetLayoutBinding meshDescBindings[2] = {};
+    
+    // Binding 0: Shadow map
+    meshDescBindings[0].binding = 0;
+    meshDescBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    meshDescBindings[0].descriptorCount = 1;
+    meshDescBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    
+    // Binding 1: Light buffer
+    meshDescBindings[1].binding = 1;
+    meshDescBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    meshDescBindings[1].descriptorCount = 1;
+    meshDescBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     
     VkDescriptorSetLayoutCreateInfo shadowLayoutInfo{};
     shadowLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    shadowLayoutInfo.bindingCount = 1;
-    shadowLayoutInfo.pBindings = &shadowBinding;
+    shadowLayoutInfo.bindingCount = 2;
+    shadowLayoutInfo.pBindings = meshDescBindings;
     
     if (vkCreateDescriptorSetLayout(device, &shadowLayoutInfo, nullptr, &m_MeshDescriptorLayout) != VK_SUCCESS) {
         LUCENT_CORE_ERROR("Failed to create mesh descriptor layout");
@@ -1474,9 +1482,31 @@ bool Renderer::CreateShadowResources() {
         return false;
     }
     
-    // Update descriptor set
+    // Create default light buffer (single directional light)
+    GPULight defaultLight{};
+    defaultLight.position = glm::vec3(0.0f);
+    defaultLight.type = static_cast<uint32_t>(GPULightType::Directional);
+    defaultLight.color = glm::vec3(1.0f, 0.98f, 0.95f);
+    defaultLight.intensity = 2.5f;
+    defaultLight.direction = glm::normalize(glm::vec3(1.0f, 1.0f, 0.5f));
+    defaultLight.range = 0.0f;
+    
+    BufferDesc lightBufferDesc{};
+    lightBufferDesc.size = sizeof(GPULight);
+    lightBufferDesc.usage = BufferUsage::Storage;
+    lightBufferDesc.hostVisible = true;
+    lightBufferDesc.debugName = "MeshLightBuffer";
+    
+    if (!m_LightBuffer.Init(m_Device, lightBufferDesc)) {
+        LUCENT_CORE_ERROR("Failed to create light buffer");
+        return false;
+    }
+    m_LightBuffer.Upload(&defaultLight, sizeof(GPULight));
+    
+    // Update descriptor set (shadow map + light buffer)
     DescriptorWriter writer;
     writer.WriteImage(0, m_ShadowMap.GetView(), m_ShadowSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    writer.WriteBuffer(1, m_LightBuffer.GetHandle(), m_LightBuffer.GetSize(), 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     writer.UpdateSet(device, m_ShadowDescriptorSet);
     
     // Load shadow shader
@@ -1567,6 +1597,54 @@ void Renderer::DestroyShadowResources() {
         m_ShadowSampler = VK_NULL_HANDLE;
     }
     m_ShadowMap.Shutdown();
+    m_LightBuffer.Shutdown();
+}
+
+void Renderer::SetLights(const std::vector<GPULight>& lights) {
+    if (!m_Device) return;
+    
+    // Calculate actual data size
+    size_t actualDataSize = lights.empty() ? sizeof(GPULight) : lights.size() * sizeof(GPULight);
+    
+    // Resize buffer if needed (grow only)
+    if (m_LightBuffer.GetSize() < actualDataSize) {
+        m_LightBuffer.Shutdown();
+        
+        BufferDesc lightBufferDesc{};
+        lightBufferDesc.size = actualDataSize;
+        lightBufferDesc.usage = BufferUsage::Storage;
+        lightBufferDesc.hostVisible = true;
+        lightBufferDesc.debugName = "MeshLightBuffer";
+        
+        if (!m_LightBuffer.Init(m_Device, lightBufferDesc)) {
+            LUCENT_CORE_ERROR("Failed to resize light buffer");
+            return;
+        }
+    }
+    
+    // Upload light data
+    if (!lights.empty()) {
+        m_LightBuffer.Upload(lights.data(), lights.size() * sizeof(GPULight));
+    } else {
+        // Default directional light when no lights in scene
+        GPULight defaultLight{};
+        defaultLight.position = glm::vec3(0.0f);
+        defaultLight.type = static_cast<uint32_t>(GPULightType::Directional);
+        defaultLight.color = glm::vec3(1.0f, 0.98f, 0.95f);
+        defaultLight.intensity = 2.5f;
+        defaultLight.direction = glm::normalize(glm::vec3(1.0f, 1.0f, 0.5f));
+        defaultLight.range = 0.0f;
+        m_LightBuffer.Upload(&defaultLight, sizeof(GPULight));
+    }
+    
+    // ALWAYS update descriptor with the EXACT size of uploaded data
+    // This is critical because GLSL's lights.length() returns descriptorRange/sizeof(GPULight)
+    if (m_ShadowDescriptorSet != VK_NULL_HANDLE) {
+        DescriptorWriter writer;
+        writer.WriteImage(0, m_ShadowMap.GetView(), m_ShadowSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        writer.WriteBuffer(1, m_LightBuffer.GetHandle(), actualDataSize, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        writer.UpdateSet(m_Context->GetDevice(), m_ShadowDescriptorSet);
+    }
 }
 
 void Renderer::BeginShadowPass(VkCommandBuffer cmd) {

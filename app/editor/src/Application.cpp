@@ -279,7 +279,8 @@ void Application::InitScene() {
     lightTransform.rotation = glm::vec3(-45.0f, -45.0f, 0.0f);
     auto& lightComp = light.AddComponent<scene::LightComponent>();
     lightComp.type = scene::LightType::Directional;
-    lightComp.intensity = 1.0f;
+    // Make the default directional light strong enough to visibly dominate the (simple) sky/environment in traced modes.
+    lightComp.intensity = 10.0f;
     
     // Create some placeholder mesh entities
     // Red metallic cube
@@ -625,6 +626,51 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
         // Update light matrix for shadow mapping
         UpdateLightMatrix();
         
+        // Update lights for rasterizer (collect scene lights)
+        {
+            std::vector<gfx::GPULight> lights;
+            auto lightView = m_Scene.GetView<scene::LightComponent, scene::TransformComponent>();
+            lightView.Each([&](scene::Entity entity, scene::LightComponent& light, scene::TransformComponent& transform) {
+                (void)entity;
+                
+                gfx::GPULight gpuLight{};
+                gpuLight.color = light.color;
+                gpuLight.intensity = light.intensity;
+                gpuLight.range = light.range;
+                gpuLight.innerAngle = glm::radians(light.innerAngle);
+                gpuLight.outerAngle = glm::radians(light.outerAngle);
+                
+                gpuLight.position = transform.position;
+                
+                // Use GetForward() for consistent rotation handling
+                glm::vec3 forward = transform.GetForward();
+                
+                switch (light.type) {
+                    case scene::LightType::Directional:
+                        gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Directional);
+                        // Direction FROM the light (opposite of where it points)
+                        gpuLight.direction = -forward;
+                        break;
+                    case scene::LightType::Point:
+                        gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Point);
+                        gpuLight.direction = forward;
+                        break;
+                    case scene::LightType::Spot:
+                        gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Spot);
+                        // Spot lights point in their forward direction
+                        gpuLight.direction = forward;
+                        break;
+                    default:
+                        gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Point);
+                        gpuLight.direction = forward;
+                        break;
+                }
+                
+                lights.push_back(gpuLight);
+            });
+            m_Renderer.SetLights(lights);
+        }
+        
         // Render shadow pass first
         RenderShadowPass(cmd);
         
@@ -832,19 +878,19 @@ void Application::ScrollCallback(GLFWwindow* window, double xoffset, double yoff
 }
 
 void Application::UpdateLightMatrix() {
-    // Find directional light in scene
+    // Find first directional light in scene
     glm::vec3 lightDir = glm::normalize(glm::vec3(1.0f, 1.0f, 0.5f)); // Default
+    bool foundLight = false;
     
     auto lightEntities = m_Scene.GetView<scene::LightComponent, scene::TransformComponent>();
     lightEntities.Each([&](scene::Entity entity, scene::LightComponent& light, scene::TransformComponent& transform) {
         (void)entity;
-        if (light.type == scene::LightType::Directional) {
-            // Get light direction from rotation
-            glm::mat4 rotMat = glm::mat4(1.0f);
-            rotMat = glm::rotate(rotMat, glm::radians(transform.rotation.x), glm::vec3(1, 0, 0));
-            rotMat = glm::rotate(rotMat, glm::radians(transform.rotation.y), glm::vec3(0, 1, 0));
-            rotMat = glm::rotate(rotMat, glm::radians(transform.rotation.z), glm::vec3(0, 0, 1));
-            lightDir = -glm::normalize(glm::vec3(rotMat * glm::vec4(0, 0, -1, 0)));
+        if (light.type == scene::LightType::Directional && !foundLight) {
+            // Use GetForward() for consistency with light collection
+            // GetForward returns the -Z axis in world space (where light points)
+            // We want the direction FROM the light, so we negate it
+            lightDir = -transform.GetForward();
+            foundLight = true;
         }
     });
     
@@ -906,6 +952,46 @@ void Application::UpdateTracerScene() {
     // Build scene data for the tracer
     std::vector<gfx::BVHBuilder::Triangle> triangles;
     std::vector<gfx::GPUMaterial> materials;
+    std::vector<gfx::GPULight> lights;
+    
+    // Collect lights from scene
+    auto lightView = m_Scene.GetView<scene::LightComponent, scene::TransformComponent>();
+    lightView.Each([&](scene::Entity entity, scene::LightComponent& light, scene::TransformComponent& transform) {
+        (void)entity;
+        
+        gfx::GPULight gpuLight{};
+        gpuLight.color = light.color;
+        gpuLight.intensity = light.intensity;
+        gpuLight.range = light.range;
+        gpuLight.innerAngle = glm::radians(light.innerAngle);
+        gpuLight.outerAngle = glm::radians(light.outerAngle);
+        gpuLight.position = transform.position;
+        
+        // Use GetForward() for consistent rotation handling
+        glm::vec3 forward = transform.GetForward();
+        
+        switch (light.type) {
+            case scene::LightType::Directional:
+                gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Directional);
+                // Direction FROM the light (opposite of where it points)
+                gpuLight.direction = -forward;
+                break;
+            case scene::LightType::Point:
+                gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Point);
+                gpuLight.direction = forward;
+                break;
+            case scene::LightType::Spot:
+                gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Spot);
+                gpuLight.direction = forward;
+                break;
+            case scene::LightType::Area:
+                gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Area);
+                gpuLight.direction = forward;
+                break;
+        }
+        
+        lights.push_back(gpuLight);
+    });
     
     // Default material
     gfx::GPUMaterial defaultMat{};
@@ -979,11 +1065,11 @@ void Application::UpdateTracerScene() {
     gfx::RenderMode mode = m_Renderer.GetRenderMode();
     if (mode == gfx::RenderMode::RayTraced) {
         if (gfx::TracerRayKHR* rt = m_Renderer.GetTracerRayKHR(); rt && rt->IsSupported()) {
-            rt->UpdateScene(triangles, materials);
+            rt->UpdateScene(triangles, materials, lights);
         }
     } else {
         if (gfx::TracerCompute* compute = m_Renderer.GetTracerCompute()) {
-            compute->UpdateScene(triangles, materials);
+            compute->UpdateScene(triangles, materials, lights);
         }
     }
     

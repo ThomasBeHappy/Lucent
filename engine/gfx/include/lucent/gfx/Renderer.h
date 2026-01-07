@@ -4,6 +4,7 @@
 #include "lucent/gfx/Device.h"
 #include "lucent/gfx/Swapchain.h"
 #include "lucent/gfx/Image.h"
+#include "lucent/gfx/Buffer.h"
 #include "lucent/gfx/DescriptorAllocator.h"
 #include "lucent/gfx/PipelineBuilder.h"
 #include "lucent/gfx/RenderCapabilities.h"
@@ -138,6 +139,9 @@ public:
     Image* GetShadowMap() { return &m_ShadowMap; }
     VkSampler GetShadowSampler() const { return m_ShadowSampler; }
     
+    // Scene lights for rasterizer
+    void SetLights(const std::vector<GPULight>& lights);
+    
 private:
     bool CreateFrameResources();
     bool CreateOffscreenResources();
@@ -267,6 +271,9 @@ private:
     VkShaderModule m_ShadowVertShader = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_ShadowDescriptorLayout = VK_NULL_HANDLE; // Points to m_MeshDescriptorLayout
     VkDescriptorSet m_ShadowDescriptorSet = VK_NULL_HANDLE;
+    
+    // Light buffer for rasterizer
+    Buffer m_LightBuffer;
 };
 
 } // namespace lucent::gfx
