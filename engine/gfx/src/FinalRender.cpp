@@ -4,14 +4,116 @@
 #include "lucent/gfx/TracerRayKHR.h"
 #include "lucent/core/Log.h"
 #include <GLFW/glfw3.h>
+#include <algorithm>
 #include <fstream>
 #include <cmath>
+#include <vector>
 
 // stb_image_write for PNG export
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
 namespace lucent::gfx {
+
+namespace {
+
+float ComputeLuminance(float r, float g, float b) {
+    return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+}
+
+void BoxDenoise(const float* src, float* dst, uint32_t width, uint32_t height, uint32_t radius) {
+    const int32_t r = static_cast<int32_t>(radius);
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            float sumR = 0.0f;
+            float sumG = 0.0f;
+            float sumB = 0.0f;
+            float sumA = 0.0f;
+            uint32_t count = 0;
+
+            for (int32_t dy = -r; dy <= r; ++dy) {
+                int32_t yy = std::clamp(static_cast<int32_t>(y) + dy, 0, static_cast<int32_t>(height - 1));
+                for (int32_t dx = -r; dx <= r; ++dx) {
+                    int32_t xx = std::clamp(static_cast<int32_t>(x) + dx, 0, static_cast<int32_t>(width - 1));
+                    uint32_t idx = (yy * width + xx) * 4;
+                    sumR += src[idx + 0];
+                    sumG += src[idx + 1];
+                    sumB += src[idx + 2];
+                    sumA += src[idx + 3];
+                    count++;
+                }
+            }
+
+            uint32_t outIdx = (y * width + x) * 4;
+            float inv = count > 0 ? (1.0f / static_cast<float>(count)) : 1.0f;
+            dst[outIdx + 0] = sumR * inv;
+            dst[outIdx + 1] = sumG * inv;
+            dst[outIdx + 2] = sumB * inv;
+            dst[outIdx + 3] = sumA * inv;
+        }
+    }
+}
+
+void EdgeAwareDenoise(const float* src, float* dst, uint32_t width, uint32_t height, uint32_t radius) {
+    const int32_t r = static_cast<int32_t>(radius);
+    const float sigmaSpatial = std::max(1.0f, radius * 0.5f);
+    const float sigmaColor = 0.1f;
+    const float invSpatial = 1.0f / (2.0f * sigmaSpatial * sigmaSpatial);
+    const float invColor = 1.0f / (2.0f * sigmaColor * sigmaColor);
+
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            uint32_t centerIdx = (y * width + x) * 4;
+            float centerR = src[centerIdx + 0];
+            float centerG = src[centerIdx + 1];
+            float centerB = src[centerIdx + 2];
+            float centerA = src[centerIdx + 3];
+            float centerLuma = ComputeLuminance(centerR, centerG, centerB);
+
+            float sumR = 0.0f;
+            float sumG = 0.0f;
+            float sumB = 0.0f;
+            float sumA = 0.0f;
+            float weightSum = 0.0f;
+
+            for (int32_t dy = -r; dy <= r; ++dy) {
+                int32_t yy = std::clamp(static_cast<int32_t>(y) + dy, 0, static_cast<int32_t>(height - 1));
+                for (int32_t dx = -r; dx <= r; ++dx) {
+                    int32_t xx = std::clamp(static_cast<int32_t>(x) + dx, 0, static_cast<int32_t>(width - 1));
+                    uint32_t idx = (yy * width + xx) * 4;
+
+                    float sampleR = src[idx + 0];
+                    float sampleG = src[idx + 1];
+                    float sampleB = src[idx + 2];
+                    float sampleA = src[idx + 3];
+                    float sampleLuma = ComputeLuminance(sampleR, sampleG, sampleB);
+
+                    float spatialWeight = std::exp(-(dx * dx + dy * dy) * invSpatial);
+                    float colorDelta = sampleLuma - centerLuma;
+                    float colorWeight = std::exp(-(colorDelta * colorDelta) * invColor);
+                    float weight = spatialWeight * colorWeight;
+
+                    sumR += sampleR * weight;
+                    sumG += sampleG * weight;
+                    sumB += sampleB * weight;
+                    sumA += sampleA * weight;
+                    weightSum += weight;
+                }
+            }
+
+            if (weightSum <= 0.0f) {
+                weightSum = 1.0f;
+            }
+
+            dst[centerIdx + 0] = sumR / weightSum;
+            dst[centerIdx + 1] = sumG / weightSum;
+            dst[centerIdx + 2] = sumB / weightSum;
+            dst[centerIdx + 3] = sumA / weightSum;
+        }
+    }
+}
+
+} // namespace
 
 FinalRender::~FinalRender() {
     Shutdown();
@@ -238,13 +340,35 @@ bool FinalRender::ApplyTonemap() {
     
     device->EndSingleTimeCommands(cmd);
     
-    // Read back and tonemap
+    // Read back and denoise/tonemap
     float* hdrData = static_cast<float*>(stagingBuffer.Map());
+    float strength = std::clamp(m_Config.denoiseStrength, 0.0f, 1.0f);
+    uint32_t radius = std::max(1u, m_Config.denoiseRadius);
+    bool useDenoiser = m_Config.denoiser != DenoiserType::None && strength > 0.0f;
+    bool denoiseSupported = m_Config.denoiser == DenoiserType::Box || m_Config.denoiser == DenoiserType::EdgeAware;
+    std::vector<float> denoised;
+
+    if (useDenoiser && denoiseSupported) {
+        denoised.resize(static_cast<size_t>(m_Config.width) * m_Config.height * 4);
+        if (m_Config.denoiser == DenoiserType::EdgeAware) {
+            EdgeAwareDenoise(hdrData, denoised.data(), m_Config.width, m_Config.height, radius);
+        } else {
+            BoxDenoise(hdrData, denoised.data(), m_Config.width, m_Config.height, radius);
+        }
+    } else {
+        useDenoiser = false;
+    }
     
     for (uint32_t i = 0; i < m_Config.width * m_Config.height; i++) {
         float r = hdrData[i * 4 + 0];
         float g = hdrData[i * 4 + 1];
         float b = hdrData[i * 4 + 2];
+
+        if (useDenoiser) {
+            r = r * (1.0f - strength) + denoised[i * 4 + 0] * strength;
+            g = g * (1.0f - strength) + denoised[i * 4 + 1] * strength;
+            b = b * (1.0f - strength) + denoised[i * 4 + 2] * strength;
+        }
         
         // Apply exposure
         r *= m_Config.exposure;
@@ -349,4 +473,3 @@ bool FinalRender::SaveToEXR(const std::string& path) {
 }
 
 } // namespace lucent::gfx
-

@@ -25,6 +25,28 @@ inline const char* TonemapOperatorName(TonemapOperator op) {
     }
 }
 
+// Denoiser backends (viewport/final render)
+enum class DenoiserType : uint8_t {
+    None = 0,
+    Box,
+    EdgeAware,
+    OpenImageDenoise,
+    OptiX,
+    NRD
+};
+
+inline const char* DenoiserTypeName(DenoiserType type) {
+    switch (type) {
+        case DenoiserType::None:             return "None";
+        case DenoiserType::Box:              return "Box Blur";
+        case DenoiserType::EdgeAware:        return "Edge-Aware";
+        case DenoiserType::OpenImageDenoise: return "OpenImageDenoise";
+        case DenoiserType::OptiX:            return "OptiX";
+        case DenoiserType::NRD:              return "NRD";
+        default:                             return "Unknown";
+    }
+}
+
 // Blender-like render settings shared by all render modes
 struct RenderSettings {
     // === Sampling ===
@@ -48,8 +70,9 @@ struct RenderSettings {
     float gamma = 2.2f;
     
     // === Denoise ===
-    bool enableDenoise = false;
+    DenoiserType denoiser = DenoiserType::None;
     float denoiseStrength = 0.5f;
+    uint32_t denoiseRadius = 2;
     
     // === Performance ===
     bool useHalfRes = false;            // Render at half resolution for viewport
@@ -98,5 +121,4 @@ struct RenderSettings {
 };
 
 } // namespace lucent::gfx
-
 

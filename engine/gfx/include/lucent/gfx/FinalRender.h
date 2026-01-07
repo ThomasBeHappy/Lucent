@@ -26,6 +26,9 @@ struct FinalRenderConfig {
     float exposure = 1.0f;
     TonemapOperator tonemap = TonemapOperator::ACES;
     float gamma = 2.2f;
+    DenoiserType denoiser = DenoiserType::None;
+    float denoiseStrength = 0.5f;
+    uint32_t denoiseRadius = 2;
     std::string outputPath = "render.png";
     bool useRayTracing = true;  // Use RayTraced if available, else Traced
 };
@@ -110,5 +113,4 @@ private:
 };
 
 } // namespace lucent::gfx
-
 
