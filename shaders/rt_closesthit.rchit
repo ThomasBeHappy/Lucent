@@ -92,3 +92,4 @@ void main() {
     payload = diffuse + emissive.rgb * emissive.a;
 }
 
+

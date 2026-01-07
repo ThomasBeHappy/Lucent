@@ -81,3 +81,4 @@ void main() {
     imageStore(accumImage, ivec2(pixel), vec4(accumulated, 1.0));
 }
 
+

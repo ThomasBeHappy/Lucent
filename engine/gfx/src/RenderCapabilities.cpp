@@ -58,3 +58,4 @@ RenderCapabilities RenderCapabilities::FromDeviceFeatures(const DeviceFeatures& 
 
 } // namespace lucent::gfx
 
+

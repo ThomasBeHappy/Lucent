@@ -861,3 +861,4 @@ void TracerRayKHR::ResetAccumulation() {
 
 } // namespace lucent::gfx
 
+
