@@ -37,6 +37,9 @@ target_link_libraries(editor
         unofficial::imgui-node-editor::imgui-node-editor
 )
 
+# Ensure shaders are compiled before building editor
+add_dependencies(editor shaders)
+
 # -----------------------------------------------------------------------------
 # Editor icon pack (Font Awesome) - auto-download and copy into runtime Assets
 # -----------------------------------------------------------------------------

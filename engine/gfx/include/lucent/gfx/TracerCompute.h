@@ -5,6 +5,7 @@
 #include "lucent/gfx/Buffer.h"
 #include "lucent/gfx/Image.h"
 #include "lucent/gfx/RenderSettings.h"
+#include "lucent/gfx/EnvironmentMap.h"
 #include <glm/glm.hpp>
 #include <vector>
 #include <memory>
@@ -67,17 +68,26 @@ enum class GPULightType : uint32_t {
     Area = 3
 };
 
-// Light for GPU (48 bytes, aligned)
+// Area light shapes
+enum class GPUAreaShape : uint32_t {
+    Disk = 0,
+    Rect = 1
+};
+
+// Light for GPU (64 bytes, aligned)
 struct GPULight {
-    glm::vec3 position;      // World position (point/spot) or direction (directional)
+    glm::vec3 position;      // World position (point/spot/area) or direction (directional)
     uint32_t type;           // GPULightType
     glm::vec3 color;         // RGB color
     float intensity;         // Light intensity
-    glm::vec3 direction;     // Light direction (for spot/directional)
+    glm::vec3 direction;     // Light direction (for spot/directional/area normal)
     float range;             // Attenuation range (point/spot)
     float innerAngle;        // Spot inner cone angle (radians)
     float outerAngle;        // Spot outer cone angle (radians)
-    float padding[2];        // Padding to 48 bytes
+    float areaWidth;         // Area light width (rect) or radius (disk)
+    float areaHeight;        // Area light height (rect only)
+    glm::vec3 areaTangent;   // Area light tangent (for rect orientation)
+    uint32_t areaShape;      // GPUAreaShape (0=disk, 1=rect)
 };
 
 // Push constants for compute shader
@@ -86,6 +96,10 @@ struct TracerPushConstants {
     uint32_t sampleIndex;
     uint32_t maxBounces;
     float clampValue;
+    uint32_t lightCount;
+    float envIntensity;
+    float envRotation;
+    uint32_t useEnvMap;
 };
 
 // Scene data for GPU
@@ -145,6 +159,12 @@ public:
                      const std::vector<GPUMaterial>& materials,
                      const std::vector<GPULight>& lights = {});
     
+    // Set environment map for IBL
+    void SetEnvironmentMap(EnvironmentMap* envMap);
+
+    // Update only light data (no BVH rebuild)
+    void UpdateLights(const std::vector<GPULight>& lights = {});
+    
     // Render a sample
     void Trace(VkCommandBuffer cmd, 
                const GPUCamera& camera,
@@ -178,6 +198,9 @@ private:
     SceneGPU m_SceneGPU;
     bool m_SceneDirty = true;
     bool m_DescriptorsDirty = true;  // Only update descriptors when needed
+    
+    // Environment map
+    EnvironmentMap* m_EnvMap = nullptr;
     
     // Compute pipeline
     VkDescriptorSetLayout m_DescriptorLayout = VK_NULL_HANDLE;

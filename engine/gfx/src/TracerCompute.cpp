@@ -129,13 +129,14 @@ bool TracerCompute::Init(VulkanContext* context, Device* device) {
     VkDescriptorPoolSize poolSizes[] = {
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },  // accumImage + albedoImage + normalImage
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 }, // triangles + bvh + instances + materials + lights
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 }  // env map + marginal CDF + conditional CDF
     };
     
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.maxSets = 1;
-    poolInfo.poolSizeCount = 3;
+    poolInfo.poolSizeCount = 4;
     poolInfo.pPoolSizes = poolSizes;
     
     if (vkCreateDescriptorPool(context->GetDevice(), &poolInfo, nullptr, &m_DescriptorPool) != VK_SUCCESS) {
@@ -145,20 +146,23 @@ bool TracerCompute::Init(VulkanContext* context, Device* device) {
     
     // Create descriptor set layout
     VkDescriptorSetLayoutBinding bindings[] = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },      // accumImage
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },     // triangles
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },     // bvhNodes
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },     // instances
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },     // materials
-        { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },     // camera
-        { 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },      // albedoImage
-        { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },      // normalImage
-        { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }      // lights
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // accumImage
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // triangles
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // bvhNodes
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // instances
+        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // materials
+        { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // camera
+        { 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // albedoImage
+        { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // normalImage
+        { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // lights
+        { 9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },   // envMap
+        { 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },  // envMarginalCDF
+        { 11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }   // envConditionalCDF
     };
     
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 9;
+    layoutInfo.bindingCount = 12;
     layoutInfo.pBindings = bindings;
     
     if (vkCreateDescriptorSetLayout(context->GetDevice(), &layoutInfo, nullptr, &m_DescriptorLayout) != VK_SUCCESS) {
@@ -379,7 +383,34 @@ void TracerCompute::UpdateDescriptors() {
     lightInfo.offset = 0;
     lightInfo.range = m_SceneGPU.lightBuffer.GetSize();
     
-    VkWriteDescriptorSet writes[9] = {};
+    // Environment map textures
+    VkDescriptorImageInfo envMapInfo{};
+    VkDescriptorImageInfo envMarginalInfo{};
+    VkDescriptorImageInfo envConditionalInfo{};
+    
+    if (m_EnvMap && m_EnvMap->IsLoaded()) {
+        envMapInfo.sampler = m_EnvMap->GetSampler();
+        envMapInfo.imageView = m_EnvMap->GetEnvView();
+        envMapInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        
+        envMarginalInfo.sampler = m_EnvMap->GetSampler();
+        envMarginalInfo.imageView = m_EnvMap->GetMarginalCDFView();
+        envMarginalInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        
+        envConditionalInfo.sampler = m_EnvMap->GetSampler();
+        envConditionalInfo.imageView = m_EnvMap->GetConditionalCDFView();
+        envConditionalInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    } else {
+        // Use accumulation image view as placeholder (won't be sampled if useEnvMap=0)
+        envMapInfo.sampler = VK_NULL_HANDLE;
+        envMapInfo.imageView = m_AccumulationImage.GetView();
+        envMapInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        
+        envMarginalInfo = envMapInfo;
+        envConditionalInfo = envMapInfo;
+    }
+    
+    VkWriteDescriptorSet writes[12] = {};
     
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = m_DescriptorSet;
@@ -444,7 +475,78 @@ void TracerCompute::UpdateDescriptors() {
     writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[8].pBufferInfo = &lightInfo;
     
-    vkUpdateDescriptorSets(device, 9, writes, 0, nullptr);
+    // Environment map writes - only add if we have valid views
+    uint32_t writeCount = 9;
+    if (m_EnvMap && m_EnvMap->IsLoaded()) {
+        writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[9].dstSet = m_DescriptorSet;
+        writes[9].dstBinding = 9;
+        writes[9].descriptorCount = 1;
+        writes[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[9].pImageInfo = &envMapInfo;
+        
+        writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[10].dstSet = m_DescriptorSet;
+        writes[10].dstBinding = 10;
+        writes[10].descriptorCount = 1;
+        writes[10].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[10].pImageInfo = &envMarginalInfo;
+        
+        writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[11].dstSet = m_DescriptorSet;
+        writes[11].dstBinding = 11;
+        writes[11].descriptorCount = 1;
+        writes[11].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[11].pImageInfo = &envConditionalInfo;
+        
+        writeCount = 12;
+    }
+    
+    vkUpdateDescriptorSets(device, writeCount, writes, 0, nullptr);
+}
+
+void TracerCompute::SetEnvironmentMap(EnvironmentMap* envMap) {
+    m_EnvMap = envMap;
+    m_DescriptorsDirty = true;
+}
+
+void TracerCompute::UpdateLights(const std::vector<GPULight>& inputLights) {
+    if (!m_Device) return;
+    if (!m_SceneGPU.valid) return;
+
+    size_t lightCount = std::max(inputLights.size(), size_t(1));
+    size_t lightSize = lightCount * sizeof(GPULight);
+
+    // Resize light buffer if needed
+    if (m_SceneGPU.lightBuffer.GetHandle() == VK_NULL_HANDLE || m_SceneGPU.lightBuffer.GetSize() != lightSize) {
+        m_SceneGPU.lightBuffer.Shutdown();
+        BufferDesc lightDesc{};
+        lightDesc.size = lightSize;
+        lightDesc.usage = BufferUsage::Storage;
+        lightDesc.hostVisible = true;
+        lightDesc.debugName = "TracerLights";
+        m_SceneGPU.lightBuffer.Init(m_Device, lightDesc);
+        m_DescriptorsDirty = true; // buffer handle/size changed
+    }
+
+    // Upload lights (or a dummy light if empty)
+    if (!inputLights.empty()) {
+        m_SceneGPU.lightBuffer.Upload(inputLights.data(), inputLights.size() * sizeof(GPULight));
+        m_SceneGPU.lightCount = static_cast<uint32_t>(inputLights.size());
+    } else {
+        // Default directional light (sun)
+        GPULight defaultLight{};
+        defaultLight.position = glm::vec3(0.0f);
+        defaultLight.type = static_cast<uint32_t>(GPULightType::Directional);
+        defaultLight.color = glm::vec3(1.0f, 0.98f, 0.95f);
+        defaultLight.intensity = 2.5f;
+        defaultLight.direction = glm::normalize(glm::vec3(1.0f, 1.0f, 0.5f));
+        defaultLight.range = 0.0f;
+        m_SceneGPU.lightBuffer.Upload(&defaultLight, sizeof(GPULight));
+        m_SceneGPU.lightCount = 1;
+    }
+
+    m_DescriptorsDirty = true;
 }
 
 void TracerCompute::UpdateScene(const std::vector<BVHBuilder::Triangle>& inputTriangles,
@@ -637,6 +739,10 @@ void TracerCompute::Trace(VkCommandBuffer cmd,
     pc.sampleIndex = settings.accumulatedSamples;
     pc.maxBounces = settings.maxBounces;
     pc.clampValue = settings.clampIndirect;
+    pc.lightCount = m_SceneGPU.lightCount;
+    pc.envIntensity = settings.envIntensity;
+    pc.envRotation = settings.envRotation;
+    pc.useEnvMap = (m_EnvMap && m_EnvMap->IsLoaded() && settings.useEnvMap) ? 1 : 0;
     
     vkCmdPushConstants(cmd, m_PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 
         0, sizeof(TracerPushConstants), &pc);

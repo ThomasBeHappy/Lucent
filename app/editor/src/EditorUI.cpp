@@ -647,6 +647,28 @@ void EditorUI::DrawDockspace() {
                     }
                 }
             }
+            if (ImGui::MenuItem(m_IconFontLoaded ? (LUCENT_ICON_IMPORT " Import glTF...") : "Import glTF...")) {
+                if (!m_Scene || !m_Device) {
+                    Win32FileDialogs::ShowError(L"Import glTF", L"Scene or device not initialized.");
+                } else {
+                    std::string path = Win32FileDialogs::OpenFile(
+                        L"Import glTF/GLB",
+                        {{L"glTF", L"*.gltf;*.glb"}, {L"All Files", L"*.*"}},
+                        L"gltf"
+                    );
+                    if (!path.empty()) {
+                        int added = SceneIO::ImportGLTF(m_Scene, m_Device, path);
+                        if (added < 0) {
+                            LUCENT_CORE_ERROR("Import glTF failed: {}", SceneIO::GetLastError());
+                            Win32FileDialogs::ShowError(L"Import glTF", L"Import failed. See console for details.");
+                        } else {
+                            m_SceneDirty = true;
+                            if (m_Renderer) m_Renderer->GetSettings().MarkDirty();
+                            LUCENT_CORE_INFO("Imported {} entities from glTF: {}", added, path);
+                        }
+                    }
+                }
+            }
             if (ImGui::BeginMenu("Export")) {
                 if (ImGui::MenuItem("Scene (.lucent)...")) {
                     if (m_Scene) {
@@ -1563,7 +1585,28 @@ void EditorUI::DrawComponentsPanel(scene::Entity entity) {
             }
             
             if (light->type == scene::LightType::Area) {
-                ImGui::DragFloat2("Size", &light->areaSize.x, 0.1f, 0.01f, 100.0f);
+                const char* shapeNames[] = { "Disk", "Rect" };
+                int shapeIdx = static_cast<int>(light->areaShape);
+                if (ImGui::Combo("Shape", &shapeIdx, shapeNames, 2)) {
+                    light->areaShape = static_cast<scene::AreaShape>(shapeIdx);
+                }
+                
+                if (light->areaShape == scene::AreaShape::Disk) {
+                    ImGui::DragFloat("Radius", &light->areaWidth, 0.1f, 0.01f, 100.0f);
+                } else {
+                    ImGui::DragFloat("Width", &light->areaWidth, 0.1f, 0.01f, 100.0f);
+                    ImGui::DragFloat("Height", &light->areaHeight, 0.1f, 0.01f, 100.0f);
+                }
+            }
+            
+            // Soft shadow controls for non-area lights
+            if (light->type != scene::LightType::Area) {
+                ImGui::DragFloat("Shadow Softness", &light->shadowSoftness, 0.01f, 0.0f, 1.0f, "%.3f");
+                ImGui::SameLine();
+                ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Controls soft shadow radius.\nDirectional: angular radius in radians\nPoint/Spot: physical radius in world units");
+                }
             }
             
             ImGui::Checkbox("Cast Shadows", &light->castShadows);
@@ -2270,6 +2313,24 @@ void EditorUI::DrawRenderPropertiesPanel() {
             if (ImGui::DragFloat("Clamp Indirect", &settings.clampIndirect, 0.1f, 0.0f, 100.0f, settings.clampIndirect == 0 ? "Off" : "%.1f")) {
                 settingsChanged = true;
             }
+        }
+    }
+    
+    // === Environment (HDRI) ===
+    if (currentMode != gfx::RenderMode::Simple) {
+        if (ImGui::CollapsingHeader("Environment")) {
+            if (ImGui::Checkbox("Use Environment Map", &settings.useEnvMap)) {
+                settings.MarkDirty();  // Reset accumulation when env changes
+            }
+            if (ImGui::DragFloat("Env Intensity", &settings.envIntensity, 0.01f, 0.0f, 10.0f, "%.2f")) {
+                settings.MarkDirty();
+            }
+            float rotationDeg = glm::degrees(settings.envRotation);
+            if (ImGui::DragFloat("Env Rotation", &rotationDeg, 1.0f, -180.0f, 180.0f, "%.1f deg")) {
+                settings.envRotation = glm::radians(rotationDeg);
+                settings.MarkDirty();
+            }
+            ImGui::TextDisabled("HDR file loading: TODO");
         }
     }
     

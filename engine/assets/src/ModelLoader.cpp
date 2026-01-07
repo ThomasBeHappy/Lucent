@@ -1,6 +1,11 @@
 #include "lucent/assets/ModelLoader.h"
 #include "lucent/core/Log.h"
 
+#include <stb_image.h>
+
+#include <glm/gtc/quaternion.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
 #define TINYGLTF_IMPLEMENTATION
 #define TINYGLTF_NO_STB_IMAGE        // We already have stb_image in Texture.cpp
 #define TINYGLTF_NO_STB_IMAGE_WRITE
@@ -185,6 +190,86 @@ std::unique_ptr<Model> ModelLoader::LoadGLTF(gfx::Device* device, const std::str
         model->materials.push_back(defaultMat);
     }
     
+    // Load cameras
+    for (size_t i = 0; i < gltfModel.cameras.size(); i++) {
+        const auto& gltfCam = gltfModel.cameras[i];
+        CameraData cam;
+        
+        cam.name = gltfCam.name.empty() ? "Camera_" + std::to_string(i) : gltfCam.name;
+        
+        if (gltfCam.type == "perspective") {
+            cam.perspective = true;
+            cam.fov = static_cast<float>(glm::degrees(gltfCam.perspective.yfov));
+            cam.aspectRatio = static_cast<float>(gltfCam.perspective.aspectRatio);
+            cam.nearClip = static_cast<float>(gltfCam.perspective.znear);
+            cam.farClip = gltfCam.perspective.zfar > 0 ? 
+                          static_cast<float>(gltfCam.perspective.zfar) : 10000.0f;
+        } else {
+            cam.perspective = false;
+            cam.orthoSize = static_cast<float>(gltfCam.orthographic.ymag);
+            cam.nearClip = static_cast<float>(gltfCam.orthographic.znear);
+            cam.farClip = static_cast<float>(gltfCam.orthographic.zfar);
+        }
+        
+        model->cameras.push_back(cam);
+    }
+    
+    // Load lights from KHR_lights_punctual extension
+    if (gltfModel.extensions.find("KHR_lights_punctual") != gltfModel.extensions.end()) {
+        const auto& lightsExt = gltfModel.extensions.at("KHR_lights_punctual");
+        if (lightsExt.Has("lights") && lightsExt.Get("lights").IsArray()) {
+            const auto& lightsArray = lightsExt.Get("lights");
+            for (size_t i = 0; i < lightsArray.ArrayLen(); i++) {
+                const auto& gltfLight = lightsArray.Get(static_cast<int>(i));
+                LightData light;
+                
+                if (gltfLight.Has("name")) {
+                    light.name = gltfLight.Get("name").Get<std::string>();
+                } else {
+                    light.name = "Light_" + std::to_string(i);
+                }
+                
+                std::string type = gltfLight.Get("type").Get<std::string>();
+                if (type == "directional") {
+                    light.type = LightData::Type::Directional;
+                } else if (type == "point") {
+                    light.type = LightData::Type::Point;
+                } else if (type == "spot") {
+                    light.type = LightData::Type::Spot;
+                }
+                
+                if (gltfLight.Has("color") && gltfLight.Get("color").IsArray()) {
+                    const auto& color = gltfLight.Get("color");
+                    light.color = glm::vec3(
+                        static_cast<float>(color.Get(0).Get<double>()),
+                        static_cast<float>(color.Get(1).Get<double>()),
+                        static_cast<float>(color.Get(2).Get<double>())
+                    );
+                }
+                
+                if (gltfLight.Has("intensity")) {
+                    light.intensity = static_cast<float>(gltfLight.Get("intensity").Get<double>());
+                }
+                
+                if (gltfLight.Has("range")) {
+                    light.range = static_cast<float>(gltfLight.Get("range").Get<double>());
+                }
+                
+                if (light.type == LightData::Type::Spot && gltfLight.Has("spot")) {
+                    const auto& spot = gltfLight.Get("spot");
+                    if (spot.Has("innerConeAngle")) {
+                        light.innerAngle = static_cast<float>(spot.Get("innerConeAngle").Get<double>());
+                    }
+                    if (spot.Has("outerConeAngle")) {
+                        light.outerAngle = static_cast<float>(spot.Get("outerConeAngle").Get<double>());
+                    }
+                }
+                
+                model->lights.push_back(light);
+            }
+        }
+    }
+    
     // Load meshes
     for (size_t meshIdx = 0; meshIdx < gltfModel.meshes.size(); meshIdx++) {
         const auto& gltfMesh = gltfModel.meshes[meshIdx];
@@ -344,6 +429,15 @@ std::unique_ptr<Model> ModelLoader::LoadGLTF(gfx::Device* device, const std::str
         
         node.name = gltfNode.name.empty() ? "Node_" + std::to_string(nodeIdx) : gltfNode.name;
         node.meshIndex = gltfNode.mesh;
+        node.cameraIndex = gltfNode.camera;
+        
+        // Check for light extension on this node
+        if (gltfNode.extensions.find("KHR_lights_punctual") != gltfNode.extensions.end()) {
+            const auto& lightExt = gltfNode.extensions.at("KHR_lights_punctual");
+            if (lightExt.Has("light")) {
+                node.lightIndex = lightExt.Get("light").Get<int>();
+            }
+        }
         
         // Build local transform
         if (!gltfNode.matrix.empty()) {
@@ -417,9 +511,9 @@ std::unique_ptr<Model> ModelLoader::LoadGLTF(gfx::Device* device, const std::str
         }
     }
     
-    LUCENT_CORE_INFO("Loaded glTF '{}': {} meshes, {} materials, {} textures, {} nodes",
+    LUCENT_CORE_INFO("Loaded glTF '{}': {} meshes, {} materials, {} textures, {} cameras, {} lights, {} nodes",
         model->name, model->meshes.size(), model->materials.size(), 
-        model->textures.size(), model->nodes.size());
+        model->textures.size(), model->cameras.size(), model->lights.size(), model->nodes.size());
     
     return model;
 }

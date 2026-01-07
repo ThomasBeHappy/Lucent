@@ -2,6 +2,7 @@
 #include "EditorSettings.h"
 #include "lucent/gfx/DebugUtils.h"
 #include "lucent/gfx/VkResultUtils.h"
+#include "lucent/assets/MeshRegistry.h"
 #include "lucent/scene/Components.h"
 #include "lucent/material/MaterialAsset.h"
 #include <GLFW/glfw3.h>
@@ -115,6 +116,9 @@ bool Application::Init(const ApplicationConfig& config) {
     // Initialize scene with demo entities
     InitScene();
     
+    // Initialize environment map (default sky)
+    InitEnvironmentMap();
+    
     // Connect scene and camera to UI
     m_EditorUI.SetScene(&m_Scene);
     m_EditorUI.SetEditorCamera(&m_EditorCamera);
@@ -207,11 +211,17 @@ void Application::RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj) {
         
         if (!renderer.visible) return;
         
-        // Get mesh based on primitive type
-        auto it = m_PrimitiveMeshes.find(renderer.primitiveType);
-        if (it == m_PrimitiveMeshes.end() || !it->second) return;
-        
-        assets::Mesh* mesh = it->second.get();
+        assets::Mesh* mesh = nullptr;
+        if (renderer.primitiveType != scene::MeshRendererComponent::PrimitiveType::None) {
+            auto it = m_PrimitiveMeshes.find(renderer.primitiveType);
+            if (it == m_PrimitiveMeshes.end() || !it->second) return;
+            mesh = it->second.get();
+        } else if (renderer.meshAssetID != UINT32_MAX) {
+            mesh = lucent::assets::MeshRegistry::Get().GetMesh(renderer.meshAssetID);
+            if (!mesh) return;
+        } else {
+            return;
+        }
         
         // Determine pipeline and layout to use
         VkPipeline pipeline = defaultPipeline;
@@ -642,6 +652,12 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
                 
                 gpuLight.position = transform.position;
                 
+                // Area light properties
+                gpuLight.areaWidth = light.areaWidth;
+                gpuLight.areaHeight = light.areaHeight;
+                gpuLight.areaShape = static_cast<uint32_t>(light.areaShape);
+                gpuLight.areaTangent = transform.GetRight();
+                
                 // Use GetForward() for consistent rotation handling
                 glm::vec3 forward = transform.GetForward();
                 
@@ -650,15 +666,24 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
                         gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Directional);
                         // Direction FROM the light (opposite of where it points)
                         gpuLight.direction = -forward;
+                        // Use shadowSoftness as angular radius for directional
+                        gpuLight.areaWidth = light.shadowSoftness;
                         break;
                     case scene::LightType::Point:
                         gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Point);
                         gpuLight.direction = forward;
+                        // Use shadowSoftness as point light radius
+                        gpuLight.areaWidth = light.shadowSoftness;
                         break;
                     case scene::LightType::Spot:
                         gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Spot);
                         // Spot lights point in their forward direction
                         gpuLight.direction = forward;
+                        gpuLight.areaWidth = light.shadowSoftness;
+                        break;
+                    case scene::LightType::Area:
+                        gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Area);
+                        gpuLight.direction = forward;  // Area normal
                         break;
                     default:
                         gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Point);
@@ -923,11 +948,18 @@ void Application::RenderShadowPass(VkCommandBuffer cmd) {
         (void)entity;
         
         if (!renderer.visible || !renderer.castShadows) return;
-        
-        auto it = m_PrimitiveMeshes.find(renderer.primitiveType);
-        if (it == m_PrimitiveMeshes.end() || !it->second) return;
-        
-        assets::Mesh* mesh = it->second.get();
+ 
+        assets::Mesh* mesh = nullptr;
+        if (renderer.primitiveType != scene::MeshRendererComponent::PrimitiveType::None) {
+            auto it = m_PrimitiveMeshes.find(renderer.primitiveType);
+            if (it == m_PrimitiveMeshes.end() || !it->second) return;
+            mesh = it->second.get();
+        } else if (renderer.meshAssetID != UINT32_MAX) {
+            mesh = lucent::assets::MeshRegistry::Get().GetMesh(renderer.meshAssetID);
+            if (!mesh) return;
+        } else {
+            return;
+        }
         
         struct ShadowPushConstants {
             glm::mat4 model;
@@ -967,6 +999,12 @@ void Application::UpdateTracerScene() {
         gpuLight.outerAngle = glm::radians(light.outerAngle);
         gpuLight.position = transform.position;
         
+        // Area light properties
+        gpuLight.areaWidth = light.areaWidth;
+        gpuLight.areaHeight = light.areaHeight;
+        gpuLight.areaShape = static_cast<uint32_t>(light.areaShape);
+        gpuLight.areaTangent = transform.GetRight();
+        
         // Use GetForward() for consistent rotation handling
         glm::vec3 forward = transform.GetForward();
         
@@ -975,18 +1013,21 @@ void Application::UpdateTracerScene() {
                 gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Directional);
                 // Direction FROM the light (opposite of where it points)
                 gpuLight.direction = -forward;
+                gpuLight.areaWidth = light.shadowSoftness;
                 break;
             case scene::LightType::Point:
                 gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Point);
                 gpuLight.direction = forward;
+                gpuLight.areaWidth = light.shadowSoftness;
                 break;
             case scene::LightType::Spot:
                 gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Spot);
                 gpuLight.direction = forward;
+                gpuLight.areaWidth = light.shadowSoftness;
                 break;
             case scene::LightType::Area:
                 gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Area);
-                gpuLight.direction = forward;
+                gpuLight.direction = forward;  // Area normal
                 break;
         }
         
@@ -1009,11 +1050,17 @@ void Application::UpdateTracerScene() {
         
         if (!renderer.visible) return;
         
-        // Find mesh
-        auto it = m_PrimitiveMeshes.find(renderer.primitiveType);
-        if (it == m_PrimitiveMeshes.end() || !it->second) return;
-        
-        assets::Mesh* mesh = it->second.get();
+        assets::Mesh* mesh = nullptr;
+        if (renderer.primitiveType != scene::MeshRendererComponent::PrimitiveType::None) {
+            auto it = m_PrimitiveMeshes.find(renderer.primitiveType);
+            if (it == m_PrimitiveMeshes.end() || !it->second) return;
+            mesh = it->second.get();
+        } else if (renderer.meshAssetID != UINT32_MAX) {
+            mesh = lucent::assets::MeshRegistry::Get().GetMesh(renderer.meshAssetID);
+            if (!mesh) return;
+        } else {
+            return;
+        }
         const auto& vertices = mesh->GetCPUVertices();
         const auto& indices = mesh->GetCPUIndices();
         
@@ -1073,7 +1120,96 @@ void Application::UpdateTracerScene() {
         }
     }
     
+    m_LastTracerLights = lights;
     m_TracerSceneDirty = false;
+}
+
+void Application::UpdateTracerLightsOnly() {
+    if (m_TracerSceneDirty) return; // full update pending
+    gfx::RenderMode mode = m_Renderer.GetRenderMode();
+    if (mode == gfx::RenderMode::Simple) return;
+
+    std::vector<gfx::GPULight> lights;
+
+    auto lightView = m_Scene.GetView<scene::LightComponent, scene::TransformComponent>();
+    lightView.Each([&](scene::Entity entity, scene::LightComponent& light, scene::TransformComponent& transform) {
+        (void)entity;
+
+        gfx::GPULight gpuLight{};
+        gpuLight.color = light.color;
+        gpuLight.intensity = light.intensity;
+        gpuLight.range = light.range;
+        gpuLight.innerAngle = glm::radians(light.innerAngle);
+        gpuLight.outerAngle = glm::radians(light.outerAngle);
+        gpuLight.position = transform.position;
+
+        // Area light properties
+        gpuLight.areaWidth = light.areaWidth;
+        gpuLight.areaHeight = light.areaHeight;
+        gpuLight.areaShape = static_cast<uint32_t>(light.areaShape);
+        gpuLight.areaTangent = transform.GetRight();
+
+        glm::vec3 forward = transform.GetForward();
+        switch (light.type) {
+            case scene::LightType::Directional:
+                gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Directional);
+                gpuLight.direction = -forward;
+                gpuLight.areaWidth = light.shadowSoftness; // angular radius
+                break;
+            case scene::LightType::Point:
+                gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Point);
+                gpuLight.direction = forward;
+                gpuLight.areaWidth = light.shadowSoftness; // radius
+                break;
+            case scene::LightType::Spot:
+                gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Spot);
+                gpuLight.direction = forward;
+                gpuLight.areaWidth = light.shadowSoftness; // radius
+                break;
+            case scene::LightType::Area:
+                gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Area);
+                gpuLight.direction = forward;
+                break;
+        }
+
+        lights.push_back(gpuLight);
+    });
+
+    auto lightsEqual = [&](const std::vector<gfx::GPULight>& a, const std::vector<gfx::GPULight>& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); i++) {
+            const auto& x = a[i];
+            const auto& y = b[i];
+            if (x.type != y.type) return false;
+            if (!NearlyEqualVec3(x.position, y.position, 1e-4f)) return false;
+            if (!NearlyEqualVec3(x.color, y.color, 1e-4f)) return false;
+            if (!NearlyEqual(x.intensity, y.intensity, 1e-4f)) return false;
+            if (!NearlyEqualVec3(x.direction, y.direction, 1e-4f)) return false;
+            if (!NearlyEqual(x.range, y.range, 1e-4f)) return false;
+            if (!NearlyEqual(x.innerAngle, y.innerAngle, 1e-4f)) return false;
+            if (!NearlyEqual(x.outerAngle, y.outerAngle, 1e-4f)) return false;
+            if (!NearlyEqual(x.areaWidth, y.areaWidth, 1e-4f)) return false;
+            if (!NearlyEqual(x.areaHeight, y.areaHeight, 1e-4f)) return false;
+            if (!NearlyEqualVec3(x.areaTangent, y.areaTangent, 1e-4f)) return false;
+            if (x.areaShape != y.areaShape) return false;
+        }
+        return true;
+    };
+
+    if (lightsEqual(lights, m_LastTracerLights)) return;
+
+    m_LastTracerLights = lights;
+    m_Renderer.GetSettings().MarkDirty(); // reset accumulation on light changes
+
+    if (mode == gfx::RenderMode::RayTraced) {
+        if (gfx::TracerRayKHR* rt = m_Renderer.GetTracerRayKHR(); rt && rt->IsSupported()) {
+            rt->UpdateLights(lights);
+        }
+    } else {
+        if (gfx::TracerCompute* compute = m_Renderer.GetTracerCompute()) {
+            compute->UpdateLights(lights);
+        }
+    }
 }
 
 void Application::RenderTracedPath(VkCommandBuffer cmd) {
@@ -1090,6 +1226,8 @@ void Application::RenderTracedPath(VkCommandBuffer cmd) {
     // Check if scene needs to be updated
     if (m_TracerSceneDirty) {
         UpdateTracerScene();
+    } else {
+        UpdateTracerLightsOnly();
     }
     
     // Check if already converged
@@ -1130,6 +1268,8 @@ void Application::RenderRayTracedPath(VkCommandBuffer cmd) {
     // Check if scene needs to be updated
     if (m_TracerSceneDirty) {
         UpdateTracerScene();
+    } else {
+        UpdateTracerLightsOnly();
     }
     
     // Check if already converged
@@ -1154,6 +1294,24 @@ void Application::RenderRayTracedPath(VkCommandBuffer cmd) {
     
     // Increment sample count
     settings.IncrementSamples(1);
+}
+
+void Application::InitEnvironmentMap() {
+    // Create a default procedural sky environment
+    if (!m_EnvironmentMap.CreateDefaultSky(&m_Device)) {
+        LUCENT_CORE_WARN("Failed to create default environment map");
+        return;
+    }
+    
+    // Set the environment map on both tracers
+    if (auto* tracer = m_Renderer.GetTracerCompute()) {
+        tracer->SetEnvironmentMap(&m_EnvironmentMap);
+    }
+    if (auto* tracer = m_Renderer.GetTracerRayKHR()) {
+        tracer->SetEnvironmentMap(&m_EnvironmentMap);
+    }
+    
+    LUCENT_CORE_INFO("Environment map initialized");
 }
 
 } // namespace lucent

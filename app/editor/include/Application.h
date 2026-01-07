@@ -4,11 +4,13 @@
 #include "lucent/gfx/VulkanContext.h"
 #include "lucent/gfx/Device.h"
 #include "lucent/gfx/Renderer.h"
+#include "lucent/gfx/EnvironmentMap.h"
 #include "lucent/scene/Scene.h"
 #include "lucent/scene/EditorCamera.h"
 #include "lucent/assets/Mesh.h"
 #include "EditorUI.h"
 #include <unordered_map>
+#include <vector>
 
 struct GLFWwindow;
 
@@ -99,9 +101,15 @@ private:
     
     // Traced mode support
     void UpdateTracerScene();
+    void UpdateTracerLightsOnly();
     void RenderTracedPath(VkCommandBuffer cmd);
     void RenderRayTracedPath(VkCommandBuffer cmd);
     bool m_TracerSceneDirty = true;
+    std::vector<gfx::GPULight> m_LastTracerLights;
+    
+    // Environment mapping (HDRI)
+    gfx::EnvironmentMap m_EnvironmentMap;
+    void InitEnvironmentMap();
 };
 
 } // namespace lucent

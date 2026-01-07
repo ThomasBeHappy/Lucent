@@ -91,6 +91,7 @@ add_subdirectory(engine/gfx)
 add_subdirectory(engine/scene)
 add_subdirectory(engine/assets)
 add_subdirectory(engine/material)
+add_subdirectory(shaders)
 add_subdirectory(app/editor)
 
 if(LUCENT_BUILD_TESTS)

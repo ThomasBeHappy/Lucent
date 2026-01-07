@@ -14,7 +14,8 @@
         "shaderc",
         "imguizmo",
         "stb",
-        "imgui-node-editor"
+        "imgui-node-editor",
+        "tinygltf"
     ],
     "builtin-baseline": "2c2afe98de8b2824cd22253cfcd44f687252bb84"
 }

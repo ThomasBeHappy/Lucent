@@ -48,12 +48,20 @@ struct GPULight {
     float range;
     float innerAngle;
     float outerAngle;
-    vec2 padding;
+    float areaWidth;     // Area width (rect) or radius (disk); also softness for point/spot/dir
+    float areaHeight;    // Area height (rect only)
+    vec3 areaTangent;    // Area light tangent
+    uint areaShape;      // 0=disk, 1=rect
 };
 
 layout(scalar, set = 0, binding = 8) readonly buffer LightBuffer {
     GPULight lights[];
 };
+
+// Environment map (HDR equirectangular)
+layout(set = 0, binding = 9) uniform sampler2D envMap;
+layout(set = 0, binding = 10) uniform sampler2D envMarginalCDF;
+layout(set = 0, binding = 11) uniform sampler2D envConditionalCDF;
 
 // Push constants
 layout(push_constant) uniform PushConstants {
@@ -61,6 +69,10 @@ layout(push_constant) uniform PushConstants {
     uint sampleIndex;
     uint maxBounces;
     float clampValue;
+    uint lightCount;
+    float envIntensity;
+    float envRotation;
+    uint useEnvMap;
 } pc;
 
 // Light types
@@ -114,6 +126,87 @@ vec3 sampleCone(vec3 axis, float cosMaxAngle, inout uint seed) {
 vec3 randomCosineHemisphere(vec3 normal, inout uint seed) {
     vec3 dir = normalize(normal + randomInUnitSphere(seed));
     return dir;
+}
+
+// Sample HDR environment map (equirectangular projection)
+vec3 sampleEnvironment(vec3 direction) {
+    // Apply rotation around Y axis
+    float c = cos(pc.envRotation);
+    float s = sin(pc.envRotation);
+    vec3 rotDir = vec3(c * direction.x - s * direction.z, direction.y, s * direction.x + c * direction.z);
+    
+    // Equirectangular mapping
+    float u = atan(rotDir.z, rotDir.x) / (2.0 * PI) + 0.5;
+    float v = asin(clamp(rotDir.y, -1.0, 1.0)) / PI + 0.5;
+    
+    if (pc.useEnvMap != 0u) {
+        return texture(envMap, vec2(u, v)).rgb * pc.envIntensity;
+    } else {
+        // Fallback procedural sky
+        float t = 0.5 * (direction.y + 1.0);
+        return mix(vec3(1.0), vec3(0.5, 0.7, 1.0), t) * 0.05;
+    }
+}
+
+// Importance sample environment using pre-computed CDF
+vec3 sampleEnvironmentDirection(inout uint seed, out float pdf) {
+    float u1 = randomFloat(seed);
+    float u2 = randomFloat(seed);
+    
+    if (pc.useEnvMap == 0u) {
+        // Uniform hemisphere sampling fallback
+        float cosTheta = u1;
+        float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+        float phi = 2.0 * PI * u2;
+        pdf = 1.0 / (4.0 * PI);
+        return vec3(cos(phi) * sinTheta, cosTheta, sin(phi) * sinTheta);
+    }
+    
+    // Binary search in marginal CDF to find row (v coordinate)
+    float v = 0.5;
+    ivec2 envSize = textureSize(envMap, 0);
+    
+    // Simple linear search for v (could optimize with binary search)
+    for (int i = 0; i < envSize.y; i++) {
+        float cdfVal = texelFetch(envMarginalCDF, ivec2(i, 0), 0).r;
+        if (u1 <= cdfVal) {
+            float prevCdf = (i > 0) ? texelFetch(envMarginalCDF, ivec2(i - 1, 0), 0).r : 0.0;
+            v = (float(i) + (u1 - prevCdf) / max(cdfVal - prevCdf, 0.0001)) / float(envSize.y);
+            break;
+        }
+    }
+    
+    // Binary search in conditional CDF to find column (u coordinate)
+    int row = int(v * float(envSize.y));
+    row = clamp(row, 0, envSize.y - 1);
+    float u = 0.5;
+    
+    for (int i = 0; i < envSize.x; i++) {
+        float cdfVal = texelFetch(envConditionalCDF, ivec2(i, row), 0).r;
+        if (u2 <= cdfVal) {
+            float prevCdf = (i > 0) ? texelFetch(envConditionalCDF, ivec2(i - 1, row), 0).r : 0.0;
+            u = (float(i) + (u2 - prevCdf) / max(cdfVal - prevCdf, 0.0001)) / float(envSize.x);
+            break;
+        }
+    }
+    
+    // Convert UV to direction (equirectangular)
+    float theta = v * PI;
+    float phi = u * 2.0 * PI - PI;
+    
+    // Apply inverse rotation
+    float c = cos(-pc.envRotation);
+    float s = sin(-pc.envRotation);
+    vec3 dir = vec3(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi));
+    vec3 rotDir = vec3(c * dir.x - s * dir.z, dir.y, s * dir.x + c * dir.z);
+    
+    // Compute PDF (luminance-weighted)
+    vec3 envColor = texture(envMap, vec2(u, v)).rgb;
+    float lum = 0.2126 * envColor.r + 0.7152 * envColor.g + 0.0722 * envColor.b;
+    float sinTheta = sin(theta);
+    pdf = max(lum * float(envSize.x * envSize.y) / (2.0 * PI * PI * max(sinTheta, 0.0001)), 0.0001);
+    
+    return rotDir;
 }
 
 // Ray structure
@@ -248,14 +341,13 @@ PathTraceResult pathTrace(Ray ray, inout uint seed) {
         
         if (!hit.hit) {
             // Sky color (simple gradient)
-            float t = 0.5 * (ray.direction.y + 1.0);
-            // Keep the environment relatively dim so explicit scene lights dominate.
-            vec3 skyColor = mix(vec3(1.0), vec3(0.5, 0.7, 1.0), t) * 0.05;
-            result.radiance += throughput * skyColor;
+            // Sample environment map
+            vec3 envColor = sampleEnvironment(ray.direction);
+            result.radiance += throughput * envColor;
             
-            // For sky hits on first bounce, use sky as albedo
+            // For sky hits on first bounce, use env as albedo
             if (firstHit) {
-                result.albedo = skyColor;
+                result.albedo = envColor;
                 result.normal = -ray.direction;  // Normal pointing back at camera
             }
             break;
@@ -297,12 +389,47 @@ PathTraceResult pathTrace(Ray ray, inout uint seed) {
             vec3 sampledPos = light.position;
             
             if (light.type == LIGHT_DIRECTIONAL) {
-                // Directional light - direction points toward light
-                float cosMax = cos(SUN_ANGULAR_RADIUS);
+                // Directional light - use per-light softness or fallback to default
+                float angularRadius = (light.areaWidth > 0.0) ? light.areaWidth : SUN_ANGULAR_RADIUS;
+                float cosMax = cos(angularRadius);
                 lightDir = sampleCone(light.direction, cosMax, seed);
+            } else if (light.type == LIGHT_AREA) {
+                // Area light - sample a point on the surface
+                vec3 tangent = light.areaTangent;
+                vec3 bitangent = cross(light.direction, tangent);
+                
+                if (light.areaShape == 0u) {
+                    // Disk - sample random point in disk
+                    float r = sqrt(randomFloat(seed)) * light.areaWidth;
+                    float angle = randomFloat(seed) * 2.0 * PI;
+                    sampledPos = light.position + tangent * (r * cos(angle)) + bitangent * (r * sin(angle));
+                } else {
+                    // Rect - sample random point on rectangle
+                    float u = (randomFloat(seed) - 0.5) * light.areaWidth;
+                    float v = (randomFloat(seed) - 0.5) * light.areaHeight;
+                    sampledPos = light.position + tangent * u + bitangent * v;
+                }
+                
+                vec3 toLight = sampledPos - hit.position;
+                lightDist = length(toLight);
+                lightDir = toLight / lightDist;
+                
+                // Check if we're on the lit side of the area light
+                float cosAngle = dot(-lightDir, light.direction);
+                if (cosAngle < 0.0) continue;  // Back side of area light
+                
+                // Distance attenuation with cosine falloff for area lights
+                if (light.range > 0.0) {
+                    attenuation = 1.0 - clamp(lightDist / light.range, 0.0, 1.0);
+                    attenuation *= attenuation;
+                } else {
+                    attenuation = 1.0 / (lightDist * lightDist + 1.0);
+                }
+                attenuation *= cosAngle;  // Cosine falloff from area light normal
             } else if (light.type == LIGHT_POINT || light.type == LIGHT_SPOT) {
-                // Point/Spot light
-                sampledPos = light.position + randomInUnitSphere(seed) * POINT_LIGHT_RADIUS;
+                // Point/Spot light - use per-light softness or fallback to default
+                float softRadius = (light.areaWidth > 0.0) ? light.areaWidth : POINT_LIGHT_RADIUS;
+                sampledPos = light.position + randomInUnitSphere(seed) * softRadius;
                 vec3 toLight = sampledPos - hit.position;
                 lightDist = length(toLight);
                 lightDir = toLight / lightDist;
@@ -340,6 +467,7 @@ PathTraceResult pathTrace(Ray ray, inout uint seed) {
             if (light.type == LIGHT_DIRECTIONAL) {
                 if (shadowHit.hit) continue;
             } else {
+                // Point, spot, and area lights - check if shadow hit is before the light
                 if (shadowHit.hit && shadowHit.t < lightDist - EPSILON) {
                     continue; // In shadow
                 }

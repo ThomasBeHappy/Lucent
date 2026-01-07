@@ -12,6 +12,7 @@ set(ENGINE_GFX_SOURCES
     src/TracerCompute.cpp
     src/TracerRayKHR.cpp
     src/FinalRender.cpp
+    src/EnvironmentMap.cpp
 )
 
 # Add OptiX denoiser if enabled

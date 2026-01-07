@@ -1,5 +1,7 @@
 #include "SceneIO.h"
 #include "lucent/scene/Components.h"
+#include "lucent/assets/ModelLoader.h"
+#include "lucent/assets/MeshRegistry.h"
 #include "lucent/core/Log.h"
 
 #include <fstream>
@@ -232,6 +234,151 @@ bool LoadScene(scene::Scene* scene, const std::string& filepath) {
     file.close();
     LUCENT_CORE_INFO("Scene loaded from: {}", filepath);
     return true;
+}
+
+int ImportGLTF(scene::Scene* scene, gfx::Device* device, const std::string& filepath) {
+    if (!scene || !device) {
+        s_LastError = "Scene or device is null";
+        return -1;
+    }
+    
+    assets::ModelLoader loader;
+    auto model = loader.LoadGLTF(device, filepath);
+    
+    if (!model) {
+        s_LastError = loader.GetLastError();
+        return -1;
+    }
+    
+    int entitiesCreated = 0;
+    
+    // Helper to decompose matrix into TRS
+    auto decomposeMatrix = [](const glm::mat4& m, glm::vec3& pos, glm::vec3& rot, glm::vec3& scale) {
+        pos = glm::vec3(m[3]);
+        
+        scale.x = glm::length(glm::vec3(m[0]));
+        scale.y = glm::length(glm::vec3(m[1]));
+        scale.z = glm::length(glm::vec3(m[2]));
+        
+        glm::mat3 rotMat(
+            glm::vec3(m[0]) / scale.x,
+            glm::vec3(m[1]) / scale.y,
+            glm::vec3(m[2]) / scale.z
+        );
+        
+        // Extract Euler angles (YXZ order to match editor)
+        rot.x = glm::degrees(asin(-rotMat[1][2]));
+        if (cos(glm::radians(rot.x)) > 0.0001f) {
+            rot.y = glm::degrees(atan2(rotMat[0][2], rotMat[2][2]));
+            rot.z = glm::degrees(atan2(rotMat[1][0], rotMat[1][1]));
+        } else {
+            rot.y = glm::degrees(atan2(-rotMat[2][0], rotMat[0][0]));
+            rot.z = 0.0f;
+        }
+    };
+    
+    // Process nodes recursively to compute world transforms
+    std::function<void(uint32_t, const glm::mat4&)> processNode;
+    processNode = [&](uint32_t nodeIdx, const glm::mat4& parentTransform) {
+        if (nodeIdx >= model->nodes.size()) return;
+        
+        const auto& node = model->nodes[nodeIdx];
+        glm::mat4 worldTransform = parentTransform * node.localTransform;
+        
+        glm::vec3 pos, rot, scale;
+        decomposeMatrix(worldTransform, pos, rot, scale);
+        
+        // Create entity for this node if it has content
+        bool hasContent = (node.meshIndex >= 0) || (node.cameraIndex >= 0) || (node.lightIndex >= 0);
+        
+        if (hasContent) {
+            scene::Entity entity = scene->CreateEntity(node.name);
+            auto* transform = entity.GetComponent<scene::TransformComponent>();
+            transform->position = pos;
+            transform->rotation = rot;
+            transform->scale = scale;
+            
+            // Add mesh renderer if this node has a mesh
+            if (node.meshIndex >= 0 && node.meshIndex < static_cast<int>(model->meshes.size())) {
+                // For now, we only set base material properties from the first material
+                // TODO: Support multiple submeshes with different materials
+                auto& meshRenderer = entity.AddComponent<scene::MeshRendererComponent>();
+                meshRenderer.primitiveType = scene::MeshRendererComponent::PrimitiveType::None;
+                
+                // Register mesh in runtime registry and store ID in component
+                if (model->meshes[node.meshIndex]) {
+                    meshRenderer.meshAssetID = assets::MeshRegistry::Get().Register(std::move(model->meshes[node.meshIndex]));
+                }
+                
+                // Get material from first submesh if available
+                const auto* mesh = assets::MeshRegistry::Get().GetMesh(meshRenderer.meshAssetID);
+                if (mesh && !mesh->GetSubmeshes().empty()) {
+                    uint32_t matIdx = mesh->GetSubmeshes()[0].materialIndex;
+                    if (matIdx < model->materials.size()) {
+                        const auto& mat = model->materials[matIdx];
+                        meshRenderer.baseColor = glm::vec3(mat.baseColorFactor);
+                        meshRenderer.metallic = mat.metallicFactor;
+                        meshRenderer.roughness = mat.roughnessFactor;
+                        meshRenderer.emissive = mat.emissiveFactor;
+                        meshRenderer.emissiveIntensity = glm::length(mat.emissiveFactor) > 0.01f ? 1.0f : 0.0f;
+                    }
+                }
+            }
+            
+            // Add camera if this node has one
+            if (node.cameraIndex >= 0 && node.cameraIndex < static_cast<int>(model->cameras.size())) {
+                const auto& camData = model->cameras[node.cameraIndex];
+                auto& cam = entity.AddComponent<scene::CameraComponent>();
+                cam.projectionType = camData.perspective ? 
+                    scene::CameraComponent::ProjectionType::Perspective :
+                    scene::CameraComponent::ProjectionType::Orthographic;
+                cam.fov = camData.fov;
+                cam.orthoSize = camData.orthoSize;
+                cam.nearClip = camData.nearClip;
+                cam.farClip = camData.farClip;
+                cam.primary = false;  // Don't override existing primary camera
+            }
+            
+            // Add light if this node has one
+            if (node.lightIndex >= 0 && node.lightIndex < static_cast<int>(model->lights.size())) {
+                const auto& lightData = model->lights[node.lightIndex];
+                auto& light = entity.AddComponent<scene::LightComponent>();
+                
+                switch (lightData.type) {
+                    case assets::LightData::Type::Directional:
+                        light.type = scene::LightType::Directional;
+                        break;
+                    case assets::LightData::Type::Point:
+                        light.type = scene::LightType::Point;
+                        break;
+                    case assets::LightData::Type::Spot:
+                        light.type = scene::LightType::Spot;
+                        break;
+                }
+                
+                light.color = lightData.color;
+                light.intensity = lightData.intensity;
+                light.range = lightData.range;
+                light.innerAngle = glm::degrees(lightData.innerAngle);
+                light.outerAngle = glm::degrees(lightData.outerAngle);
+            }
+            
+            entitiesCreated++;
+        }
+        
+        // Process children
+        for (uint32_t childIdx : node.children) {
+            processNode(childIdx, worldTransform);
+        }
+    };
+    
+    // Process all root nodes
+    for (uint32_t rootIdx : model->rootNodes) {
+        processNode(rootIdx, glm::mat4(1.0f));
+    }
+    
+    LUCENT_CORE_INFO("Imported {} entities from glTF: {}", entitiesCreated, filepath);
+    return entitiesCreated;
 }
 
 } // namespace SceneIO

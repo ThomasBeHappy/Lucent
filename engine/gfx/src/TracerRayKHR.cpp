@@ -36,13 +36,14 @@ bool TracerRayKHR::Init(VulkanContext* context, Device* device) {
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },  // accumImage + albedoImage + normalImage
         // vertices, indices, materials, primitiveMaterialIds, lights
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 },
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 }  // env map + marginal CDF + conditional CDF
     };
     
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.maxSets = 1;
-    poolInfo.poolSizeCount = 4;
+    poolInfo.poolSizeCount = 5;
     poolInfo.pPoolSizes = poolSizes;
     
     if (vkCreateDescriptorPool(context->GetDevice(), &poolInfo, nullptr, &m_DescriptorPool) != VK_SUCCESS) {
@@ -61,12 +62,15 @@ bool TracerRayKHR::Init(VulkanContext* context, Device* device) {
         { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }, // per-primitive material ids
         { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr },  // albedoImage
         { 8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr },  // normalImage
-        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }  // lights
+        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr },  // lights
+        { 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR, nullptr },  // envMap
+        { 11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR, nullptr },  // envMarginalCDF
+        { 12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR, nullptr }   // envConditionalCDF
     };
     
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 10;
+    layoutInfo.bindingCount = 13;
     layoutInfo.pBindings = bindings;
     
     if (vkCreateDescriptorSetLayout(context->GetDevice(), &layoutInfo, nullptr, &m_DescriptorLayout) != VK_SUCCESS) {
@@ -207,7 +211,7 @@ bool TracerRayKHR::CreateRayTracingPipeline() {
     
     // Create pipeline layout
     VkPushConstantRange pushConstant{};
-    pushConstant.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+    pushConstant.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
     pushConstant.offset = 0;
     pushConstant.size = sizeof(RTPushConstants);
     
@@ -858,6 +862,43 @@ void TracerRayKHR::UpdateScene(const std::vector<BVHBuilder::Triangle>& triangle
     LUCENT_CORE_INFO("TracerRayKHR: Scene updated with {} lights", m_LightCount);
 }
 
+void TracerRayKHR::UpdateLights(const std::vector<GPULight>& lights) {
+    if (!m_Supported) return;
+    if (!m_Ready) return;
+
+    size_t lightCount = std::max(lights.size(), size_t(1));
+    size_t lightSize = lightCount * sizeof(GPULight);
+
+    if (m_LightBuffer.GetHandle() == VK_NULL_HANDLE || m_LightBuffer.GetSize() != lightSize) {
+        m_LightBuffer.Shutdown();
+        BufferDesc lightDesc{};
+        lightDesc.size = lightSize;
+        lightDesc.usage = BufferUsage::Storage;
+        lightDesc.hostVisible = true;
+        lightDesc.debugName = "RTLights";
+        m_LightBuffer.Init(m_Device, lightDesc);
+        m_DescriptorsDirty = true; // buffer handle/size changed
+    }
+
+    if (!lights.empty()) {
+        m_LightBuffer.Upload(lights.data(), lights.size() * sizeof(GPULight));
+        m_LightCount = static_cast<uint32_t>(lights.size());
+    } else {
+        // Default directional light (sun)
+        GPULight defaultLight{};
+        defaultLight.position = glm::vec3(0.0f);
+        defaultLight.type = static_cast<uint32_t>(GPULightType::Directional);
+        defaultLight.color = glm::vec3(1.0f, 0.98f, 0.95f);
+        defaultLight.intensity = 2.5f;
+        defaultLight.direction = glm::normalize(glm::vec3(1.0f, 1.0f, 0.5f));
+        defaultLight.range = 0.0f;
+        m_LightBuffer.Upload(&defaultLight, sizeof(GPULight));
+        m_LightCount = 1;
+    }
+
+    m_DescriptorsDirty = true;
+}
+
 void TracerRayKHR::Trace(VkCommandBuffer cmd,
                           const GPUCamera& camera,
                           const RenderSettings& settings,
@@ -927,7 +968,26 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
         lightInfo.offset = 0;
         lightInfo.range = m_LightBuffer.GetSize();
 
-        VkWriteDescriptorSet writes[10] = {};
+        // Environment map textures
+        VkDescriptorImageInfo envMapInfo{};
+        VkDescriptorImageInfo envMarginalInfo{};
+        VkDescriptorImageInfo envConditionalInfo{};
+        
+        if (m_EnvMap && m_EnvMap->IsLoaded()) {
+            envMapInfo.sampler = m_EnvMap->GetSampler();
+            envMapInfo.imageView = m_EnvMap->GetEnvView();
+            envMapInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            
+            envMarginalInfo.sampler = m_EnvMap->GetSampler();
+            envMarginalInfo.imageView = m_EnvMap->GetMarginalCDFView();
+            envMarginalInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            
+            envConditionalInfo.sampler = m_EnvMap->GetSampler();
+            envConditionalInfo.imageView = m_EnvMap->GetConditionalCDFView();
+            envConditionalInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+
+        VkWriteDescriptorSet writes[13] = {};
 
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].pNext = &asWrite;
@@ -999,7 +1059,35 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
         writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[9].pBufferInfo = &lightInfo;
 
-        vkUpdateDescriptorSets(device, 10, writes, 0, nullptr);
+        uint32_t writeCount = 10;
+        
+        // Environment map writes - only add if we have valid views
+        if (m_EnvMap && m_EnvMap->IsLoaded()) {
+            writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[10].dstSet = m_DescriptorSet;
+            writes[10].dstBinding = 10;
+            writes[10].descriptorCount = 1;
+            writes[10].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[10].pImageInfo = &envMapInfo;
+            
+            writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[11].dstSet = m_DescriptorSet;
+            writes[11].dstBinding = 11;
+            writes[11].descriptorCount = 1;
+            writes[11].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[11].pImageInfo = &envMarginalInfo;
+            
+            writes[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[12].dstSet = m_DescriptorSet;
+            writes[12].dstBinding = 12;
+            writes[12].descriptorCount = 1;
+            writes[12].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[12].pImageInfo = &envConditionalInfo;
+            
+            writeCount = 13;
+        }
+
+        vkUpdateDescriptorSets(device, writeCount, writes, 0, nullptr);
         m_DescriptorsDirty = false;
     }
     
@@ -1014,9 +1102,13 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
     pc.sampleIndex = settings.accumulatedSamples;
     pc.maxBounces = settings.maxBounces;
     pc.clampValue = settings.clampIndirect;
+    pc.lightCount = m_LightCount;
+    pc.envIntensity = settings.envIntensity;
+    pc.envRotation = settings.envRotation;
+    pc.useEnvMap = (m_EnvMap && m_EnvMap->IsLoaded() && settings.useEnvMap) ? 1 : 0;
     
     vkCmdPushConstants(cmd, m_PipelineLayout, 
-                        VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,
+                        VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR,
                         0, sizeof(RTPushConstants), &pc);
     
     // Trace rays
@@ -1066,6 +1158,11 @@ void TracerRayKHR::ResetAccumulation() {
     }
     
     LUCENT_CORE_DEBUG("TracerRayKHR: Accumulation reset");
+}
+
+void TracerRayKHR::SetEnvironmentMap(EnvironmentMap* envMap) {
+    m_EnvMap = envMap;
+    m_DescriptorsDirty = true;
 }
 
 } // namespace lucent::gfx

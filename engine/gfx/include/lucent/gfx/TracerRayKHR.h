@@ -6,6 +6,7 @@
 #include "lucent/gfx/Image.h"
 #include "lucent/gfx/RenderSettings.h"
 #include "lucent/gfx/TracerCompute.h" // Reuse GPUCamera, GPUMaterial
+#include "lucent/gfx/EnvironmentMap.h"
 #include <glm/glm.hpp>
 #include <vector>
 #include <memory>
@@ -62,6 +63,10 @@ struct RTPushConstants {
     uint32_t sampleIndex;
     uint32_t maxBounces;
     float clampValue;
+    uint32_t lightCount;
+    float envIntensity;
+    float envRotation;
+    uint32_t useEnvMap;
 };
 
 // Vulkan KHR ray tracing based path tracer
@@ -80,6 +85,12 @@ public:
     void UpdateScene(const std::vector<BVHBuilder::Triangle>& triangles,
                      const std::vector<GPUMaterial>& materials,
                      const std::vector<GPULight>& lights = {});
+    
+    // Set environment map for IBL
+    void SetEnvironmentMap(EnvironmentMap* envMap);
+
+    // Update only light data (no BLAS/TLAS rebuild)
+    void UpdateLights(const std::vector<GPULight>& lights = {});
     
     // Trace rays for one sample
     void Trace(VkCommandBuffer cmd,
@@ -139,6 +150,9 @@ private:
     Buffer m_LightBuffer;
     uint32_t m_TriangleCount = 0;
     uint32_t m_LightCount = 0;
+    
+    // Environment map
+    EnvironmentMap* m_EnvMap = nullptr;
     
     // Ray tracing pipeline
     VkDescriptorSetLayout m_DescriptorLayout = VK_NULL_HANDLE;

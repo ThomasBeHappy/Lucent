@@ -23,7 +23,10 @@ struct GPULight {
     float range;
     float innerAngle;
     float outerAngle;
-    vec2 padding;
+    float areaWidth;     // Area width (rect) or radius (disk); also softness for point/spot/dir
+    float areaHeight;    // Area height (rect only)
+    vec3 areaTangent;    // Area light tangent
+    uint areaShape;      // 0=disk, 1=rect
 };
 
 layout(scalar, set = 0, binding = 1) readonly buffer LightBuffer {

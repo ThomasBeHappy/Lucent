@@ -90,6 +90,12 @@ enum class LightType {
     Area
 };
 
+// Area light shapes
+enum class AreaShape {
+    Disk,
+    Rect
+};
+
 // Light component
 struct LightComponent {
     LightType type = LightType::Point;
@@ -104,7 +110,12 @@ struct LightComponent {
     float outerAngle = 45.0f; // degrees
     
     // Area light properties
-    glm::vec2 areaSize = glm::vec2(1.0f);
+    AreaShape areaShape = AreaShape::Rect;
+    float areaWidth = 1.0f;   // Width for rect, radius for disk
+    float areaHeight = 1.0f;  // Height for rect (ignored for disk)
+    
+    // Soft shadow radius (for point/spot/directional)
+    float shadowSoftness = 0.0f;
     
     // Shadows
     bool castShadows = true;

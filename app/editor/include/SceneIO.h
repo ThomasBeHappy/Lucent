@@ -1,6 +1,7 @@
 #pragma once
 
 #include "lucent/scene/Scene.h"
+#include "lucent/gfx/Device.h"
 #include <string>
 
 namespace lucent {
@@ -26,6 +27,10 @@ bool SaveScene(scene::Scene* scene, const std::string& filepath);
 // Load scene from file
 // Returns true on success (scene is cleared first)
 bool LoadScene(scene::Scene* scene, const std::string& filepath);
+
+// Import glTF/GLB model into existing scene (adds entities, does not clear)
+// Returns number of entities created, or -1 on error
+int ImportGLTF(scene::Scene* scene, gfx::Device* device, const std::string& filepath);
 
 // Get last error message
 const std::string& GetLastError();

@@ -29,12 +29,20 @@ struct GPULight {
     float range;
     float innerAngle;
     float outerAngle;
-    vec2 padding;
+    float areaWidth;     // Area width (rect) or radius (disk); also softness for point/spot/dir
+    float areaHeight;    // Area height (rect only)
+    vec3 areaTangent;    // Area light tangent
+    uint areaShape;      // 0=disk, 1=rect
 };
 
 layout(scalar, set = 0, binding = 9) readonly buffer LightBuffer {
     GPULight lights[];
 };
+
+// Environment map (HDR equirectangular)
+layout(set = 0, binding = 10) uniform sampler2D envMap;
+layout(set = 0, binding = 11) uniform sampler2D envMarginalCDF;
+layout(set = 0, binding = 12) uniform sampler2D envConditionalCDF;
 
 // Light types
 const uint LIGHT_DIRECTIONAL = 0u;
@@ -47,6 +55,10 @@ layout(push_constant) uniform PushConstants {
     uint sampleIndex;
     uint maxBounces;
     float clampValue;
+    uint lightCount;
+    float envIntensity;
+    float envRotation;
+    uint useEnvMap;
 } pc;
 
 // Ray payload: carries radiance, throughput, hit info for multi-bounce
@@ -112,14 +124,32 @@ vec3 sampleCone(vec3 axis, float cosMaxAngle, inout uint seed) {
     return normalize(u * (cos(phi) * sinTheta) + v * (sin(phi) * sinTheta) + w * cosTheta);
 }
 
-// Sky color (simple gradient)
+// Sample HDR environment map (equirectangular projection)
+vec3 sampleEnvironment(vec3 direction) {
+    // Apply rotation around Y axis
+    float c = cos(pc.envRotation);
+    float s = sin(pc.envRotation);
+    vec3 rotDir = vec3(c * direction.x - s * direction.z, direction.y, s * direction.x + c * direction.z);
+    
+    // Equirectangular mapping
+    float u = atan(rotDir.z, rotDir.x) / (2.0 * PI) + 0.5;
+    float v = asin(clamp(rotDir.y, -1.0, 1.0)) / PI + 0.5;
+    
+    if (pc.useEnvMap != 0u) {
+        return texture(envMap, vec2(u, v)).rgb * pc.envIntensity;
+    } else {
+        // Fallback procedural sky
+        float t = 0.5 * (direction.y + 1.0);
+        return mix(vec3(1.0), vec3(0.5, 0.7, 1.0), t) * 0.05;
+    }
+}
+
+// Sky color - wrapper for environment sampling with sun disc
 vec3 getSkyColor(vec3 direction) {
-    float t = 0.5 * (direction.y + 1.0);
-    // Keep the environment relatively dim so explicit scene lights dominate (otherwise light direction changes are hard to notice).
-    vec3 skyColor = mix(vec3(1.0), vec3(0.5, 0.7, 1.0), t) * 0.05;
+    vec3 skyColor = sampleEnvironment(direction);
     
     // Add sun disc for any directional lights
-    uint numLights = lights.length();
+    uint numLights = pc.lightCount;
     for (uint i = 0; i < numLights; i++) {
         if (lights[i].type == LIGHT_DIRECTIONAL) {
             float sunDot = dot(direction, lights[i].direction);
@@ -233,12 +263,47 @@ void main() {
             vec3 sampledPos = light.position;
             
             if (light.type == LIGHT_DIRECTIONAL) {
-                // Soft sun: jitter direction within a small cone
-                float cosMax = cos(SUN_ANGULAR_RADIUS);
+                // Soft sun: use per-light softness or fallback to default
+                float angularRadius = (light.areaWidth > 0.0) ? light.areaWidth : SUN_ANGULAR_RADIUS;
+                float cosMax = cos(angularRadius);
                 lightDir = sampleCone(light.direction, cosMax, seed);
+            } else if (light.type == LIGHT_AREA) {
+                // Area light - sample a point on the surface
+                vec3 tangent = light.areaTangent;
+                vec3 bitangent = cross(light.direction, tangent);
+                
+                if (light.areaShape == 0u) {
+                    // Disk - sample random point in disk
+                    float r = sqrt(randomFloat(seed)) * light.areaWidth;
+                    float angle = randomFloat(seed) * 2.0 * PI;
+                    sampledPos = light.position + tangent * (r * cos(angle)) + bitangent * (r * sin(angle));
+                } else {
+                    // Rect - sample random point on rectangle
+                    float u = (randomFloat(seed) - 0.5) * light.areaWidth;
+                    float v = (randomFloat(seed) - 0.5) * light.areaHeight;
+                    sampledPos = light.position + tangent * u + bitangent * v;
+                }
+                
+                vec3 toLight = sampledPos - payload.hitPos;
+                lightDist = length(toLight);
+                lightDir = toLight / lightDist;
+                
+                // Check if we're on the lit side of the area light
+                float cosAngle = dot(-lightDir, light.direction);
+                if (cosAngle < 0.0) continue;  // Back side of area light
+                
+                // Distance attenuation with cosine falloff
+                if (light.range > 0.0) {
+                    attenuation = 1.0 - clamp(lightDist / light.range, 0.0, 1.0);
+                    attenuation *= attenuation;
+                } else {
+                    attenuation = 1.0 / (lightDist * lightDist + 1.0);
+                }
+                attenuation *= cosAngle;  // Cosine falloff from area light normal
             } else if (light.type == LIGHT_POINT || light.type == LIGHT_SPOT) {
-                // Soft point/spot: treat as a small sphere light around its position
-                sampledPos = light.position + randomInUnitSphere(seed) * POINT_LIGHT_RADIUS;
+                // Soft point/spot: use per-light softness or fallback to default
+                float softRadius = (light.areaWidth > 0.0) ? light.areaWidth : POINT_LIGHT_RADIUS;
+                sampledPos = light.position + randomInUnitSphere(seed) * softRadius;
                 vec3 toLight = sampledPos - payload.hitPos;
                 lightDist = length(toLight);
                 lightDir = toLight / lightDist;
@@ -267,17 +332,10 @@ void main() {
             float NdotL = max(dot(payload.hitNormal, lightDir), 0.0);
             if (NdotL <= 0.0 || attenuation <= 0.0) continue;
             
-            // Shadow ray
+            // Shadow ray - use infinite distance for directional, light distance for others
             float shadowTMax = (light.type == LIGHT_DIRECTIONAL) ? MAX_DIST : max(lightDist - 0.01, 0.01);
             float visibility = traceShadow(shadowOrigin, lightDir, shadowTMax);
             if (visibility <= 0.0) continue;
-            
-            // Check if shadow ray hits something before the light
-            // (For point/spot lights - directional lights have infinite distance)
-            if (light.type != LIGHT_DIRECTIONAL) {
-                // We need to test if occluder is closer than light
-                // For now, we use the simple visibility check
-            }
             
             vec3 diffuseColor = payload.albedo * (1.0 - payload.metallic);
             vec3 directLight = diffuseColor * light.color * light.intensity * NdotL * attenuation * visibility / PI;

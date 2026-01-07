@@ -64,6 +64,11 @@ struct RenderSettings {
     float clampDirect = 0.0f;           // Clamp direct lighting (0 = no clamp)
     float clampIndirect = 10.0f;        // Clamp indirect lighting
     
+    // === Environment ===
+    float envIntensity = 1.0f;          // Environment map intensity multiplier
+    float envRotation = 0.0f;           // Environment rotation around Y (radians)
+    bool useEnvMap = true;              // Use environment map for background/lighting
+    
     // === Film / Color ===
     float exposure = 1.0f;
     TonemapOperator tonemapOperator = TonemapOperator::ACES;
