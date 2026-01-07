@@ -1,0 +1,21 @@
+{
+    "name": "lucent",
+    "version": "0.1.0",
+    "description": "Blender-like 3D editor with Vulkan RT path tracer",
+    "dependencies": [
+        "vulkan",
+        "glfw3",
+        "glm",
+        {
+            "name": "imgui",
+            "features": ["glfw-binding", "vulkan-binding", "docking-experimental"]
+        },
+        "spdlog",
+        "shaderc",
+        "imguizmo",
+        "stb",
+        "imgui-node-editor"
+    ],
+    "builtin-baseline": "2c2afe98de8b2824cd22253cfcd44f687252bb84"
+}
+

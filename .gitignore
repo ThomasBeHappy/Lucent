@@ -1,0 +1,41 @@
+# Build directories
+build/
+install/
+out/
+cmake-build-*/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# vcpkg
+vcpkg_installed/
+
+# Compiled shaders
+*.spv
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+
+# Binaries
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# Compiled Object files
+*.o
+*.obj
+
+# Cursor
+.cursor/
+
