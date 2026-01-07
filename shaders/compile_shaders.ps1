@@ -33,7 +33,7 @@ foreach ($ext in $extensions) {
         $outputFile = Join-Path $outputDir "$($shader.Name).spv"
         Write-Host "Compiling $($shader.Name)..."
         
-        & $glslc -o $outputFile $shader.FullName --target-env=vulkan1.3 -g
+        & $glslc -o $outputFile $shader.FullName --target-env=vulkan1.2 -g
         
         if ($LASTEXITCODE -eq 0) {
             $compiled++

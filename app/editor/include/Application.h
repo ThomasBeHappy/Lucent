@@ -87,8 +87,15 @@ private:
     // Primitive meshes
     std::unordered_map<scene::MeshRendererComponent::PrimitiveType, std::unique_ptr<assets::Mesh>> m_PrimitiveMeshes;
     
+    // Shadow mapping
+    bool m_ShadowsEnabled = true;
+    float m_ShadowBias = 0.005f;
+    glm::mat4 m_LightViewProj{1.0f};
+    
     void CreatePrimitiveMeshes();
     void RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj);
+    void UpdateLightMatrix();
+    void RenderShadowPass(VkCommandBuffer cmd);
 };
 
 } // namespace lucent

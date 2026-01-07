@@ -141,6 +141,11 @@ void Application::RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj) {
         defaultPipeline = m_Renderer.GetMeshWireframePipeline();
     }
     
+    // Bind shadow map descriptor set (set 0)
+    VkDescriptorSet shadowSet = m_Renderer.GetShadowDescriptorSet();
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, defaultLayout, 
+        0, 1, &shadowSet, 0, nullptr);
+    
     // Get camera position for specular calculations
     glm::vec3 camPos = m_EditorCamera.GetPosition();
     
@@ -186,17 +191,19 @@ void Application::RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj) {
             glm::mat4 model;
             glm::mat4 viewProj;
             glm::vec4 baseColor;       // RGB + alpha
-            glm::vec4 materialParams;  // metallic, roughness, emissiveIntensity, unused
-            glm::vec4 emissive;        // RGB + unused
+            glm::vec4 materialParams;  // metallic, roughness, emissiveIntensity, shadowBias
+            glm::vec4 emissive;        // RGB + shadowEnabled
             glm::vec4 cameraPos;       // Camera world position
+            glm::mat4 lightViewProj;   // Light space matrix for shadows
         } pc;
         
         pc.model = transform.GetLocalMatrix();
         pc.viewProj = viewProj;
         pc.baseColor = glm::vec4(renderer.baseColor, 1.0f);
-        pc.materialParams = glm::vec4(renderer.metallic, renderer.roughness, renderer.emissiveIntensity, 0.0f);
-        pc.emissive = glm::vec4(renderer.emissive, 0.0f);
+        pc.materialParams = glm::vec4(renderer.metallic, renderer.roughness, renderer.emissiveIntensity, m_ShadowBias);
+        pc.emissive = glm::vec4(renderer.emissive, m_ShadowsEnabled ? 1.0f : 0.0f);
         pc.cameraPos = glm::vec4(camPos, 0.0f);
+        pc.lightViewProj = m_LightViewProj;
         
         vkCmdPushConstants(cmd, currentLayout, 
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &pc);
@@ -395,6 +402,12 @@ bool Application::InitWindow(const ApplicationConfig& config) {
 }
 
 void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
+    // Update light matrix for shadow mapping
+    UpdateLightMatrix();
+    
+    // Render shadow pass first
+    RenderShadowPass(cmd);
+    
     gfx::Image* offscreen = m_Renderer.GetOffscreenImage();
     
     VkExtent2D extent = { offscreen->GetWidth(), offscreen->GetHeight() };
@@ -595,6 +608,77 @@ void Application::ScrollCallback(GLFWwindow* window, double xoffset, double yoff
     if (app->m_EditorUI.IsViewportHovered()) {
         app->m_EditorCamera.OnMouseScroll(static_cast<float>(yoffset));
     }
+}
+
+void Application::UpdateLightMatrix() {
+    // Find directional light in scene
+    glm::vec3 lightDir = glm::normalize(glm::vec3(1.0f, 1.0f, 0.5f)); // Default
+    
+    auto lightEntities = m_Scene.GetView<scene::LightComponent, scene::TransformComponent>();
+    lightEntities.Each([&](scene::Entity entity, scene::LightComponent& light, scene::TransformComponent& transform) {
+        (void)entity;
+        if (light.type == scene::LightType::Directional) {
+            // Get light direction from rotation
+            glm::mat4 rotMat = glm::mat4(1.0f);
+            rotMat = glm::rotate(rotMat, glm::radians(transform.rotation.x), glm::vec3(1, 0, 0));
+            rotMat = glm::rotate(rotMat, glm::radians(transform.rotation.y), glm::vec3(0, 1, 0));
+            rotMat = glm::rotate(rotMat, glm::radians(transform.rotation.z), glm::vec3(0, 0, 1));
+            lightDir = -glm::normalize(glm::vec3(rotMat * glm::vec4(0, 0, -1, 0)));
+        }
+    });
+    
+    // Calculate light space matrix for orthographic shadow projection
+    // The light "looks at" the scene from a distance
+    float shadowDistance = 30.0f;
+    float shadowSize = 20.0f;
+    
+    glm::vec3 lightPos = -lightDir * shadowDistance;
+    glm::mat4 lightViewMat = glm::lookAt(lightPos, glm::vec3(0.0f), glm::vec3(0, 1, 0));
+    glm::mat4 lightProj = glm::ortho(-shadowSize, shadowSize, -shadowSize, shadowSize, 0.1f, shadowDistance * 2.0f);
+    
+    m_LightViewProj = lightProj * lightViewMat;
+}
+
+void Application::RenderShadowPass(VkCommandBuffer cmd) {
+    if (!m_ShadowsEnabled) return;
+    
+    LUCENT_GPU_SCOPE(cmd, "ShadowPass");
+    
+    // Begin shadow render pass
+    m_Renderer.BeginShadowPass(cmd);
+    
+    // Bind shadow pipeline
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Renderer.GetShadowPipeline());
+    
+    // Render all meshes to shadow map
+    auto view = m_Scene.GetView<scene::MeshRendererComponent, scene::TransformComponent>();
+    view.Each([&](scene::Entity entity, scene::MeshRendererComponent& renderer, scene::TransformComponent& transform) {
+        (void)entity;
+        
+        if (!renderer.visible || !renderer.castShadows) return;
+        
+        auto it = m_PrimitiveMeshes.find(renderer.primitiveType);
+        if (it == m_PrimitiveMeshes.end() || !it->second) return;
+        
+        assets::Mesh* mesh = it->second.get();
+        
+        struct ShadowPushConstants {
+            glm::mat4 model;
+            glm::mat4 lightViewProj;
+        } pc;
+        
+        pc.model = transform.GetLocalMatrix();
+        pc.lightViewProj = m_LightViewProj;
+        
+        vkCmdPushConstants(cmd, m_Renderer.GetShadowPipelineLayout(), 
+            VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ShadowPushConstants), &pc);
+        
+        mesh->Bind(cmd);
+        mesh->Draw(cmd);
+    });
+    
+    // End shadow render pass
+    m_Renderer.EndShadowPass(cmd);
 }
 
 } // namespace lucent

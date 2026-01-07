@@ -69,6 +69,11 @@ public:
     VkPipeline GetSkyboxPipeline() const { return m_SkyboxPipeline; }
     VkPipelineLayout GetSkyboxPipelineLayout() const { return m_SkyboxPipelineLayout; }
     
+    // Post-processing
+    VkPipeline GetPostFXPipeline() const { return m_PostFXPipeline; }
+    VkPipelineLayout GetPostFXPipelineLayout() const { return m_PostFXPipelineLayout; }
+    VkDescriptorSet GetPostFXDescriptorSet() const { return m_PostFXDescriptorSet; }
+    
     // Render pass abstraction - works with both Vulkan 1.3 and 1.1/1.2
     void BeginOffscreenPass(VkCommandBuffer cmd, const glm::vec4& clearColor = glm::vec4(0.02f, 0.02f, 0.03f, 1.0f));
     void EndOffscreenPass(VkCommandBuffer cmd);
@@ -146,6 +151,7 @@ private:
     VkShaderModule m_GridFragShader = VK_NULL_HANDLE;
     
     // Mesh pipeline
+    VkDescriptorSetLayout m_MeshDescriptorLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_MeshPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_MeshPipeline = VK_NULL_HANDLE;
     VkPipeline m_MeshWireframePipeline = VK_NULL_HANDLE;
@@ -157,6 +163,14 @@ private:
     VkPipeline m_SkyboxPipeline = VK_NULL_HANDLE;
     VkShaderModule m_SkyboxVertShader = VK_NULL_HANDLE;
     VkShaderModule m_SkyboxFragShader = VK_NULL_HANDLE;
+    
+    // PostFX pipeline
+    VkDescriptorSetLayout m_PostFXDescriptorLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_PostFXDescriptorSet = VK_NULL_HANDLE;
+    VkPipelineLayout m_PostFXPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_PostFXPipeline = VK_NULL_HANDLE;
+    VkShaderModule m_PostFXVertShader = VK_NULL_HANDLE;
+    VkShaderModule m_PostFXFragShader = VK_NULL_HANDLE;
     
     // Descriptor allocator
     DescriptorAllocator m_DescriptorAllocator;
@@ -187,7 +201,7 @@ private:
     VkPipeline m_ShadowPipeline = VK_NULL_HANDLE;
     VkPipelineLayout m_ShadowPipelineLayout = VK_NULL_HANDLE;
     VkShaderModule m_ShadowVertShader = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_ShadowDescriptorLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_ShadowDescriptorLayout = VK_NULL_HANDLE; // Points to m_MeshDescriptorLayout
     VkDescriptorSet m_ShadowDescriptorSet = VK_NULL_HANDLE;
 };
 

@@ -392,15 +392,34 @@ bool Renderer::CreatePipelines() {
         return false;
     }
     
-    // Create mesh pipeline layout with push constants for model + viewProj matrices
-    // Push constants: 2 mat4 + 4 vec4 = 192 bytes
+    // Create mesh pipeline layout with push constants for model + viewProj + lightVP matrices
+    // Push constants: 3 mat4 + 4 vec4 = 256 bytes
     VkPushConstantRange meshPushConstant{};
     meshPushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     meshPushConstant.offset = 0;
-    meshPushConstant.size = sizeof(float) * 48; // 2 mat4 + 4 vec4 = 192 bytes
+    meshPushConstant.size = sizeof(float) * 64; // 3 mat4 + 4 vec4 = 256 bytes
+    
+    // Create descriptor set layout for shadow map (set 0, binding 0)
+    VkDescriptorSetLayoutBinding shadowBinding{};
+    shadowBinding.binding = 0;
+    shadowBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    shadowBinding.descriptorCount = 1;
+    shadowBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    
+    VkDescriptorSetLayoutCreateInfo shadowLayoutInfo{};
+    shadowLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    shadowLayoutInfo.bindingCount = 1;
+    shadowLayoutInfo.pBindings = &shadowBinding;
+    
+    if (vkCreateDescriptorSetLayout(device, &shadowLayoutInfo, nullptr, &m_MeshDescriptorLayout) != VK_SUCCESS) {
+        LUCENT_CORE_ERROR("Failed to create mesh descriptor layout");
+        return false;
+    }
     
     VkPipelineLayoutCreateInfo meshLayoutInfo{};
     meshLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    meshLayoutInfo.setLayoutCount = 1;
+    meshLayoutInfo.pSetLayouts = &m_MeshDescriptorLayout;
     meshLayoutInfo.pushConstantRangeCount = 1;
     meshLayoutInfo.pPushConstantRanges = &meshPushConstant;
     
@@ -547,6 +566,57 @@ bool Renderer::CreatePipelines() {
     writer.WriteImage(0, m_OffscreenColor.GetView(), m_OffscreenSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     writer.UpdateSet(device, m_CompositeDescriptorSet);
     
+    // Create PostFX pipeline
+    m_PostFXVertShader = PipelineBuilder::LoadShaderModule(device, "shaders/postfx.vert.spv");
+    m_PostFXFragShader = PipelineBuilder::LoadShaderModule(device, "shaders/postfx.frag.spv");
+    
+    if (!m_PostFXVertShader || !m_PostFXFragShader) {
+        LUCENT_CORE_WARN("PostFX shaders not found, post-processing disabled");
+    } else {
+        // PostFX descriptor layout (same as composite - just samples HDR image)
+        DescriptorLayoutBuilder postfxLayoutBuilder;
+        postfxLayoutBuilder.AddBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT);
+        m_PostFXDescriptorLayout = postfxLayoutBuilder.Build(device);
+        
+        // PostFX pipeline layout with push constants for settings
+        VkPushConstantRange postfxPushConstant{};
+        postfxPushConstant.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        postfxPushConstant.offset = 0;
+        postfxPushConstant.size = sizeof(float) * 4; // exposure, tonemapMode, gamma, unused
+        
+        VkPipelineLayoutCreateInfo postfxLayoutInfo{};
+        postfxLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        postfxLayoutInfo.setLayoutCount = 1;
+        postfxLayoutInfo.pSetLayouts = &m_PostFXDescriptorLayout;
+        postfxLayoutInfo.pushConstantRangeCount = 1;
+        postfxLayoutInfo.pPushConstantRanges = &postfxPushConstant;
+        
+        vkCreatePipelineLayout(device, &postfxLayoutInfo, nullptr, &m_PostFXPipelineLayout);
+        
+        // Build PostFX pipeline
+        PipelineBuilder postfxBuilder;
+        postfxBuilder
+            .AddShaderStage(VK_SHADER_STAGE_VERTEX_BIT, m_PostFXVertShader)
+            .AddShaderStage(VK_SHADER_STAGE_FRAGMENT_BIT, m_PostFXFragShader)
+            .SetInputAssembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+            .SetColorAttachmentFormat(m_Swapchain.GetFormat())
+            .SetDepthStencil(false, false, VK_COMPARE_OP_ALWAYS)
+            .SetLayout(m_PostFXPipelineLayout);
+        if (!UseDynamicRendering()) {
+            postfxBuilder.SetRenderPass(m_SwapchainRenderPass);
+        }
+        
+        m_PostFXPipeline = postfxBuilder.Build(device);
+        
+        // Allocate PostFX descriptor set
+        m_PostFXDescriptorSet = m_DescriptorAllocator.Allocate(m_PostFXDescriptorLayout);
+        DescriptorWriter postfxWriter;
+        postfxWriter.WriteImage(0, m_OffscreenColor.GetView(), m_OffscreenSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        postfxWriter.UpdateSet(device, m_PostFXDescriptorSet);
+        
+        LUCENT_CORE_INFO("PostFX pipeline created");
+    }
+    
     LUCENT_CORE_DEBUG("Pipelines created");
     return true;
 }
@@ -658,6 +728,10 @@ void Renderer::DestroyPipelines() {
         vkDestroyPipelineLayout(device, m_MeshPipelineLayout, nullptr);
         m_MeshPipelineLayout = VK_NULL_HANDLE;
     }
+    if (m_MeshDescriptorLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device, m_MeshDescriptorLayout, nullptr);
+        m_MeshDescriptorLayout = VK_NULL_HANDLE;
+    }
     if (m_MeshVertShader != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, m_MeshVertShader, nullptr);
         m_MeshVertShader = VK_NULL_HANDLE;
@@ -683,6 +757,28 @@ void Renderer::DestroyPipelines() {
     if (m_SkyboxFragShader != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, m_SkyboxFragShader, nullptr);
         m_SkyboxFragShader = VK_NULL_HANDLE;
+    }
+    
+    // PostFX cleanup
+    if (m_PostFXPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, m_PostFXPipeline, nullptr);
+        m_PostFXPipeline = VK_NULL_HANDLE;
+    }
+    if (m_PostFXPipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device, m_PostFXPipelineLayout, nullptr);
+        m_PostFXPipelineLayout = VK_NULL_HANDLE;
+    }
+    if (m_PostFXDescriptorLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device, m_PostFXDescriptorLayout, nullptr);
+        m_PostFXDescriptorLayout = VK_NULL_HANDLE;
+    }
+    if (m_PostFXVertShader != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, m_PostFXVertShader, nullptr);
+        m_PostFXVertShader = VK_NULL_HANDLE;
+    }
+    if (m_PostFXFragShader != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, m_PostFXFragShader, nullptr);
+        m_PostFXFragShader = VK_NULL_HANDLE;
     }
 }
 
@@ -1221,25 +1317,9 @@ bool Renderer::CreateShadowResources() {
         return false;
     }
     
-    // Create descriptor set layout for shadow map sampling
-    VkDescriptorSetLayoutBinding shadowBinding{};
-    shadowBinding.binding = 0;
-    shadowBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    shadowBinding.descriptorCount = 1;
-    shadowBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    
-    VkDescriptorSetLayoutCreateInfo layoutInfo{};
-    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 1;
-    layoutInfo.pBindings = &shadowBinding;
-    
-    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_ShadowDescriptorLayout) != VK_SUCCESS) {
-        LUCENT_CORE_ERROR("Failed to create shadow descriptor layout");
-        return false;
-    }
-    
-    // Allocate descriptor set
-    m_ShadowDescriptorSet = m_DescriptorAllocator.Allocate(m_ShadowDescriptorLayout);
+    // Use the mesh descriptor layout (already has shadow map binding at set 0, binding 0)
+    // Allocate descriptor set for the shadow map
+    m_ShadowDescriptorSet = m_DescriptorAllocator.Allocate(m_MeshDescriptorLayout);
     if (m_ShadowDescriptorSet == VK_NULL_HANDLE) {
         LUCENT_CORE_ERROR("Failed to allocate shadow descriptor set");
         return false;
@@ -1251,7 +1331,7 @@ bool Renderer::CreateShadowResources() {
     writer.UpdateSet(device, m_ShadowDescriptorSet);
     
     // Load shadow shader
-    m_ShadowVertShader = PipelineBuilder::LoadShaderModule(device, "shaders/shadow_depth.spv");
+    m_ShadowVertShader = PipelineBuilder::LoadShaderModule(device, "shaders/shadow_depth.vert.spv");
     if (m_ShadowVertShader == VK_NULL_HANDLE) {
         LUCENT_CORE_ERROR("Failed to load shadow vertex shader");
         return false;
@@ -1323,10 +1403,8 @@ void Renderer::DestroyShadowResources() {
         vkDestroyShaderModule(device, m_ShadowVertShader, nullptr);
         m_ShadowVertShader = VK_NULL_HANDLE;
     }
-    if (m_ShadowDescriptorLayout) {
-        vkDestroyDescriptorSetLayout(device, m_ShadowDescriptorLayout, nullptr);
-        m_ShadowDescriptorLayout = VK_NULL_HANDLE;
-    }
+    // Descriptor layout is shared with mesh pipeline, don't destroy here
+    m_ShadowDescriptorLayout = VK_NULL_HANDLE;
     if (m_ShadowFramebuffer) {
         vkDestroyFramebuffer(device, m_ShadowFramebuffer, nullptr);
         m_ShadowFramebuffer = VK_NULL_HANDLE;
