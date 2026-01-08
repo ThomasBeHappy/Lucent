@@ -7,6 +7,7 @@
 #include "lucent/material/MaterialAsset.h"
 #include "lucent/material/MaterialIR.h"
 #include <GLFW/glfw3.h>
+#include <algorithm>
 #include <cmath>
 
 // GLFW native access (Win32 HWND)
@@ -836,6 +837,11 @@ void Application::RenderFrame() {
     if (!m_Renderer.BeginFrame()) {
         return;
     }
+
+    if (auto* finalRender = m_Renderer.GetFinalRender();
+        finalRender && finalRender->GetStatus() == gfx::FinalRenderStatus::Rendering) {
+        finalRender->RenderSample();
+    }
     
     VkCommandBuffer cmd = m_Renderer.GetCurrentCommandBuffer();
     gfx::Image* offscreen = m_Renderer.GetOffscreenImage();
@@ -936,6 +942,11 @@ void Application::KeyCallback(GLFWwindow* window, int key, int scancode, int act
         // Reset camera on Home key
         if (key == GLFW_KEY_HOME) {
             app->m_EditorCamera.Reset();
+        }
+
+        // Final render from primary camera
+        if (key == GLFW_KEY_F12 && !io.WantTextInput) {
+            app->StartFinalRenderFromMainCamera();
         }
         
         // Toggle camera mode with F key
@@ -1090,18 +1101,20 @@ void Application::RenderShadowPass(VkCommandBuffer cmd) {
     m_Renderer.EndShadowPass(cmd);
 }
 
-void Application::UpdateTracerScene() {
-    // Build scene data for the tracer
-    std::vector<gfx::BVHBuilder::Triangle> triangles;
-    std::vector<gfx::GPUMaterial> materials;
-    std::vector<gfx::GPULight> lights;
-    std::vector<gfx::GPUVolume> volumes;
-    
+void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& triangles,
+                                       std::vector<gfx::GPUMaterial>& materials,
+                                       std::vector<gfx::GPULight>& lights,
+                                       std::vector<gfx::GPUVolume>& volumes) {
+    triangles.clear();
+    materials.clear();
+    lights.clear();
+    volumes.clear();
+
     // Collect lights from scene
     auto lightView = m_Scene.GetView<scene::LightComponent, scene::TransformComponent>();
     lightView.Each([&](scene::Entity entity, scene::LightComponent& light, scene::TransformComponent& transform) {
         (void)entity;
-        
+
         gfx::GPULight gpuLight{};
         gpuLight.color = light.color;
         gpuLight.intensity = light.intensity;
@@ -1109,16 +1122,16 @@ void Application::UpdateTracerScene() {
         gpuLight.innerAngle = glm::radians(light.innerAngle);
         gpuLight.outerAngle = glm::radians(light.outerAngle);
         gpuLight.position = transform.position;
-        
+
         // Area light properties
         gpuLight.areaWidth = light.areaWidth;
         gpuLight.areaHeight = light.areaHeight;
         gpuLight.areaShape = static_cast<uint32_t>(light.areaShape);
         gpuLight.areaTangent = transform.GetRight();
-        
+
         // Use GetForward() for consistent rotation handling
         glm::vec3 forward = transform.GetForward();
-        
+
         switch (light.type) {
             case scene::LightType::Directional:
                 gpuLight.type = static_cast<uint32_t>(gfx::GPULightType::Directional);
@@ -1141,10 +1154,10 @@ void Application::UpdateTracerScene() {
                 gpuLight.direction = forward;  // Area normal
                 break;
         }
-        
+
         lights.push_back(gpuLight);
     });
-    
+
     // Default material
     gfx::GPUMaterial defaultMat{};
     defaultMat.baseColor = glm::vec4(0.8f, 0.8f, 0.8f, 1.0f);
@@ -1154,13 +1167,13 @@ void Application::UpdateTracerScene() {
     defaultMat.ior = 1.5f;
     defaultMat.flags = 0;
     materials.push_back(defaultMat);
-    
+
     auto view = m_Scene.GetView<scene::MeshRendererComponent, scene::TransformComponent>();
     view.Each([&](scene::Entity entity, scene::MeshRendererComponent& renderer, scene::TransformComponent& transform) {
         (void)entity;
-        
+
         if (!renderer.visible) return;
-        
+
         assets::Mesh* mesh = nullptr;
         if (renderer.primitiveType != scene::MeshRendererComponent::PrimitiveType::None) {
             auto it = m_PrimitiveMeshes.find(renderer.primitiveType);
@@ -1174,9 +1187,9 @@ void Application::UpdateTracerScene() {
         }
         const auto& vertices = mesh->GetCPUVertices();
         const auto& indices = mesh->GetCPUIndices();
-        
+
         if (vertices.empty() || indices.empty()) return;
-        
+
         glm::mat4 modelMatrix = transform.GetLocalMatrix();
         glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(modelMatrix)));
 
@@ -1190,7 +1203,7 @@ void Application::UpdateTracerScene() {
         if (matAsset && matAsset->IsValid() && matAsset->IsVolumeMaterial()) {
             gfx::GPUVolume vol{};
             vol.transform = glm::inverse(modelMatrix);
-            
+
             // Pull default values from the VolumetricOutput node input pin defaults (V1)
             const auto& graph = matAsset->GetGraph();
             const auto* volNode = graph.GetNode(graph.GetVolumeOutputNodeId());
@@ -1209,7 +1222,7 @@ void Application::UpdateTracerScene() {
                     if (std::holds_alternative<glm::vec3>(pin->defaultValue)) return std::get<glm::vec3>(pin->defaultValue);
                     return fallback;
                 };
-                
+
                 vol.scatterColor = getVec3Default(0, glm::vec3(0.8f));
                 vol.density = getFloatDefault(1, 1.0f);
                 vol.anisotropy = getFloatDefault(2, 0.0f);
@@ -1224,7 +1237,7 @@ void Application::UpdateTracerScene() {
                 vol.emission = glm::vec3(renderer.emissive);
                 vol.emissionStrength = renderer.emissiveIntensity;
             }
-            
+
             // Compute world-space AABB from mesh vertices (V1)
             glm::vec3 aabbMin(FLT_MAX);
             glm::vec3 aabbMax(-FLT_MAX);
@@ -1235,11 +1248,11 @@ void Application::UpdateTracerScene() {
             }
             vol.aabbMin = aabbMin;
             vol.aabbMax = aabbMax;
-            
+
             volumes.push_back(vol);
             return; // IMPORTANT: don't also add surface triangles/material for volume containers
         }
-        
+
         // Add material for this mesh
         uint32_t matId = static_cast<uint32_t>(materials.size());
         gfx::GPUMaterial mat{};
@@ -1277,35 +1290,45 @@ void Application::UpdateTracerScene() {
         }
 
         materials.push_back(mat);
-        
+
         // Add triangles using the Vertex struct
         for (size_t i = 0; i + 2 < indices.size(); i += 3) {
             gfx::BVHBuilder::Triangle tri;
-            
+
             const assets::Vertex& v0 = vertices[indices[i + 0]];
             const assets::Vertex& v1 = vertices[indices[i + 1]];
             const assets::Vertex& v2 = vertices[indices[i + 2]];
-            
+
             // Transform positions to world space
             tri.v0 = glm::vec3(modelMatrix * glm::vec4(v0.position, 1.0f));
             tri.v1 = glm::vec3(modelMatrix * glm::vec4(v1.position, 1.0f));
             tri.v2 = glm::vec3(modelMatrix * glm::vec4(v2.position, 1.0f));
-            
+
             // Transform normals to world space
             tri.n0 = glm::normalize(normalMatrix * v0.normal);
             tri.n1 = glm::normalize(normalMatrix * v1.normal);
             tri.n2 = glm::normalize(normalMatrix * v2.normal);
-            
+
             tri.uv0 = v0.uv;
             tri.uv1 = v1.uv;
             tri.uv2 = v2.uv;
-            
+
             tri.materialId = matId;
-            
+
             triangles.push_back(tri);
         }
     });
-    
+}
+
+void Application::UpdateTracerScene() {
+    // Build scene data for the tracer
+    std::vector<gfx::BVHBuilder::Triangle> triangles;
+    std::vector<gfx::GPUMaterial> materials;
+    std::vector<gfx::GPULight> lights;
+    std::vector<gfx::GPUVolume> volumes;
+
+    BuildTracerSceneData(triangles, materials, lights, volumes);
+
     // Update the currently active tracer backend
     gfx::RenderMode mode = m_Renderer.GetRenderMode();
     if (mode == gfx::RenderMode::RayTraced) {
@@ -1317,7 +1340,7 @@ void Application::UpdateTracerScene() {
             compute->UpdateScene(triangles, materials, lights, volumes);
         }
     }
-    
+
     m_LastTracerLights = lights;
     m_TracerSceneDirty = false;
 }
@@ -1408,6 +1431,81 @@ void Application::UpdateTracerLightsOnly() {
             compute->UpdateLights(lights);
         }
     }
+}
+
+void Application::StartFinalRenderFromMainCamera() {
+    gfx::FinalRender* finalRender = m_Renderer.GetFinalRender();
+    if (!finalRender) {
+        LUCENT_CORE_WARN("Final render is not available");
+        return;
+    }
+
+    if (finalRender->GetStatus() == gfx::FinalRenderStatus::Rendering) {
+        LUCENT_CORE_WARN("Final render already in progress");
+        return;
+    }
+
+    scene::Entity cameraEntity = m_Scene.GetPrimaryCamera();
+    if (!cameraEntity.IsValid()) {
+        LUCENT_CORE_WARN("Final render aborted: no primary camera found");
+        return;
+    }
+
+    auto* camera = cameraEntity.GetComponent<scene::CameraComponent>();
+    auto* transform = cameraEntity.GetComponent<scene::TransformComponent>();
+    if (!camera || !transform) {
+        LUCENT_CORE_WARN("Final render aborted: primary camera missing components");
+        return;
+    }
+
+    gfx::RenderSettings& settings = m_Renderer.GetSettings();
+    uint32_t width = std::max(settings.renderWidth, 16u);
+    uint32_t height = std::max(settings.renderHeight, 16u);
+    float aspect = static_cast<float>(width) / static_cast<float>(height);
+
+    glm::mat4 view = glm::lookAt(transform->position,
+                                 transform->position + transform->GetForward(),
+                                 transform->GetUp());
+    glm::mat4 proj = camera->GetProjection(aspect);
+
+    gfx::GPUCamera gpuCamera{};
+    gpuCamera.invView = glm::inverse(view);
+    gpuCamera.invProj = glm::inverse(proj);
+    gpuCamera.position = transform->position;
+    gpuCamera.fov = camera->fov;
+    gpuCamera.resolution = glm::vec2(width, height);
+    gpuCamera.nearPlane = camera->nearClip;
+    gpuCamera.farPlane = camera->farClip;
+
+    std::vector<gfx::BVHBuilder::Triangle> triangles;
+    std::vector<gfx::GPUMaterial> materials;
+    std::vector<gfx::GPULight> lights;
+    std::vector<gfx::GPUVolume> volumes;
+    BuildTracerSceneData(triangles, materials, lights, volumes);
+
+    gfx::FinalRenderConfig config;
+    config.width = width;
+    config.height = height;
+    config.samples = settings.finalSamples;
+    config.maxBounces = settings.maxBounces;
+    config.exposure = settings.exposure;
+    config.tonemap = settings.tonemapOperator;
+    config.gamma = settings.gamma;
+    config.denoiser = settings.denoiser;
+    config.denoiseStrength = settings.denoiseStrength;
+    config.denoiseRadius = settings.denoiseRadius;
+    config.transparentBackground = settings.transparentBackground;
+    config.outputPath.clear();
+
+    bool canRayTrace = m_Renderer.GetTracerRayKHR() && m_Renderer.GetTracerRayKHR()->IsSupported();
+    config.useRayTracing = (m_Renderer.GetRenderMode() == gfx::RenderMode::RayTraced) && canRayTrace;
+
+    if (!finalRender->Start(config, gpuCamera, triangles, materials, lights, volumes)) {
+        LUCENT_CORE_WARN("Final render failed to start");
+        return;
+    }
+
+    LUCENT_CORE_INFO("Final render started from primary camera (F12)");
 }
 
 void Application::RenderTracedPath(VkCommandBuffer cmd) {

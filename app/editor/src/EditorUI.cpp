@@ -2349,6 +2349,18 @@ void EditorUI::DrawRenderPropertiesPanel() {
             settingsChanged = true;
         }
     }
+
+    // === Output ===
+    if (ImGui::CollapsingHeader("Output", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int renderSize[2] = { static_cast<int>(settings.renderWidth), static_cast<int>(settings.renderHeight) };
+        if (ImGui::InputInt2("Render Resolution", renderSize)) {
+            settings.renderWidth = static_cast<uint32_t>(std::max(16, renderSize[0]));
+            settings.renderHeight = static_cast<uint32_t>(std::max(16, renderSize[1]));
+        }
+        if (ImGui::Checkbox("Transparent Background", &settings.transparentBackground)) {
+            settingsChanged = true;
+        }
+    }
     
     // === Bounces (for Traced/RayTraced modes) ===
     if (currentMode != gfx::RenderMode::Simple) {
@@ -2505,6 +2517,48 @@ void EditorUI::DrawRenderPropertiesPanel() {
             if (settings.enableShadows) {
                 ImGui::DragFloat("Shadow Bias", &settings.shadowBias, 0.0001f, 0.0f, 0.1f, "%.4f");
             }
+        }
+    }
+
+    // === Final Render ===
+    if (ImGui::CollapsingHeader("Final Render", ImGuiTreeNodeFlags_DefaultOpen)) {
+        gfx::FinalRender* finalRender = m_Renderer->GetFinalRender();
+        if (!finalRender) {
+            ImGui::TextDisabled("Final render is not available in this build.");
+        } else {
+            gfx::FinalRenderStatus status = finalRender->GetStatus();
+            switch (status) {
+                case gfx::FinalRenderStatus::Rendering:
+                    ImGui::TextColored(ThemeAccent(), "Rendering...");
+                    ImGui::ProgressBar(finalRender->GetProgress(), ImVec2(0.0f, 0.0f));
+                    ImGui::Text("Samples: %u / %u", finalRender->GetCurrentSample(), finalRender->GetTotalSamples());
+                    if (ImGui::Button("Cancel Render")) {
+                        finalRender->Cancel();
+                    }
+                    break;
+                case gfx::FinalRenderStatus::Completed:
+                    ImGui::TextColored(ThemeSuccess(), "Completed");
+                    break;
+                case gfx::FinalRenderStatus::Failed:
+                    ImGui::TextColored(ThemeError(), "Failed");
+                    break;
+                case gfx::FinalRenderStatus::Cancelled:
+                    ImGui::TextColored(ThemeWarn(), "Cancelled");
+                    break;
+                default:
+                    ImGui::TextDisabled("Idle");
+                    break;
+            }
+
+            static char outputPath[256] = "render.png";
+            ImGui::InputText("Output Path", outputPath, sizeof(outputPath));
+            if (status == gfx::FinalRenderStatus::Completed) {
+                if (ImGui::Button("Save Render")) {
+                    finalRender->ExportImage(outputPath);
+                }
+            }
+
+            ImGui::TextDisabled("Press F12 to render from the primary camera.");
         }
     }
     

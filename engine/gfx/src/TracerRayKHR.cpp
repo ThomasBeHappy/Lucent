@@ -1343,6 +1343,7 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
     pc.envIntensity = settings.envIntensity;
     pc.envRotation = settings.envRotation;
     pc.useEnvMap = (m_EnvMap && m_EnvMap->IsLoaded() && settings.useEnvMap) ? 1 : 0;
+    pc.transparentBackground = settings.transparentBackground ? 1 : 0;
     pc.volumeCount = m_VolumeCount;
     
     vkCmdPushConstants(cmd, m_PipelineLayout, 
@@ -1404,5 +1405,4 @@ void TracerRayKHR::SetEnvironmentMap(EnvironmentMap* envMap) {
 }
 
 } // namespace lucent::gfx
-
 

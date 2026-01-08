@@ -31,6 +31,7 @@ struct FinalRenderConfig {
     uint32_t denoiseRadius = 2;
     std::string outputPath = "render.png";
     bool useRayTracing = true;  // Use RayTraced if available, else Traced
+    bool transparentBackground = false;
 };
 
 // Render progress callback
@@ -57,7 +58,9 @@ public:
     // Start a render job
     bool Start(const FinalRenderConfig& config, const GPUCamera& camera,
                const std::vector<BVHBuilder::Triangle>& triangles,
-               const std::vector<GPUMaterial>& materials);
+               const std::vector<GPUMaterial>& materials,
+               const std::vector<GPULight>& lights = {},
+               const std::vector<GPUVolume>& volumes = {});
     
     // Cancel current render
     void Cancel();
@@ -113,4 +116,3 @@ private:
 };
 
 } // namespace lucent::gfx
-

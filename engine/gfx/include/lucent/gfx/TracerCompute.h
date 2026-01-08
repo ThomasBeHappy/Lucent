@@ -115,10 +115,10 @@ struct TracerPushConstants {
     float envIntensity;
     float envRotation;
     uint32_t useEnvMap;
+    uint32_t transparentBackground;
     uint32_t volumeCount;  // Number of volume instances
     uint32_t pad0;
     uint32_t pad1;
-    uint32_t pad2;
 };
 
 // Scene data for GPU
@@ -247,4 +247,3 @@ private:
 };
 
 } // namespace lucent::gfx
-
