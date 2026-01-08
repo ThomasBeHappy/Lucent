@@ -293,6 +293,7 @@ public:
     
     // Get the output node (there should be exactly one)
     NodeID GetOutputNodeId() const { return m_OutputNodeId; }
+    void SetOutputNodeId(NodeID nodeId) { m_OutputNodeId = nodeId; }
     
     // Compute a hash of the graph for caching
     uint64_t ComputeHash() const;

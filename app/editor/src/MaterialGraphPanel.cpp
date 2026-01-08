@@ -900,6 +900,18 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
             if (changed) {
                 auto* mutableNode = const_cast<material::MaterialNode*>(&node);
                 mutableNode->parameter = p;
+
+                // IMPORTANT: the material compiler uses the Noise node *input pin defaults*
+                // for Scale/Detail/Roughness/Distortion when those inputs are unconnected.
+                // Keep pin defaults in sync with the UI parameters so changes affect the shader.
+                auto& matGraph = m_Material->GetGraph();
+                if (node.inputPins.size() >= 5) {
+                    if (auto* scalePin = matGraph.GetPin(node.inputPins[1])) scalePin->defaultValue = p.x;
+                    if (auto* detailPin = matGraph.GetPin(node.inputPins[2])) detailPin->defaultValue = p.y;
+                    if (auto* roughPin = matGraph.GetPin(node.inputPins[3])) roughPin->defaultValue = p.z;
+                    if (auto* distPin = matGraph.GetPin(node.inputPins[4])) distPin->defaultValue = p.w;
+                }
+
                 m_Material->MarkDirty();
             }
             break;

@@ -522,7 +522,9 @@ MaterialAsset* MaterialAssetManager::LoadMaterial(const std::string& path) {
     
     // Read header
     std::getline(file, line);
-    if (line != "LUCENT_MATERIAL_V1") {
+    const bool isV1 = (line == "LUCENT_MATERIAL_V1");
+    const bool isV2 = (line == "LUCENT_MATERIAL_V2");
+    if (!isV1 && !isV2) {
         LUCENT_CORE_ERROR("Invalid material file format");
         return nullptr;
     }
@@ -533,13 +535,166 @@ MaterialAsset* MaterialAssetManager::LoadMaterial(const std::string& path) {
         graph.SetName(line.substr(6));
     }
     
-    // Read nodes, links, textures
-    // TODO: Full serialization
+    struct PendingLinkV2 {
+        uint64_t startNodeId = 0;
+        int startOutIndex = -1;
+        uint64_t endNodeId = 0;
+        int endInIndex = -1;
+    };
+    std::vector<PendingLinkV2> pendingLinks;
+    
+    struct PendingTextureSlot {
+        int index = -1;
+        bool sRGB = true;
+        std::string path;
+    };
+    std::vector<PendingTextureSlot> pendingSlots;
+    
+    std::unordered_map<uint64_t, material::NodeID> nodeIdMap; // fileNodeId -> runtimeNodeId
+    
+    auto startsWith = [](const std::string& s, const char* prefix) -> bool {
+        return s.rfind(prefix, 0) == 0;
+    };
+    auto trimLeft = [](std::string& s) {
+        while (!s.empty() && (s[0] == ' ' || s[0] == '\t' || s[0] == '\r')) s.erase(s.begin());
+    };
+    
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        
+        if (line == "NODE_BEGIN") {
+            uint64_t fileNodeId = 0;
+            int typeInt = -1;
+            float px = 0.0f, py = 0.0f;
+            bool hasFloat = false; float pFloat = 0.0f;
+            bool hasVec2 = false; glm::vec2 pVec2(0.0f);
+            bool hasVec3 = false; glm::vec3 pVec3(0.0f);
+            bool hasVec4 = false; glm::vec4 pVec4(0.0f);
+            bool hasString = false; std::string pString;
+            
+            while (std::getline(file, line)) {
+                if (line == "NODE_END") break;
+                trimLeft(line);
+                
+                if (startsWith(line, "ID:")) {
+                    unsigned long long tmp = 0;
+                    if (sscanf_s(line.c_str(), "ID: %llu", &tmp) == 1) fileNodeId = (uint64_t)tmp;
+                } else if (startsWith(line, "TYPE:")) {
+                    sscanf_s(line.c_str(), "TYPE: %d", &typeInt);
+                } else if (startsWith(line, "POS:")) {
+                    sscanf_s(line.c_str(), "POS: %f %f", &px, &py);
+                } else if (startsWith(line, "PARAM_FLOAT:")) {
+                    hasFloat = (sscanf_s(line.c_str(), "PARAM_FLOAT: %f", &pFloat) == 1);
+                } else if (startsWith(line, "PARAM_VEC2:")) {
+                    hasVec2 = (sscanf_s(line.c_str(), "PARAM_VEC2: %f %f", &pVec2.x, &pVec2.y) == 2);
+                } else if (startsWith(line, "PARAM_VEC3:")) {
+                    hasVec3 = (sscanf_s(line.c_str(), "PARAM_VEC3: %f %f %f", &pVec3.x, &pVec3.y, &pVec3.z) == 3);
+                } else if (startsWith(line, "PARAM_VEC4:")) {
+                    hasVec4 = (sscanf_s(line.c_str(), "PARAM_VEC4: %f %f %f %f", &pVec4.x, &pVec4.y, &pVec4.z, &pVec4.w) == 4);
+                } else if (startsWith(line, "PARAM_STRING:")) {
+                    hasString = true;
+                    pString = line.substr(std::string("PARAM_STRING:").size());
+                    trimLeft(pString);
+                }
+            }
+            
+            if (typeInt < 0) continue;
+            const NodeType nodeType = static_cast<NodeType>(typeInt);
+            NodeID newId = graph.CreateNode(nodeType, glm::vec2(px, py));
+            if (fileNodeId != 0) nodeIdMap[fileNodeId] = newId;
+            if (nodeType == NodeType::PBROutput) {
+                graph.SetOutputNodeId(newId);
+            }
+            
+            if (auto* n = graph.GetNode(newId)) {
+                if (hasFloat) n->parameter = pFloat;
+                else if (hasVec2) n->parameter = pVec2;
+                else if (hasVec3) n->parameter = pVec3;
+                else if (hasVec4) n->parameter = pVec4;
+                else if (hasString) n->parameter = pString;
+                
+                // Noise uses pin defaults if unconnected; keep them in sync with stored parameter.
+                if (n->type == NodeType::Noise) {
+                    glm::vec4 p = std::holds_alternative<glm::vec4>(n->parameter)
+                        ? std::get<glm::vec4>(n->parameter)
+                        : glm::vec4(5.0f, 4.0f, 0.5f, 0.0f);
+                    if (n->inputPins.size() >= 5) {
+                        if (auto* scalePin = graph.GetPin(n->inputPins[1])) scalePin->defaultValue = p.x;
+                        if (auto* detailPin = graph.GetPin(n->inputPins[2])) detailPin->defaultValue = p.y;
+                        if (auto* roughPin = graph.GetPin(n->inputPins[3])) roughPin->defaultValue = p.z;
+                        if (auto* distPin = graph.GetPin(n->inputPins[4])) distPin->defaultValue = p.w;
+                    }
+                }
+            }
+            
+            continue;
+        }
+        
+        if (isV2 && startsWith(line, "LINK:")) {
+            PendingLinkV2 l{};
+            unsigned long long a = 0, c = 0;
+            int b = -1, d = -1;
+            if (sscanf_s(line.c_str(), "LINK: %llu %d %llu %d", &a, &b, &c, &d) == 4) {
+                l.startNodeId = (uint64_t)a;
+                l.startOutIndex = b;
+                l.endNodeId = (uint64_t)c;
+                l.endInIndex = d;
+                pendingLinks.push_back(l);
+            }
+            continue;
+        }
+        
+        if (startsWith(line, "TEXTURE:")) {
+            int idx = -1;
+            int srgbInt = 1;
+            char pathBuf[1024] = {};
+            if (sscanf_s(line.c_str(), "TEXTURE: %d %d %1023[^\n]", &idx, &srgbInt, pathBuf, (unsigned)_countof(pathBuf)) >= 2) {
+                PendingTextureSlot s{};
+                s.index = idx;
+                s.sRGB = (srgbInt != 0);
+                s.path = (strlen(pathBuf) > 0) ? std::string(pathBuf) : std::string();
+                pendingSlots.push_back(std::move(s));
+            }
+            continue;
+        }
+        
+        // V1 LINK lines are pin-id based; cannot restore without serializing pins.
+    }
     
     file.close();
     
-    // Create default graph for now
-    graph.CreateDefault();
+    // Apply texture slots in index order
+    std::sort(pendingSlots.begin(), pendingSlots.end(), [](const PendingTextureSlot& a, const PendingTextureSlot& b) {
+        return a.index < b.index;
+    });
+    for (const auto& s : pendingSlots) {
+        if (s.index < 0) continue;
+        while ((int)graph.GetTextureSlots().size() <= s.index) {
+            graph.AddTextureSlot("", true);
+        }
+        graph.SetTextureSlot(s.index, s.path, s.sRGB);
+    }
+    
+    // Resolve V2 links (node id + pin index)
+    if (isV2) {
+        for (const auto& l : pendingLinks) {
+            auto itA = nodeIdMap.find(l.startNodeId);
+            auto itB = nodeIdMap.find(l.endNodeId);
+            if (itA == nodeIdMap.end() || itB == nodeIdMap.end()) continue;
+            auto* startNode = graph.GetNode(itA->second);
+            auto* endNode = graph.GetNode(itB->second);
+            if (!startNode || !endNode) continue;
+            if (l.startOutIndex < 0 || l.endInIndex < 0) continue;
+            if (l.startOutIndex >= (int)startNode->outputPins.size()) continue;
+            if (l.endInIndex >= (int)endNode->inputPins.size()) continue;
+            graph.CreateLink(startNode->outputPins[l.startOutIndex], endNode->inputPins[l.endInIndex]);
+        }
+    }
+    
+    // If file contained no nodes (or parse failed), fallback to default.
+    if (graph.GetNodes().empty()) {
+        graph.CreateDefault();
+    }
     
     // Compile
     material->Recompile();
@@ -562,7 +717,7 @@ bool MaterialAssetManager::SaveMaterial(MaterialAsset* material, const std::stri
     const MaterialGraph& graph = material->GetGraph();
     
     // Write header
-    file << "LUCENT_MATERIAL_V1\n";
+    file << "LUCENT_MATERIAL_V2\n";
     file << "NAME: " << graph.GetName() << "\n\n";
     
     // Write nodes
@@ -575,9 +730,15 @@ bool MaterialAssetManager::SaveMaterial(MaterialAsset* material, const std::stri
         // Write parameter based on type
         if (std::holds_alternative<float>(node.parameter)) {
             file << "  PARAM_FLOAT: " << std::get<float>(node.parameter) << "\n";
+        } else if (std::holds_alternative<glm::vec2>(node.parameter)) {
+            const auto& v = std::get<glm::vec2>(node.parameter);
+            file << "  PARAM_VEC2: " << v.x << " " << v.y << "\n";
         } else if (std::holds_alternative<glm::vec3>(node.parameter)) {
             const auto& v = std::get<glm::vec3>(node.parameter);
             file << "  PARAM_VEC3: " << v.x << " " << v.y << " " << v.z << "\n";
+        } else if (std::holds_alternative<glm::vec4>(node.parameter)) {
+            const auto& v = std::get<glm::vec4>(node.parameter);
+            file << "  PARAM_VEC4: " << v.x << " " << v.y << " " << v.z << " " << v.w << "\n";
         } else if (std::holds_alternative<std::string>(node.parameter)) {
             file << "  PARAM_STRING: " << std::get<std::string>(node.parameter) << "\n";
         }
@@ -586,8 +747,27 @@ bool MaterialAssetManager::SaveMaterial(MaterialAsset* material, const std::stri
     }
     
     // Write links
-    for (const auto& [id, link] : graph.GetLinks()) {
-        file << "LINK: " << link.startPinId << " " << link.endPinId << "\n";
+    // V2 stores links by node id + pin indices (stable across sessions)
+    for (const auto& [_, link] : graph.GetLinks()) {
+        const MaterialPin* startPin = graph.GetPin(link.startPinId);
+        const MaterialPin* endPin = graph.GetPin(link.endPinId);
+        if (!startPin || !endPin) continue;
+        const MaterialNode* startNode = graph.GetNode(startPin->nodeId);
+        const MaterialNode* endNode = graph.GetNode(endPin->nodeId);
+        if (!startNode || !endNode) continue;
+        
+        auto findIndex = [](const std::vector<PinID>& pins, PinID id) -> int {
+            for (int i = 0; i < (int)pins.size(); ++i) {
+                if (pins[i] == id) return i;
+            }
+            return -1;
+        };
+        
+        const int outIndex = findIndex(startNode->outputPins, link.startPinId);
+        const int inIndex = findIndex(endNode->inputPins, link.endPinId);
+        if (outIndex < 0 || inIndex < 0) continue;
+        
+        file << "LINK: " << startNode->id << " " << outIndex << " " << endNode->id << " " << inIndex << "\n";
     }
     
     // Write texture slots
