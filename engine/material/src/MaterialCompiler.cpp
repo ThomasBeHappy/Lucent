@@ -1030,6 +1030,61 @@ std::string MaterialCompiler::GenerateNodeCode(const MaterialGraph& graph, const
             pinVarNames[node.outputPins[0]] = var;
             break;
         }
+        
+        // Utility nodes
+        case NodeType::Reroute: {
+            // Passthrough: forward input directly to output
+            std::string val = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
+            pinVarNames[node.outputPins[0]] = val;
+            break;
+        }
+        
+        case NodeType::Frame:
+            // Frame is editor-only, no code generation
+            break;
+        
+        // Type conversion nodes
+        case NodeType::FloatToVec3: {
+            std::string val = GetPinValue(graph, node.inputPins[0], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "f2v3";
+            ss << "    vec3 " << var << " = vec3(" << val << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+        
+        case NodeType::Vec3ToFloat: {
+            std::string vec = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
+            std::string var = varPrefix + "v3f";
+            ss << "    float " << var << " = (" << vec << ").x;\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+        
+        case NodeType::Vec2ToVec3: {
+            std::string vec2 = GetPinValue(graph, node.inputPins[0], PinType::Vec2, pinVarNames);
+            std::string z = GetPinValue(graph, node.inputPins[1], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "v2v3";
+            ss << "    vec3 " << var << " = vec3(" << vec2 << ", " << z << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+        
+        case NodeType::Vec3ToVec4: {
+            std::string vec3 = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
+            std::string a = GetPinValue(graph, node.inputPins[1], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "v3v4";
+            ss << "    vec4 " << var << " = vec4(" << vec3 << ", " << a << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+        
+        case NodeType::Vec4ToVec3: {
+            std::string vec4 = GetPinValue(graph, node.inputPins[0], PinType::Vec4, pinVarNames);
+            std::string var = varPrefix + "v4v3";
+            ss << "    vec3 " << var << " = (" << vec4 << ").xyz;\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
             
         default:
             break;

@@ -156,6 +156,27 @@ bool MaterialIRCompiler::Compile(const MaterialGraph& graph, MaterialIR& outIR, 
             case NodeType::PBROutput:
                 instr.type = IRNodeType::OutputPBR;
                 break;
+            
+            // Utility nodes
+            case NodeType::Reroute:
+                // Passthrough - just copy input to output
+                instr.type = IRNodeType::ConstFloat; // Placeholder - will be resolved in linking
+                instr.operands[0] = 0.0f;
+                break;
+            
+            case NodeType::Frame:
+                // Frame is editor-only, skip entirely
+                continue; // Don't add instruction
+            
+            // Type conversion nodes - these are semantic in IR
+            case NodeType::FloatToVec3:
+            case NodeType::Vec3ToFloat:
+            case NodeType::Vec2ToVec3:
+            case NodeType::Vec3ToVec4:
+            case NodeType::Vec4ToVec3:
+                // Treat as passthrough for IR purposes (actual conversion happens in shader codegen)
+                instr.type = IRNodeType::ConstFloat; // Placeholder
+                break;
                 
             default:
                 // Unsupported node type - use constant fallback
@@ -235,6 +256,15 @@ bool MaterialIRCompiler::IsTracedCompatible(const MaterialGraph& graph) {
             case NodeType::Smoothstep:
             case NodeType::Sin:
             case NodeType::Cos:
+            // Utility nodes
+            case NodeType::Reroute:
+            case NodeType::Frame:
+            // Type conversion nodes
+            case NodeType::FloatToVec3:
+            case NodeType::Vec3ToFloat:
+            case NodeType::Vec2ToVec3:
+            case NodeType::Vec3ToVec4:
+            case NodeType::Vec4ToVec3:
                 break;
                 
             // Unsupported or partially supported

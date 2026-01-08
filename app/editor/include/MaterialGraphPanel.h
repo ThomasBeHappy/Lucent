@@ -53,6 +53,7 @@ private:
     void DrawToolbar();
     void DrawNodeEditor();
     void DrawNodeCreationMenu();
+    void DrawQuickAddPopup();
     void DrawCompileStatus();
     void HandleAutoCompile();
     void RenderMaterialPreviewIfNeeded();
@@ -90,6 +91,13 @@ private:
     // UI state
     bool m_FirstFrame = true;
     std::string m_SearchFilter;
+    
+    // Quick-add search popup (Tab)
+    bool m_ShowQuickAddPopup = false;
+    ImVec2 m_QuickAddPosition = { 0, 0 };
+    char m_QuickAddSearchBuffer[128] = {};
+    int m_QuickAddSelectedIndex = 0;
+    bool m_QuickAddFocusInput = false;
     
     // Compile status animation
     float m_CompileAnimTimer = 0.0f;
@@ -132,6 +140,28 @@ private:
     glm::vec3 m_BeforeVec3{0.0f};
     bool m_IsEditingFloat = false;
     bool m_IsEditingVec3 = false;
+    
+    // Clipboard for copy/paste
+    struct ClipboardNode {
+        material::NodeType type;
+        material::PinValue parameter;
+        glm::vec2 position;
+        int originalIdx; // index in clipboard for link remapping
+    };
+    struct ClipboardLink {
+        int srcNodeIdx;  // index into clipboard nodes
+        int srcPinIdx;   // output pin index on that node
+        int dstNodeIdx;  // index into clipboard nodes
+        int dstPinIdx;   // input pin index on that node
+    };
+    std::vector<ClipboardNode> m_ClipboardNodes;
+    std::vector<ClipboardLink> m_ClipboardLinks;
+    glm::vec2 m_ClipboardCenter{0.0f}; // center of copied selection (for offset on paste)
+    
+    // Clipboard methods
+    void CopySelection();
+    void PasteClipboard();
+    void DuplicateSelection();
 };
 
 } // namespace lucent

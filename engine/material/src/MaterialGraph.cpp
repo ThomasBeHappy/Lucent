@@ -112,6 +112,10 @@ NodeID MaterialGraph::CreateNode(NodeType type, const glm::vec2& position) {
             // power
             node.parameter = 5.0f;
             break;
+        case NodeType::Frame:
+            // Format: "FRAME:w,h,r,g,b,a;title"
+            node.parameter = std::string("FRAME:300,200,0.2,0.2,0.2,0.5;Comment");
+            break;
         default:
             node.parameter = 0.0f;
             break;
@@ -332,6 +336,42 @@ void MaterialGraph::SetupNodePins(MaterialNode& node) {
             addInput("Absorption", PinType::Vec3, glm::vec3(0.0f));              // Absorption color
             addInput("Emission", PinType::Vec3, glm::vec3(0.0f));                // Volume emission
             addInput("Emission Strength", PinType::Float, 1.0f);                 // Emission multiplier
+            break;
+            
+        // Utility nodes
+        case NodeType::Reroute:
+            // Reroute is polymorphic - pin type is determined when connected
+            // Default to Vec3 (most common case)
+            addInput("In", PinType::Vec3, glm::vec3(0.0f));
+            addOutput("Out", PinType::Vec3);
+            break;
+        case NodeType::Frame:
+            // Frame is editor-only, no pins
+            // Size and title stored in parameter as "FRAME:w,h,r,g,b,a;title"
+            break;
+            
+        // Type conversion nodes
+        case NodeType::FloatToVec3:
+            addInput("Value", PinType::Float, 0.0f);
+            addOutput("Vector", PinType::Vec3);
+            break;
+        case NodeType::Vec3ToFloat:
+            addInput("Vector", PinType::Vec3, glm::vec3(0.0f));
+            addOutput("Value", PinType::Float);
+            break;
+        case NodeType::Vec2ToVec3:
+            addInput("Vector", PinType::Vec2, glm::vec2(0.0f));
+            addInput("Z", PinType::Float, 0.0f);
+            addOutput("Vector", PinType::Vec3);
+            break;
+        case NodeType::Vec3ToVec4:
+            addInput("Vector", PinType::Vec3, glm::vec3(0.0f));
+            addInput("A", PinType::Float, 1.0f);
+            addOutput("Vector", PinType::Vec4);
+            break;
+        case NodeType::Vec4ToVec3:
+            addInput("Vector", PinType::Vec4, glm::vec4(0.0f));
+            addOutput("Vector", PinType::Vec3);
             break;
     }
 }

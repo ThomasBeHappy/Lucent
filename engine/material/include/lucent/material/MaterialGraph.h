@@ -115,6 +115,17 @@ enum class NodeType {
     // Output
     PBROutput,          // Final PBR material output (surface domain)
     VolumetricOutput,   // Final volumetric material output (volume domain)
+    
+    // Utility / Editor
+    Reroute,            // Passthrough node for wire organization
+    Frame,              // Comment/group frame (editor-only, no compilation)
+    
+    // Type Conversion
+    FloatToVec3,        // Broadcast float to vec3
+    Vec3ToFloat,        // Extract first component (R) from vec3
+    Vec2ToVec3,         // Extend vec2 to vec3 (z=0)
+    Vec3ToVec4,         // Extend vec3 to vec4 (a=1)
+    Vec4ToVec3,         // Drop alpha from vec4
 };
 
 // Get node category for UI
@@ -165,6 +176,15 @@ inline const char* GetNodeCategory(NodeType type) {
         case NodeType::PBROutput:
         case NodeType::VolumetricOutput:
             return "Output";
+        case NodeType::Reroute:
+        case NodeType::Frame:
+            return "Utility";
+        case NodeType::FloatToVec3:
+        case NodeType::Vec3ToFloat:
+        case NodeType::Vec2ToVec3:
+        case NodeType::Vec3ToVec4:
+        case NodeType::Vec4ToVec3:
+            return "Convert";
     }
     return "Other";
 }
@@ -207,6 +227,13 @@ inline const char* GetNodeTypeName(NodeType type) {
         case NodeType::CombineVec4: return "Combine RGBA";
         case NodeType::PBROutput: return "PBR Output";
         case NodeType::VolumetricOutput: return "Volume Output";
+        case NodeType::Reroute: return "Reroute";
+        case NodeType::Frame: return "Frame";
+        case NodeType::FloatToVec3: return "Float to Vec3";
+        case NodeType::Vec3ToFloat: return "Vec3 to Float";
+        case NodeType::Vec2ToVec3: return "Vec2 to Vec3";
+        case NodeType::Vec3ToVec4: return "Vec3 to Vec4";
+        case NodeType::Vec4ToVec3: return "Vec4 to Vec3";
     }
     return "Unknown";
 }

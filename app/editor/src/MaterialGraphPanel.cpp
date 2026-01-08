@@ -8,6 +8,8 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <cctype>
+#include <cstring>
 #include <imgui_internal.h>
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -674,10 +676,58 @@ void MaterialGraphPanel::DrawNodeEditor() {
     }
     ed::EndDelete();
     
+    // Keyboard shortcuts for copy/paste/duplicate
+    if (ImGui::GetIO().KeyCtrl) {
+        if (ImGui::IsKeyPressed(ImGuiKey_C)) {
+            CopySelection();
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_V)) {
+            PasteClipboard();
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_D)) {
+            DuplicateSelection();
+        }
+        // Ctrl+A: Select all nodes
+        if (ImGui::IsKeyPressed(ImGuiKey_A)) {
+            ed::ClearSelection();
+            for (const auto& [nodeId, node] : graph.GetNodes()) {
+                ed::SelectNode(ed::NodeId(nodeId), true);
+            }
+        }
+    }
+    
+    // Delete key: Delete selected nodes and links
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+        // Get selected links
+        int selectedCount = ed::GetSelectedObjectCount();
+        if (selectedCount > 0) {
+            std::vector<ed::LinkId> selectedLinks(selectedCount);
+            int linkCount = ed::GetSelectedLinks(selectedLinks.data(), selectedCount);
+            
+            for (int i = 0; i < linkCount; ++i) {
+                graph.DeleteLink(static_cast<material::LinkID>(selectedLinks[i].Get()));
+            }
+            
+            std::vector<ed::NodeId> selectedNodes(selectedCount);
+            int nodeCount = ed::GetSelectedNodes(selectedNodes.data(), selectedCount);
+            
+            for (int i = 0; i < nodeCount; ++i) {
+                graph.DeleteNode(static_cast<material::NodeID>(selectedNodes[i].Get()));
+            }
+            
+            if (linkCount > 0 || nodeCount > 0) {
+                m_Material->MarkDirty();
+            }
+        }
+    }
+    
     // Handle context menu
     HandleContextMenu();
     
     ed::End();
+    
+    // Handle quick-add popup (Tab search)
+    DrawQuickAddPopup();
     
     // Handle deferred color pickers (must be outside node editor)
     // ConstVec3 color picker
@@ -1206,6 +1256,77 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
             }
             break;
         }
+        case material::NodeType::Reroute: {
+            // Reroute nodes are just small pass-through dots
+            ImGui::TextDisabled("->");
+            break;
+        }
+        // Type conversion nodes - just show conversion direction
+        case material::NodeType::FloatToVec3:
+        case material::NodeType::Vec3ToFloat:
+        case material::NodeType::Vec2ToVec3:
+        case material::NodeType::Vec3ToVec4:
+        case material::NodeType::Vec4ToVec3: {
+            ImGui::TextDisabled("Convert");
+            break;
+        }
+        case material::NodeType::Frame: {
+            // Frame nodes display as comment boxes
+            // Parse parameters: "FRAME:w,h,r,g,b,a;title"
+            std::string param = std::holds_alternative<std::string>(node.parameter) ?
+                std::get<std::string>(node.parameter) : "FRAME:300,200,0.2,0.2,0.2,0.5;Comment";
+            
+            float w = 300.0f, h = 200.0f;
+            float r = 0.2f, g = 0.2f, b = 0.2f, a = 0.5f;
+            char title[128] = "Comment";
+            
+            // Parse
+            if (param.rfind("FRAME:", 0) == 0) {
+                const char* data = param.c_str() + 6;
+                if (sscanf_s(data, "%f,%f,%f,%f,%f,%f", &w, &h, &r, &g, &b, &a) >= 2) {
+                    // Parse title after semicolon
+                    const char* semi = strchr(data, ';');
+                    if (semi && *(semi + 1)) {
+                        strncpy_s(title, semi + 1, sizeof(title) - 1);
+                        title[sizeof(title) - 1] = '\0';
+                    }
+                }
+            }
+            
+            // Editable title
+            ImGui::SetNextItemWidth(180.0f);
+            bool changed = false;
+            if (ImGui::InputText("##title", title, sizeof(title))) {
+                changed = true;
+            }
+            
+            // Size controls
+            ImGui::SetNextItemWidth(80.0f);
+            if (ImGui::DragFloat("W##frame", &w, 1.0f, 100.0f, 1000.0f)) changed = true;
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80.0f);
+            if (ImGui::DragFloat("H##frame", &h, 1.0f, 100.0f, 1000.0f)) changed = true;
+            
+            // Color picker
+            float colArr[4] = { r, g, b, a };
+            if (ImGui::ColorEdit4("Color##frame", colArr, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar)) {
+                r = colArr[0]; g = colArr[1]; b = colArr[2]; a = colArr[3];
+                changed = true;
+            }
+            
+            // Add some minimum size
+            ImGui::Dummy(ImVec2(w, h));
+            
+            if (changed) {
+                // Rebuild parameter string
+                char newParam[256];
+                snprintf(newParam, sizeof(newParam), "FRAME:%.0f,%.0f,%.2f,%.2f,%.2f,%.2f;%s", w, h, r, g, b, a, title);
+                auto* mutableNode = const_cast<material::MaterialNode*>(&node);
+                mutableNode->parameter = std::string(newParam);
+                m_Material->MarkDirty();
+            }
+            break;
+        }
         default:
             break;
     }
@@ -1295,7 +1416,208 @@ void MaterialGraphPanel::HandleContextMenu() {
         ImGui::EndPopup();
     }
     
+    // Handle Tab key to open quick-add popup
+    if (ImGui::IsKeyPressed(ImGuiKey_Tab) && !m_ShowQuickAddPopup) {
+        m_ShowQuickAddPopup = true;
+        m_QuickAddPosition = ed::ScreenToCanvas(ImGui::GetMousePos());
+        m_QuickAddSearchBuffer[0] = '\0';
+        m_QuickAddSelectedIndex = 0;
+        m_QuickAddFocusInput = true;
+    }
+    
     ed::Resume();
+}
+
+// Fuzzy match helper: returns true if all characters in filter appear in name (in order)
+static bool FuzzyMatch(const char* name, const char* filter) {
+    if (!filter || !*filter) return true;
+    
+    const char* n = name;
+    const char* f = filter;
+    
+    while (*n && *f) {
+        char nc = static_cast<char>(std::tolower(static_cast<unsigned char>(*n)));
+        char fc = static_cast<char>(std::tolower(static_cast<unsigned char>(*f)));
+        if (nc == fc) {
+            ++f;
+        }
+        ++n;
+    }
+    return *f == '\0';
+}
+
+// All node types for quick-add (excluding Frame which is special)
+struct NodeMenuItem {
+    material::NodeType type;
+    const char* name;
+    const char* category;
+};
+
+static const NodeMenuItem s_AllNodeTypes[] = {
+    // Input
+    { material::NodeType::UV, "UV", "Input" },
+    { material::NodeType::VertexColor, "Vertex Color", "Input" },
+    { material::NodeType::Time, "Time", "Input" },
+    // Constants
+    { material::NodeType::ConstFloat, "Float", "Constants" },
+    { material::NodeType::ConstVec2, "Vector2", "Constants" },
+    { material::NodeType::ConstVec3, "Vector3 / Color", "Constants" },
+    { material::NodeType::ConstVec4, "Vector4", "Constants" },
+    // Texture
+    { material::NodeType::Texture2D, "Texture2D", "Texture" },
+    { material::NodeType::NormalMap, "Normal Map", "Texture" },
+    // Procedural
+    { material::NodeType::Noise, "Noise", "Procedural" },
+    // Color
+    { material::NodeType::ColorRamp, "Color Ramp", "Color" },
+    // Math
+    { material::NodeType::Add, "Add", "Math" },
+    { material::NodeType::Subtract, "Subtract", "Math" },
+    { material::NodeType::Multiply, "Multiply", "Math" },
+    { material::NodeType::Divide, "Divide", "Math" },
+    { material::NodeType::Power, "Power", "Math" },
+    { material::NodeType::Lerp, "Lerp", "Math" },
+    { material::NodeType::Remap, "Remap", "Math" },
+    { material::NodeType::Step, "Step", "Math" },
+    { material::NodeType::Smoothstep, "Smoothstep", "Math" },
+    { material::NodeType::Sin, "Sine", "Math" },
+    { material::NodeType::Cos, "Cosine", "Math" },
+    { material::NodeType::Clamp, "Clamp", "Math" },
+    { material::NodeType::OneMinus, "One Minus", "Math" },
+    { material::NodeType::Abs, "Abs", "Math" },
+    // Shading
+    { material::NodeType::Fresnel, "Fresnel", "Shading" },
+    // Vector
+    { material::NodeType::Dot, "Dot Product", "Vector" },
+    { material::NodeType::Normalize, "Normalize", "Vector" },
+    { material::NodeType::Length, "Length", "Vector" },
+    // Convert
+    { material::NodeType::SeparateVec3, "Separate RGB", "Convert" },
+    { material::NodeType::SeparateVec4, "Separate RGBA", "Convert" },
+    { material::NodeType::CombineVec3, "Combine RGB", "Convert" },
+    { material::NodeType::CombineVec4, "Combine RGBA", "Convert" },
+    { material::NodeType::FloatToVec3, "Float to Vec3", "Convert" },
+    { material::NodeType::Vec3ToFloat, "Vec3 to Float", "Convert" },
+    { material::NodeType::Vec2ToVec3, "Vec2 to Vec3", "Convert" },
+    { material::NodeType::Vec3ToVec4, "Vec3 to Vec4", "Convert" },
+    { material::NodeType::Vec4ToVec3, "Vec4 to Vec3", "Convert" },
+    // Utility
+    { material::NodeType::Reroute, "Reroute", "Utility" },
+    { material::NodeType::Frame, "Frame", "Utility" },
+    // Output (special handling in UI)
+    { material::NodeType::PBROutput, "PBR Output", "Output" },
+    { material::NodeType::VolumetricOutput, "Volume Output", "Output" },
+};
+static constexpr size_t s_AllNodeTypesCount = sizeof(s_AllNodeTypes) / sizeof(s_AllNodeTypes[0]);
+
+void MaterialGraphPanel::DrawQuickAddPopup() {
+    if (!m_ShowQuickAddPopup || !m_Material) return;
+    
+    ImGui::SetNextWindowPos(ImGui::GetMousePos(), ImGuiCond_Appearing, ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(280, 350), ImGuiCond_Always);
+    
+    if (ImGui::Begin("##QuickAdd", &m_ShowQuickAddPopup, 
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | 
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar)) {
+        
+        // Search input
+        if (m_QuickAddFocusInput) {
+            ImGui::SetKeyboardFocusHere();
+            m_QuickAddFocusInput = false;
+        }
+        
+        ImGui::PushItemWidth(-1);
+        bool enterPressed = ImGui::InputText("##Search", m_QuickAddSearchBuffer, sizeof(m_QuickAddSearchBuffer),
+            ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+        ImGui::PopItemWidth();
+        
+        ImGui::Separator();
+        
+        // Build filtered list
+        std::vector<const NodeMenuItem*> filtered;
+        for (size_t i = 0; i < s_AllNodeTypesCount; ++i) {
+            const auto& item = s_AllNodeTypes[i];
+            
+            // Skip output nodes that already exist
+            if (item.type == material::NodeType::PBROutput && m_Material->GetGraph().HasPBROutput()) continue;
+            if (item.type == material::NodeType::VolumetricOutput && m_Material->GetGraph().HasVolumeOutput()) continue;
+            
+            // Fuzzy filter by name and category
+            if (FuzzyMatch(item.name, m_QuickAddSearchBuffer) || 
+                FuzzyMatch(item.category, m_QuickAddSearchBuffer)) {
+                filtered.push_back(&item);
+            }
+        }
+        
+        // Handle keyboard navigation
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+            m_QuickAddSelectedIndex = std::min(m_QuickAddSelectedIndex + 1, (int)filtered.size() - 1);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+            m_QuickAddSelectedIndex = std::max(m_QuickAddSelectedIndex - 1, 0);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            m_ShowQuickAddPopup = false;
+        }
+        
+        // Clamp selection
+        if (m_QuickAddSelectedIndex >= (int)filtered.size()) {
+            m_QuickAddSelectedIndex = std::max(0, (int)filtered.size() - 1);
+        }
+        
+        // Results list
+        ImGui::BeginChild("##NodeList", ImVec2(0, 0), false);
+        
+        const char* lastCategory = nullptr;
+        int idx = 0;
+        for (const auto* item : filtered) {
+            // Category header
+            if (lastCategory == nullptr || strcmp(lastCategory, item->category) != 0) {
+                lastCategory = item->category;
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s", item->category);
+            }
+            
+            bool isSelected = (idx == m_QuickAddSelectedIndex);
+            
+            // Indent items under category
+            ImGui::Indent(10.0f);
+            if (ImGui::Selectable(item->name, isSelected)) {
+                // Create the node
+                material::MaterialGraph& graph = m_Material->GetGraph();
+                graph.CreateNode(item->type, glm::vec2(m_QuickAddPosition.x, m_QuickAddPosition.y));
+                m_Material->MarkDirty();
+                m_ShowQuickAddPopup = false;
+            }
+            ImGui::Unindent(10.0f);
+            
+            // Scroll to selected item
+            if (isSelected && ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+                ImGui::SetScrollHereY(0.5f);
+            }
+            if (isSelected && ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+                ImGui::SetScrollHereY(0.5f);
+            }
+            
+            ++idx;
+        }
+        
+        // Handle Enter to select
+        if (enterPressed && !filtered.empty() && m_QuickAddSelectedIndex >= 0 && m_QuickAddSelectedIndex < (int)filtered.size()) {
+            const auto* item = filtered[m_QuickAddSelectedIndex];
+            material::MaterialGraph& graph = m_Material->GetGraph();
+            graph.CreateNode(item->type, glm::vec2(m_QuickAddPosition.x, m_QuickAddPosition.y));
+            m_Material->MarkDirty();
+            m_ShowQuickAddPopup = false;
+        }
+        
+        ImGui::EndChild();
+    }
+    ImGui::End();
+    
+    // Close popup if clicked outside
+    if (!ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        m_ShowQuickAddPopup = false;
+    }
 }
 
 void MaterialGraphPanel::DrawNodeCreationMenu() {
@@ -1379,6 +1701,18 @@ void MaterialGraphPanel::DrawNodeCreationMenu() {
         addNodeMenuItem("Separate RGBA", material::NodeType::SeparateVec4);
         addNodeMenuItem("Combine RGB", material::NodeType::CombineVec3);
         addNodeMenuItem("Combine RGBA", material::NodeType::CombineVec4);
+        ImGui::Separator();
+        addNodeMenuItem("Float to Vec3", material::NodeType::FloatToVec3);
+        addNodeMenuItem("Vec3 to Float", material::NodeType::Vec3ToFloat);
+        addNodeMenuItem("Vec2 to Vec3", material::NodeType::Vec2ToVec3);
+        addNodeMenuItem("Vec3 to Vec4", material::NodeType::Vec3ToVec4);
+        addNodeMenuItem("Vec4 to Vec3", material::NodeType::Vec4ToVec3);
+        ImGui::EndMenu();
+    }
+    
+    if (ImGui::BeginMenu("Utility")) {
+        addNodeMenuItem("Reroute", material::NodeType::Reroute);
+        addNodeMenuItem("Frame", material::NodeType::Frame);
         ImGui::EndMenu();
     }
     
@@ -1485,6 +1819,178 @@ void MaterialGraphPanel::CreateNodeFromDrop(const std::string& path, const ImVec
         m_Material->MarkDirty();
     }
     // Add more file type handling here as needed (e.g., .lmat for sub-materials)
+}
+
+void MaterialGraphPanel::CopySelection() {
+    if (!m_Material) return;
+    
+    material::MaterialGraph& graph = m_Material->GetGraph();
+    
+    // Get selected nodes
+    int selectedCount = ed::GetSelectedObjectCount();
+    if (selectedCount == 0) return;
+    
+    std::vector<ed::NodeId> selectedNodeIds(selectedCount);
+    int nodeCount = ed::GetSelectedNodes(selectedNodeIds.data(), selectedCount);
+    selectedNodeIds.resize(nodeCount);
+    
+    if (nodeCount == 0) return;
+    
+    // Clear clipboard
+    m_ClipboardNodes.clear();
+    m_ClipboardLinks.clear();
+    
+    // Build set of selected node IDs for quick lookup
+    std::unordered_map<material::NodeID, int> nodeToClipboardIdx;
+    glm::vec2 center(0.0f);
+    
+    for (int i = 0; i < nodeCount; ++i) {
+        material::NodeID nodeId = static_cast<material::NodeID>(selectedNodeIds[i].Get());
+        const material::MaterialNode* node = graph.GetNode(nodeId);
+        if (!node) continue;
+        
+        // Don't copy output nodes (there should only be one)
+        if (node->type == material::NodeType::PBROutput || 
+            node->type == material::NodeType::VolumetricOutput) {
+            continue;
+        }
+        
+        ClipboardNode cn;
+        cn.type = node->type;
+        cn.parameter = node->parameter;
+        cn.position = node->position;
+        cn.originalIdx = static_cast<int>(m_ClipboardNodes.size());
+        
+        nodeToClipboardIdx[nodeId] = cn.originalIdx;
+        m_ClipboardNodes.push_back(cn);
+        center += node->position;
+    }
+    
+    if (m_ClipboardNodes.empty()) return;
+    
+    m_ClipboardCenter = center / static_cast<float>(m_ClipboardNodes.size());
+    
+    // Copy links between selected nodes
+    for (const auto& [linkId, link] : graph.GetLinks()) {
+        const material::MaterialPin* startPin = graph.GetPin(link.startPinId);
+        const material::MaterialPin* endPin = graph.GetPin(link.endPinId);
+        if (!startPin || !endPin) continue;
+        
+        auto srcIt = nodeToClipboardIdx.find(startPin->nodeId);
+        auto dstIt = nodeToClipboardIdx.find(endPin->nodeId);
+        
+        // Only copy link if both nodes are in selection
+        if (srcIt != nodeToClipboardIdx.end() && dstIt != nodeToClipboardIdx.end()) {
+            ClipboardLink cl;
+            cl.srcNodeIdx = srcIt->second;
+            cl.dstNodeIdx = dstIt->second;
+            
+            // Find pin indices
+            const material::MaterialNode* srcNode = graph.GetNode(startPin->nodeId);
+            const material::MaterialNode* dstNode = graph.GetNode(endPin->nodeId);
+            if (!srcNode || !dstNode) continue;
+            
+            cl.srcPinIdx = -1;
+            for (size_t i = 0; i < srcNode->outputPins.size(); ++i) {
+                if (srcNode->outputPins[i] == link.startPinId) {
+                    cl.srcPinIdx = static_cast<int>(i);
+                    break;
+                }
+            }
+            
+            cl.dstPinIdx = -1;
+            for (size_t i = 0; i < dstNode->inputPins.size(); ++i) {
+                if (dstNode->inputPins[i] == link.endPinId) {
+                    cl.dstPinIdx = static_cast<int>(i);
+                    break;
+                }
+            }
+            
+            if (cl.srcPinIdx >= 0 && cl.dstPinIdx >= 0) {
+                m_ClipboardLinks.push_back(cl);
+            }
+        }
+    }
+    
+    LUCENT_CORE_INFO("Copied {} nodes and {} links", m_ClipboardNodes.size(), m_ClipboardLinks.size());
+}
+
+void MaterialGraphPanel::PasteClipboard() {
+    if (!m_Material || m_ClipboardNodes.empty()) return;
+    
+    material::MaterialGraph& graph = m_Material->GetGraph();
+    
+    // Get mouse position for paste offset
+    ImVec2 mousePos = ed::ScreenToCanvas(ImGui::GetMousePos());
+    glm::vec2 pasteCenter(mousePos.x, mousePos.y);
+    glm::vec2 offset = pasteCenter - m_ClipboardCenter;
+    
+    // Map clipboard index to new node ID
+    std::vector<material::NodeID> newNodeIds(m_ClipboardNodes.size(), material::INVALID_NODE_ID);
+    
+    // Create nodes
+    for (size_t i = 0; i < m_ClipboardNodes.size(); ++i) {
+        const auto& cn = m_ClipboardNodes[i];
+        glm::vec2 newPos = cn.position + offset;
+        
+        material::NodeID newId = graph.CreateNode(cn.type, newPos);
+        if (newId != material::INVALID_NODE_ID) {
+            // Copy parameter
+            material::MaterialNode* node = graph.GetNode(newId);
+            if (node) {
+                node->parameter = cn.parameter;
+                
+                // If it's a texture node, ensure the texture slot exists
+                if (cn.type == material::NodeType::Texture2D || cn.type == material::NodeType::NormalMap) {
+                    if (std::holds_alternative<std::string>(cn.parameter)) {
+                        EnsureTextureSlot(graph, std::get<std::string>(cn.parameter), 
+                            cn.type == material::NodeType::Texture2D);
+                    }
+                }
+            }
+        }
+        newNodeIds[i] = newId;
+    }
+    
+    // Create links
+    for (const auto& cl : m_ClipboardLinks) {
+        if (cl.srcNodeIdx < 0 || cl.srcNodeIdx >= (int)newNodeIds.size()) continue;
+        if (cl.dstNodeIdx < 0 || cl.dstNodeIdx >= (int)newNodeIds.size()) continue;
+        
+        material::NodeID srcNodeId = newNodeIds[cl.srcNodeIdx];
+        material::NodeID dstNodeId = newNodeIds[cl.dstNodeIdx];
+        
+        if (srcNodeId == material::INVALID_NODE_ID || dstNodeId == material::INVALID_NODE_ID) continue;
+        
+        const material::MaterialNode* srcNode = graph.GetNode(srcNodeId);
+        const material::MaterialNode* dstNode = graph.GetNode(dstNodeId);
+        if (!srcNode || !dstNode) continue;
+        
+        if (cl.srcPinIdx >= 0 && cl.srcPinIdx < (int)srcNode->outputPins.size() &&
+            cl.dstPinIdx >= 0 && cl.dstPinIdx < (int)dstNode->inputPins.size()) {
+            graph.CreateLink(srcNode->outputPins[cl.srcPinIdx], dstNode->inputPins[cl.dstPinIdx]);
+        }
+    }
+    
+    // Select pasted nodes
+    ed::ClearSelection();
+    for (material::NodeID id : newNodeIds) {
+        if (id != material::INVALID_NODE_ID) {
+            ed::SelectNode(ed::NodeId(id), true);
+        }
+    }
+    
+    m_Material->MarkDirty();
+    LUCENT_CORE_INFO("Pasted {} nodes", newNodeIds.size());
+}
+
+void MaterialGraphPanel::DuplicateSelection() {
+    CopySelection();
+    
+    // Offset the clipboard center so paste doesn't overlap exactly
+    m_ClipboardCenter += glm::vec2(50.0f, 50.0f);
+    
+    PasteClipboard();
 }
 
 } // namespace lucent
