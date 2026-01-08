@@ -4,6 +4,7 @@
 #include "lucent/scene/Components.h"
 #include "lucent/material/MaterialAsset.h"
 #include "lucent/material/MaterialGraph.h"
+#include "lucent/mesh/EditableMesh.h"
 
 namespace lucent {
 
@@ -216,6 +217,63 @@ void MaterialParamCommand::Undo() {
     
     // Trigger recompile
     m_Material->MarkDirty();
+}
+
+// ============================================================================
+// MeshEditCommand Implementation
+// ============================================================================
+
+MeshEditCommand::MeshSnapshot MeshEditCommand::CaptureSnapshot(scene::EditableMeshComponent* meshComp) {
+    MeshSnapshot snapshot;
+    
+    if (!meshComp || !meshComp->mesh) {
+        return snapshot;
+    }
+    
+    auto data = meshComp->mesh->Serialize();
+    snapshot.positions = std::move(data.positions);
+    snapshot.uvs = std::move(data.uvs);
+    snapshot.faceVertexIndices = std::move(data.faceVertexIndices);
+    
+    return snapshot;
+}
+
+void MeshEditCommand::ApplySnapshot(scene::EditableMeshComponent* meshComp, const MeshSnapshot& snapshot) {
+    if (!meshComp) return;
+    
+    mesh::EditableMesh::SerializedData data;
+    data.positions = snapshot.positions;
+    data.uvs = snapshot.uvs;
+    data.faceVertexIndices = snapshot.faceVertexIndices;
+    
+    meshComp->mesh = std::make_unique<mesh::EditableMesh>(
+        mesh::EditableMesh::Deserialize(data)
+    );
+    meshComp->MarkDirty();
+}
+
+void MeshEditCommand::Execute() {
+    if (!m_Scene) return;
+    
+    scene::Entity entity = m_Scene->GetEntity(m_EntityId);
+    if (!entity.IsValid()) return;
+    
+    auto* meshComp = entity.GetComponent<scene::EditableMeshComponent>();
+    if (meshComp) {
+        ApplySnapshot(meshComp, m_After);
+    }
+}
+
+void MeshEditCommand::Undo() {
+    if (!m_Scene) return;
+    
+    scene::Entity entity = m_Scene->GetEntity(m_EntityId);
+    if (!entity.IsValid()) return;
+    
+    auto* meshComp = entity.GetComponent<scene::EditableMeshComponent>();
+    if (meshComp) {
+        ApplySnapshot(meshComp, m_Before);
+    }
 }
 
 } // namespace lucent

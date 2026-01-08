@@ -475,40 +475,67 @@ uint64_t MaterialGraph::ComputeHash() const {
         hash *= 1099511628211ULL;
     };
     
-    // Hash nodes
-    for (const auto& [id, node] : m_Nodes) {
+    // Hash nodes (deterministic order)
+    std::vector<NodeID> nodeIds;
+    nodeIds.reserve(m_Nodes.size());
+    for (const auto& [id, _] : m_Nodes) {
+        nodeIds.push_back(id);
+    }
+    std::sort(nodeIds.begin(), nodeIds.end());
+    
+    for (NodeID id : nodeIds) {
+        const auto it = m_Nodes.find(id);
+        if (it == m_Nodes.end()) continue;
+        const auto& node = it->second;
+        
         hashCombine(id);
         hashCombine(static_cast<uint64_t>(node.type));
         
         // Hash parameter based on type
+        union { float f; uint32_t u; } conv;
         if (std::holds_alternative<float>(node.parameter)) {
-            union { float f; uint32_t u; } conv;
             conv.f = std::get<float>(node.parameter);
             hashCombine(conv.u);
+        } else if (std::holds_alternative<glm::vec2>(node.parameter)) {
+            const auto& v = std::get<glm::vec2>(node.parameter);
+            conv.f = v.x; hashCombine(conv.u);
+            conv.f = v.y; hashCombine(conv.u);
         } else if (std::holds_alternative<glm::vec3>(node.parameter)) {
             const auto& v = std::get<glm::vec3>(node.parameter);
-            union { float f; uint32_t u; } conv;
             conv.f = v.x; hashCombine(conv.u);
             conv.f = v.y; hashCombine(conv.u);
             conv.f = v.z; hashCombine(conv.u);
+        } else if (std::holds_alternative<glm::vec4>(node.parameter)) {
+            const auto& v = std::get<glm::vec4>(node.parameter);
+            conv.f = v.x; hashCombine(conv.u);
+            conv.f = v.y; hashCombine(conv.u);
+            conv.f = v.z; hashCombine(conv.u);
+            conv.f = v.w; hashCombine(conv.u);
         } else if (std::holds_alternative<std::string>(node.parameter)) {
             const auto& s = std::get<std::string>(node.parameter);
+            hashCombine(static_cast<uint64_t>(s.size()));
             for (char c : s) {
-                hashCombine(static_cast<uint64_t>(c));
+                hashCombine(static_cast<uint64_t>(static_cast<unsigned char>(c)));
             }
         }
     }
     
-    // Hash links
-    for (const auto& [id, link] : m_Links) {
-        hashCombine(link.startPinId);
-        hashCombine(link.endPinId);
+    // Hash links (deterministic order)
+    std::vector<std::pair<PinID, PinID>> linkPairs;
+    linkPairs.reserve(m_Links.size());
+    for (const auto& [_, link] : m_Links) {
+        linkPairs.emplace_back(link.startPinId, link.endPinId);
+    }
+    std::sort(linkPairs.begin(), linkPairs.end());
+    for (const auto& [startPin, endPin] : linkPairs) {
+        hashCombine(startPin);
+        hashCombine(endPin);
     }
     
     // Hash texture slots
     for (const auto& slot : m_TextureSlots) {
         for (char c : slot.path) {
-            hashCombine(static_cast<uint64_t>(c));
+            hashCombine(static_cast<uint64_t>(static_cast<unsigned char>(c)));
         }
         hashCombine(slot.sRGB ? 1 : 0);
     }

@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <cctype>
 #include <algorithm>
+#include <chrono>
 
 namespace lucent::material {
 
@@ -64,6 +65,92 @@ bool MaterialAsset::Recompile() {
     return true;
 }
 
+void MaterialAsset::RequestRecompileAsync() {
+    if (!m_Device) {
+        m_CompileError = "No device";
+        m_Valid = false;
+        return;
+    }
+    
+    // If a compile is already running, just queue another pass (we'll snapshot the latest graph later).
+    if (m_AsyncCompiling.load()) {
+        m_AsyncRecompileQueued.store(true);
+        return;
+    }
+    
+    // Snapshot graph for background compilation so the UI can keep editing safely.
+    // (MaterialGraph is value-copyable.)
+    MaterialGraph snapshot = m_Graph;
+    
+    m_AsyncCompiling.store(true);
+    m_AsyncRecompileQueued.store(false);
+    
+    m_AsyncCompileFuture = std::async(std::launch::async, [snapshot]() mutable {
+        MaterialCompiler compiler;
+        return compiler.Compile(snapshot);
+    });
+}
+
+void MaterialAsset::PumpAsyncRecompile() {
+    if (!m_AsyncCompiling.load()) return;
+    if (!m_AsyncCompileFuture.valid()) {
+        m_AsyncCompiling.store(false);
+        return;
+    }
+    
+    using namespace std::chrono_literals;
+    if (m_AsyncCompileFuture.wait_for(0ms) != std::future_status::ready) {
+        return;
+    }
+    
+    CompileResult result{};
+    try {
+        result = m_AsyncCompileFuture.get();
+    } catch (const std::exception& e) {
+        m_CompileError = std::string("Async compile exception: ") + e.what();
+        m_Valid = false;
+        m_AsyncCompiling.store(false);
+        return;
+    } catch (...) {
+        m_CompileError = "Async compile exception: unknown";
+        m_Valid = false;
+        m_AsyncCompiling.store(false);
+        return;
+    }
+    m_AsyncCompiling.store(false);
+    
+    if (!result.success) {
+        // Keep old pipeline alive; just report error.
+        m_CompileError = result.errorMessage;
+        m_Valid = false;
+    } else {
+        // If unchanged, still clear dirty (important for params that previously didn't affect hash)
+        if (result.graphHash == m_GraphHash && m_Pipeline != VK_NULL_HANDLE) {
+            m_Valid = true;
+            m_CompileError.clear();
+            m_Dirty = false;
+        } else {
+            m_GraphHash = result.graphHash;
+            
+            if (!CreatePipeline(result.fragmentShaderSPIRV)) {
+                m_CompileError = "Failed to create pipeline";
+                m_Valid = false;
+            } else {
+                m_Valid = true;
+                m_CompileError.clear();
+                m_Dirty = false;
+            }
+        }
+    }
+    
+    // If edits happened while compiling (or graph diverged), run one more pass.
+    const uint64_t currentHash = m_Graph.ComputeHash();
+    if (m_AsyncRecompileQueued.load() || (m_Valid && currentHash != m_GraphHash)) {
+        m_AsyncRecompileQueued.store(false);
+        RequestRecompileAsync();
+    }
+}
+
 bool MaterialAsset::CreatePipeline(const std::vector<uint32_t>& fragmentSpirv) {
     VkDevice device = m_Device->GetHandle();
     
@@ -119,11 +206,89 @@ bool MaterialAsset::CreatePipeline(const std::vector<uint32_t>& fragmentSpirv) {
         }
     }
     
+    // Allocate + write descriptor set for textures
+    if (m_DescriptorSetLayout != VK_NULL_HANDLE && !textureSlots.empty()) {
+        // Create a small descriptor pool for this material
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSize.descriptorCount = static_cast<uint32_t>(textureSlots.size());
+        
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        
+        if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_DescriptorPool) != VK_SUCCESS) {
+            LUCENT_CORE_ERROR("Failed to create material descriptor pool");
+            return false;
+        }
+        
+        VkDescriptorSetAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocInfo.descriptorPool = m_DescriptorPool;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &m_DescriptorSetLayout;
+        
+        if (vkAllocateDescriptorSets(device, &allocInfo, &m_DescriptorSet) != VK_SUCCESS) {
+            LUCENT_CORE_ERROR("Failed to allocate material descriptor set");
+            return false;
+        }
+        
+        // Load textures and write descriptors
+        m_Textures.clear();
+        m_Textures.reserve(textureSlots.size());
+        
+        std::vector<VkDescriptorImageInfo> imageInfos;
+        imageInfos.reserve(textureSlots.size());
+        
+        for (size_t i = 0; i < textureSlots.size(); ++i) {
+            const auto& slot = textureSlots[i];
+            
+            auto tex = std::make_unique<assets::Texture>();
+            assets::TextureDesc desc{};
+            desc.path = slot.path;
+            desc.type = assets::TextureType::Generic;
+            desc.format = slot.sRGB ? assets::TextureFormat::RGBA8_SRGB : assets::TextureFormat::RGBA8_UNORM;
+            desc.generateMips = true;
+            desc.flipVertically = true;
+            desc.debugName = slot.path.c_str();
+            
+            if (!slot.path.empty() && tex->LoadFromFile(m_Device, desc)) {
+                // ok
+            } else {
+                // Fallback: solid magenta to make missing textures obvious
+                tex->CreateSolidColor(m_Device, 255, 0, 255, 255, "MissingTexture");
+            }
+            
+            VkDescriptorImageInfo info{};
+            info.sampler = tex->GetSampler();
+            info.imageView = tex->GetView();
+            info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfos.push_back(info);
+            
+            m_Textures.push_back(std::move(tex));
+        }
+        
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = m_DescriptorSet;
+        write.dstBinding = 0;
+        write.dstArrayElement = 0;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.descriptorCount = static_cast<uint32_t>(imageInfos.size());
+        write.pImageInfo = imageInfos.data();
+        
+        vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    }
+    
     // Create pipeline layout with push constants (same as mesh pipeline)
     VkPushConstantRange pushConstant{};
     pushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pushConstant.offset = 0;
-    pushConstant.size = sizeof(float) * 48; // 2 mat4 + 4 vec4
+    // Match Renderer mesh pipeline push constant range (256 bytes).
+    // Renderer pushes extra settings (shadow/tonemap/etc) even for material pipelines.
+    pushConstant.size = sizeof(float) * 64; // 256 bytes
     
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -184,6 +349,25 @@ void MaterialAsset::DestroyPipeline() {
     if (!m_Device) return;
     
     VkDevice device = m_Device->GetHandle();
+
+    // Safety-first: materials can recompile while the main renderer is still using the old
+    // pipeline / descriptor set on in-flight command buffers. Waiting avoids DEVICE_LOST.
+    if (m_Pipeline != VK_NULL_HANDLE ||
+        m_PipelineLayout != VK_NULL_HANDLE ||
+        m_DescriptorPool != VK_NULL_HANDLE ||
+        m_DescriptorSetLayout != VK_NULL_HANDLE ||
+        m_VertexShaderModule != VK_NULL_HANDLE ||
+        m_FragmentShaderModule != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(device);
+    }
+    
+    // Destroy material textures + descriptor pool
+    m_Textures.clear();
+    if (m_DescriptorPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(device, m_DescriptorPool, nullptr);
+        m_DescriptorPool = VK_NULL_HANDLE;
+    }
+    m_DescriptorSet = VK_NULL_HANDLE;
     
     if (m_Pipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device, m_Pipeline, nullptr);
@@ -439,6 +623,17 @@ void MaterialAssetManager::RecompileAll() {
     }
     
     LUCENT_CORE_INFO("Recompiled all materials");
+}
+
+void MaterialAssetManager::PumpAsyncCompiles() {
+    if (m_DefaultMaterial) {
+        m_DefaultMaterial->PumpAsyncRecompile();
+    }
+    for (auto& [path, material] : m_Materials) {
+        if (material) {
+            material->PumpAsyncRecompile();
+        }
+    }
 }
 
 } // namespace lucent::material

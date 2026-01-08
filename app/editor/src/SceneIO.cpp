@@ -1,5 +1,6 @@
 #include "SceneIO.h"
 #include "lucent/scene/Components.h"
+#include "lucent/mesh/EditableMesh.h"
 #include "lucent/assets/ModelLoader.h"
 #include "lucent/assets/MeshRegistry.h"
 #include "lucent/core/Log.h"
@@ -39,8 +40,8 @@ bool SaveScene(scene::Scene* scene, const std::string& filepath) {
         return false;
     }
     
-    // Header
-    file << "LUCENT_SCENE_V1\n";
+    // Header (V2 supports editable meshes)
+    file << "LUCENT_SCENE_V2\n";
     file << "SCENE_NAME: " << scene->GetName() << "\n";
     file << "\n";
     
@@ -108,6 +109,35 @@ bool SaveScene(scene::Scene* scene, const std::string& filepath) {
             file << " " << mesh->emissiveIntensity << "\n";
         }
         
+        // Editable Mesh (V2 feature)
+        auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+        if (editMesh && editMesh->HasMesh()) {
+            auto data = editMesh->mesh->Serialize();
+            
+            file << "  EDITABLE_MESH_BEGIN\n";
+            file << "    VERTS: " << data.positions.size() << "\n";
+            for (size_t i = 0; i < data.positions.size(); ++i) {
+                file << "      ";
+                WriteVec3(file, data.positions[i]);
+                if (i < data.uvs.size()) {
+                    file << " " << data.uvs[i].x << " " << data.uvs[i].y;
+                } else {
+                    file << " 0 0";
+                }
+                file << "\n";
+            }
+            
+            file << "    FACES: " << data.faceVertexIndices.size() << "\n";
+            for (const auto& face : data.faceVertexIndices) {
+                file << "      " << face.size();
+                for (uint32_t idx : face) {
+                    file << " " << idx;
+                }
+                file << "\n";
+            }
+            file << "  EDITABLE_MESH_END\n";
+        }
+        
         file << "ENTITY_END\n\n";
     }
     
@@ -133,11 +163,18 @@ bool LoadScene(scene::Scene* scene, const std::string& filepath) {
     
     std::string line;
     
-    // Read header
+    // Read header (support V1 and V2)
     std::getline(file, line);
-    if (line != "LUCENT_SCENE_V1") {
-        s_LastError = "Invalid scene file format";
+    bool isV2 = (line == "LUCENT_SCENE_V2");
+    if (line != "LUCENT_SCENE_V1" && line != "LUCENT_SCENE_V2") {
+        s_LastError = "Invalid scene file format: " + line;
         return false;
+    }
+    
+    if (isV2) {
+        LUCENT_CORE_DEBUG("Loading scene format V2");
+    } else {
+        LUCENT_CORE_DEBUG("Loading scene format V1 (legacy)");
     }
     
     // Read scene name
@@ -228,6 +265,64 @@ bool LoadScene(scene::Scene* scene, const std::string& filepath) {
             mesh.roughness = roughness;
             mesh.emissive = emissive;
             mesh.emissiveIntensity = emissiveIntensity;
+        }
+        else if (line == "EDITABLE_MESH_BEGIN" && currentEntity.IsValid() && isV2) {
+            // Parse editable mesh data
+            mesh::EditableMesh::SerializedData meshData;
+            
+            while (std::getline(file, line)) {
+                size_t meshLineStart = line.find_first_not_of(" \t");
+                if (meshLineStart != std::string::npos) line = line.substr(meshLineStart);
+                
+                if (line == "EDITABLE_MESH_END") break;
+                
+                if (line.substr(0, 7) == "VERTS: ") {
+                    size_t vertCount = std::stoul(line.substr(7));
+                    meshData.positions.reserve(vertCount);
+                    meshData.uvs.reserve(vertCount);
+                    
+                    for (size_t i = 0; i < vertCount; ++i) {
+                        if (!std::getline(file, line)) break;
+                        std::istringstream vss(line);
+                        glm::vec3 pos = ReadVec3(vss);
+                        glm::vec2 uv;
+                        vss >> uv.x >> uv.y;
+                        meshData.positions.push_back(pos);
+                        meshData.uvs.push_back(uv);
+                    }
+                }
+                else if (line.substr(0, 7) == "FACES: ") {
+                    size_t faceCount = std::stoul(line.substr(7));
+                    meshData.faceVertexIndices.reserve(faceCount);
+                    
+                    for (size_t i = 0; i < faceCount; ++i) {
+                        if (!std::getline(file, line)) break;
+                        std::istringstream fss(line);
+                        size_t vertInFace;
+                        fss >> vertInFace;
+                        
+                        std::vector<uint32_t> faceIndices;
+                        faceIndices.reserve(vertInFace);
+                        for (size_t j = 0; j < vertInFace; ++j) {
+                            uint32_t idx;
+                            fss >> idx;
+                            faceIndices.push_back(idx);
+                        }
+                        meshData.faceVertexIndices.push_back(faceIndices);
+                    }
+                }
+            }
+            
+            // Create the EditableMeshComponent
+            if (!meshData.positions.empty()) {
+                auto& editMesh = currentEntity.AddComponent<scene::EditableMeshComponent>();
+                editMesh.mesh = std::make_unique<mesh::EditableMesh>(
+                    mesh::EditableMesh::Deserialize(meshData)
+                );
+                editMesh.MarkDirty();
+                LUCENT_CORE_DEBUG("Loaded editable mesh: {} verts, {} faces", 
+                    meshData.positions.size(), meshData.faceVertexIndices.size());
+            }
         }
     }
     

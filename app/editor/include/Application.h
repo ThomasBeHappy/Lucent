@@ -89,6 +89,10 @@ private:
     // Primitive meshes
     std::unordered_map<scene::MeshRendererComponent::PrimitiveType, std::unique_ptr<assets::Mesh>> m_PrimitiveMeshes;
     
+    // Editable mesh GPU buffers (entity ID -> GPU mesh)
+    std::unordered_map<scene::EntityID, std::unique_ptr<assets::Mesh>> m_EditableMeshGPU;
+    void UpdateEditableMeshGPU(scene::Entity entity);
+    
     // Shadow mapping
     bool m_ShadowsEnabled = true;
     float m_ShadowBias = 0.005f;

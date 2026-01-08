@@ -145,6 +145,13 @@ float calcShadow(vec4 shadowCoord, float bias) {
 
 void main() {
     vec3 N = normalize(inNormal);
+    
+    // Keep T/B consumed (prevents unused-attribute warnings) and build a stable basis.
+    // This also sets us up for normal mapping later.
+    vec3 T = normalize(inTangent);
+    T = normalize(T - N * dot(N, T)); // Gram-Schmidt
+    vec3 B = normalize(cross(N, T));
+    N = normalize(cross(T, B));
     vec3 V = normalize(u_CameraPos - inWorldPos);
     
     // Material properties

@@ -22,7 +22,7 @@ constexpr Ref<T> CreateRef(Args&&... args) {
     return std::make_shared<T>(std::forward<Args>(args)...);
 }
 
-// Non-copyable base class
+// Non-copyable base class (but movable)
 class NonCopyable {
 public:
     NonCopyable() = default;
@@ -30,6 +30,9 @@ public:
     
     NonCopyable(const NonCopyable&) = delete;
     NonCopyable& operator=(const NonCopyable&) = delete;
+    
+    NonCopyable(NonCopyable&&) = default;
+    NonCopyable& operator=(NonCopyable&&) = default;
 };
 
 // Non-movable base class

@@ -89,6 +89,9 @@ struct RenderSettings {
     float shadowBias = 0.005f;
     uint32_t shadowMapSize = 2048;
     
+    // === Rasterization ===
+    bool enableBackfaceCulling = true; // If false, render meshes double-sided (debug/edit friendly)
+    
     // === Mode-specific flags ===
     RenderMode activeMode = RenderMode::Simple;
     

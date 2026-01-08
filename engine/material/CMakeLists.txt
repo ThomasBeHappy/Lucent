@@ -14,6 +14,7 @@ target_include_directories(engine_material PUBLIC
 target_link_libraries(engine_material PUBLIC
     Lucent::Core
     Lucent::Gfx
+    Lucent::Assets
     glm::glm
     unofficial::shaderc::shaderc
 )

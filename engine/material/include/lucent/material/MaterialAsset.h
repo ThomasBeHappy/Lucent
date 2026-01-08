@@ -3,10 +3,14 @@
 #include "lucent/material/MaterialGraph.h"
 #include "lucent/material/MaterialCompiler.h"
 #include "lucent/gfx/Device.h"
+#include "lucent/assets/Texture.h"
 #include <vulkan/vulkan.h>
 #include <string>
 #include <memory>
 #include <unordered_map>
+#include <vector>
+#include <future>
+#include <atomic>
 
 namespace lucent::material {
 
@@ -30,6 +34,11 @@ public:
     // Recompile the material (call after editing the graph)
     bool Recompile();
     
+    // Async recompile (compile shader in background, apply pipeline on main thread)
+    void RequestRecompileAsync();
+    void PumpAsyncRecompile(); // call periodically from main thread (e.g. per-frame)
+    bool IsRecompileInProgress() const { return m_AsyncCompiling.load(); }
+    
     // Check if the material is valid (compiled successfully)
     bool IsValid() const { return m_Valid; }
     
@@ -45,6 +54,13 @@ public:
     
     // Get descriptor set for material textures
     VkDescriptorSet GetDescriptorSet() const { return m_DescriptorSet; }
+    bool HasDescriptorSet() const { return m_DescriptorSet != VK_NULL_HANDLE; }
+    
+    // Editor preview helpers (not used by runtime renderer)
+    size_t GetLoadedTextureCount() const { return m_Textures.size(); }
+    assets::Texture* GetLoadedTexture(size_t index) const { 
+        return index < m_Textures.size() ? m_Textures[index].get() : nullptr; 
+    }
     
     // Graph hash for cache lookup
     uint64_t GetGraphHash() const { return m_GraphHash; }
@@ -60,6 +76,8 @@ public:
     
     // Set the render pass for legacy Vulkan 1.1/1.2 support
     void SetRenderPass(VkRenderPass renderPass) { m_RenderPass = renderPass; }
+    VkRenderPass GetRenderPass() const { return m_RenderPass; }
+    bool UsesLegacyRenderPass() const { return m_RenderPass != VK_NULL_HANDLE; }
     
 private:
     bool CreatePipeline(const std::vector<uint32_t>& fragmentSpirv);
@@ -83,6 +101,15 @@ private:
     VkPipeline m_Pipeline = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_DescriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorSet m_DescriptorSet = VK_NULL_HANDLE;
+    VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
+    
+    // Keep textures alive for the lifetime of the descriptor set
+    std::vector<std::unique_ptr<assets::Texture>> m_Textures;
+    
+    // Async compile state (graph->GLSL->SPIRV runs on worker thread; Vulkan pipeline swap runs on main thread)
+    std::atomic<bool> m_AsyncCompiling{ false };
+    std::atomic<bool> m_AsyncRecompileQueued{ false };
+    std::future<CompileResult> m_AsyncCompileFuture;
 };
 
 // Manager for material assets (caching, loading, saving)
@@ -113,6 +140,9 @@ public:
     
     // Reload all materials (after shader changes)
     void RecompileAll();
+    
+    // Apply any finished async compiles (call from main thread, once per frame)
+    void PumpAsyncCompiles();
     
     // Set the render pass for legacy Vulkan 1.1/1.2 mode (call before creating materials)
     void SetRenderPass(VkRenderPass renderPass) { m_RenderPass = renderPass; }

@@ -289,13 +289,15 @@ void GenerateCylinder(std::vector<Vertex>& outVertices, std::vector<uint32_t>& o
     // Side indices
     for (uint32_t i = 0; i < segments; i++) {
         uint32_t base = i * 2;
+        // CCW winding when viewed from outside (matches VK_FRONT_FACE_COUNTER_CLOCKWISE + backface culling)
+        // Quad: bottom(i), top(i), bottom(i+1), top(i+1)
         outIndices.push_back(base);
-        outIndices.push_back(base + 2);
         outIndices.push_back(base + 1);
+        outIndices.push_back(base + 2);
         
         outIndices.push_back(base + 1);
-        outIndices.push_back(base + 2);
         outIndices.push_back(base + 3);
+        outIndices.push_back(base + 2);
     }
     
     // Cap centers

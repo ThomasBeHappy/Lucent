@@ -75,6 +75,7 @@ public:
     VkPipelineLayout GetGridPipelineLayout() const { return m_GridPipelineLayout; }
     
     VkPipeline GetMeshPipeline() const { return m_MeshPipeline; }
+    VkPipeline GetMeshDoubleSidedPipeline() const { return m_MeshDoubleSidedPipeline; }
     VkPipeline GetMeshWireframePipeline() const { return m_MeshWireframePipeline; }
     VkPipelineLayout GetMeshPipelineLayout() const { return m_MeshPipelineLayout; }
     
@@ -133,7 +134,7 @@ public:
     // Shadow mapping
     void BeginShadowPass(VkCommandBuffer cmd);
     void EndShadowPass(VkCommandBuffer cmd);
-    VkDescriptorSet GetShadowDescriptorSet() const { return m_ShadowDescriptorSet; }
+    VkDescriptorSet GetShadowDescriptorSet() const { return m_ShadowDescriptorSets[m_CurrentFrame]; }
     VkPipeline GetShadowPipeline() const { return m_ShadowPipeline; }
     VkPipelineLayout GetShadowPipelineLayout() const { return m_ShadowPipelineLayout; }
     Image* GetShadowMap() { return &m_ShadowMap; }
@@ -196,6 +197,7 @@ private:
     VkDescriptorSetLayout m_MeshDescriptorLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_MeshPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_MeshPipeline = VK_NULL_HANDLE;
+    VkPipeline m_MeshDoubleSidedPipeline = VK_NULL_HANDLE;
     VkPipeline m_MeshWireframePipeline = VK_NULL_HANDLE;
     VkShaderModule m_MeshVertShader = VK_NULL_HANDLE;
     VkShaderModule m_MeshFragShader = VK_NULL_HANDLE;
@@ -270,7 +272,9 @@ private:
     VkPipelineLayout m_ShadowPipelineLayout = VK_NULL_HANDLE;
     VkShaderModule m_ShadowVertShader = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_ShadowDescriptorLayout = VK_NULL_HANDLE; // Points to m_MeshDescriptorLayout
-    VkDescriptorSet m_ShadowDescriptorSet = VK_NULL_HANDLE;
+    VkDescriptorSet m_ShadowDescriptorSets[MAX_FRAMES_IN_FLIGHT] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    bool m_ShadowDescriptorDirty = true;
+    size_t m_ShadowLightRangeBytes = sizeof(GPULight);
     
     // Light buffer for rasterizer
     Buffer m_LightBuffer;

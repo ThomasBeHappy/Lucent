@@ -182,20 +182,71 @@ void Application::CreatePrimitiveMeshes() {
     LUCENT_CORE_INFO("Created {} primitive meshes", m_PrimitiveMeshes.size());
 }
 
+void Application::UpdateEditableMeshGPU(scene::Entity entity) {
+    auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+    if (!editMesh || !editMesh->HasMesh()) return;
+    
+    // Get triangulated output
+    std::vector<glm::vec3> positions;
+    std::vector<glm::vec3> normals;
+    std::vector<glm::vec2> uvs;
+    std::vector<glm::vec4> tangents;
+    std::vector<uint32_t> indices;
+    
+    bool updated = editMesh->GetTriangulatedOutput(positions, normals, uvs, tangents, indices);
+    
+    if (!updated && m_EditableMeshGPU.count(entity.GetID()) > 0) {
+        // Mesh not dirty and we already have GPU buffers
+        return;
+    }
+    
+    if (positions.empty() || indices.empty()) {
+        return;
+    }
+    
+    // Build vertex data in the format expected by assets::Mesh
+    std::vector<assets::Vertex> vertices;
+    vertices.reserve(positions.size());
+    for (size_t i = 0; i < positions.size(); ++i) {
+        assets::Vertex v;
+        v.position = positions[i];
+        v.normal = (i < normals.size()) ? normals[i] : glm::vec3(0, 1, 0);
+        v.uv = (i < uvs.size()) ? uvs[i] : glm::vec2(0, 0);
+        v.tangent = (i < tangents.size()) ? tangents[i] : glm::vec4(1, 0, 0, 1);
+        vertices.push_back(v);
+    }
+    
+    // Create or update GPU mesh
+    auto& gpuMesh = m_EditableMeshGPU[entity.GetID()];
+    if (!gpuMesh) {
+        gpuMesh = std::make_unique<assets::Mesh>();
+    }
+    
+    // Destroy old buffers and create new ones
+    gpuMesh->Destroy();
+    
+    std::string meshName = "EditableMesh_" + std::to_string(entity.GetID());
+    if (!gpuMesh->Create(&m_Device, vertices, indices, meshName)) {
+        LUCENT_CORE_ERROR("Failed to create GPU mesh for editable mesh entity {}", entity.GetID());
+        m_EditableMeshGPU.erase(entity.GetID());
+    }
+}
+
 void Application::RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj) {
     // Get default render mode pipeline
     RenderMode mode = m_EditorUI.GetRenderMode();
-    VkPipeline defaultPipeline = m_Renderer.GetMeshPipeline();
+    VkPipeline defaultPipeline = m_Renderer.GetSettings().enableBackfaceCulling
+        ? m_Renderer.GetMeshPipeline()
+        : m_Renderer.GetMeshDoubleSidedPipeline();
     VkPipelineLayout defaultLayout = m_Renderer.GetMeshPipelineLayout();
     
     if (mode == RenderMode::Wireframe && m_Renderer.GetMeshWireframePipeline()) {
         defaultPipeline = m_Renderer.GetMeshWireframePipeline();
     }
     
-    // Bind shadow map descriptor set (set 0)
+    // Bind shadow map descriptor set (set 0) for the default mesh pipeline only.
+    // (Material pipelines have their own set 0 for textures.)
     VkDescriptorSet shadowSet = m_Renderer.GetShadowDescriptorSet();
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, defaultLayout, 
-        0, 1, &shadowSet, 0, nullptr);
     
     // Get camera position for specular calculations
     glm::vec3 camPos = m_EditorCamera.GetPosition();
@@ -207,25 +258,40 @@ void Application::RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj) {
     // Iterate all entities with MeshRendererComponent and TransformComponent
     auto view = m_Scene.GetView<scene::MeshRendererComponent, scene::TransformComponent>();
     view.Each([&](scene::Entity entity, scene::MeshRendererComponent& renderer, scene::TransformComponent& transform) {
-        (void)entity; // Unused
-        
         if (!renderer.visible) return;
         
         assets::Mesh* mesh = nullptr;
-        if (renderer.primitiveType != scene::MeshRendererComponent::PrimitiveType::None) {
-            auto it = m_PrimitiveMeshes.find(renderer.primitiveType);
-            if (it == m_PrimitiveMeshes.end() || !it->second) return;
-            mesh = it->second.get();
-        } else if (renderer.meshAssetID != UINT32_MAX) {
-            mesh = lucent::assets::MeshRegistry::Get().GetMesh(renderer.meshAssetID);
-            if (!mesh) return;
-        } else {
-            return;
+        
+        // Check if entity has an EditableMeshComponent (use that for rendering instead)
+        auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+        if (editMesh && editMesh->HasMesh()) {
+            // Update GPU mesh if dirty
+            UpdateEditableMeshGPU(entity);
+            
+            auto it = m_EditableMeshGPU.find(entity.GetID());
+            if (it != m_EditableMeshGPU.end() && it->second) {
+                mesh = it->second.get();
+            }
+        }
+        
+        // Fall back to primitive or asset mesh if no editable mesh
+        if (!mesh) {
+            if (renderer.primitiveType != scene::MeshRendererComponent::PrimitiveType::None) {
+                auto it = m_PrimitiveMeshes.find(renderer.primitiveType);
+                if (it == m_PrimitiveMeshes.end() || !it->second) return;
+                mesh = it->second.get();
+            } else if (renderer.meshAssetID != UINT32_MAX) {
+                mesh = lucent::assets::MeshRegistry::Get().GetMesh(renderer.meshAssetID);
+                if (!mesh) return;
+            } else {
+                return;
+            }
         }
         
         // Determine pipeline and layout to use
         VkPipeline pipeline = defaultPipeline;
         VkPipelineLayout layout = defaultLayout;
+        bool usesMaterialPipeline = false;
         
         // Check if entity has a material asset assigned
         if (renderer.UsesMaterialAsset()) {
@@ -233,6 +299,7 @@ void Application::RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj) {
             if (mat && mat->IsValid() && mat->GetPipeline()) {
                 pipeline = mat->GetPipeline();
                 layout = mat->GetPipelineLayout();
+                usesMaterialPipeline = true;
             }
         }
         
@@ -241,6 +308,21 @@ void Application::RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             currentPipeline = pipeline;
             currentLayout = layout;
+        }
+        
+        // Bind descriptor set(s)
+        if (usesMaterialPipeline) {
+            // Bind material texture set at set 0
+            auto* mat = material::MaterialAssetManager::Get().GetMaterial(renderer.materialPath);
+            if (mat && mat->HasDescriptorSet()) {
+                VkDescriptorSet matSet = mat->GetDescriptorSet();
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+                    0, 1, &matSet, 0, nullptr);
+            }
+        } else {
+            // Bind shadow set for default pipeline
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, defaultLayout,
+                0, 1, &shadowSet, 0, nullptr);
         }
         
         // Push constants with full material data
@@ -732,6 +814,9 @@ void Application::RenderFrame() {
     
     VkCommandBuffer cmd = m_Renderer.GetCurrentCommandBuffer();
     gfx::Image* offscreen = m_Renderer.GetOffscreenImage();
+
+    // Apply any finished background material compiles on the main thread.
+    material::MaterialAssetManager::Get().PumpAsyncCompiles();
     
     // =========================================================================
     // Pass 1: Render scene to offscreen image (viewport content)

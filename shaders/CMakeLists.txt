@@ -32,9 +32,10 @@ foreach(SHADER ${SHADER_SOURCES})
     add_custom_command(
         OUTPUT ${SHADER_OUTPUT}
         COMMAND ${GLSLC_EXECUTABLE} -o ${SHADER_OUTPUT} ${SHADER}
-            --target-env=vulkan1.3
+            --target-env=vulkan1.2
             -g  # Debug info for RenderDoc
-        DEPENDS ${SHADER}
+        # Depend on this CMakeLists too so changing compile flags forces a recompile
+        DEPENDS ${SHADER} ${CMAKE_CURRENT_LIST_FILE}
         COMMENT "Compiling shader ${SHADER_NAME}"
     )
     

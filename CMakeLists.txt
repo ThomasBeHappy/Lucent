@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.25)
 project(Lucent
     VERSION 0.1.0
     DESCRIPTION "Blender-like 3D editor with Vulkan RT path tracer"
-    LANGUAGES CXX CUDA
+    LANGUAGES CXX
 )
 
 # C++20 required
@@ -29,33 +29,43 @@ find_package(Vulkan REQUIRED)
 
 # CUDA and OptiX for AI denoising
 if(LUCENT_ENABLE_OPTIX)
-    find_package(CUDAToolkit REQUIRED)
+    # Try to find CUDA - if not available, disable OptiX
+    include(CheckLanguage)
+    check_language(CUDA)
     
-    # Find OptiX SDK (set OPTIX_ROOT or OptiX_INSTALL_DIR environment variable)
-    if(DEFINED ENV{OPTIX_ROOT})
-        set(OptiX_INSTALL_DIR $ENV{OPTIX_ROOT})
-    elseif(DEFINED ENV{OptiX_INSTALL_DIR})
-        set(OptiX_INSTALL_DIR $ENV{OptiX_INSTALL_DIR})
-    else()
-        # Default paths
-        if(WIN32)
-            file(GLOB OptiX_INSTALL_DIR "C:/ProgramData/NVIDIA Corporation/OptiX SDK 9.*")
-            if(NOT OptiX_INSTALL_DIR)
-                file(GLOB OptiX_INSTALL_DIR "C:/ProgramData/NVIDIA Corporation/OptiX SDK 8.*")
-            endif()
-            if(NOT OptiX_INSTALL_DIR)
-                file(GLOB OptiX_INSTALL_DIR "C:/ProgramData/NVIDIA Corporation/OptiX SDK 7.*")
+    if(CMAKE_CUDA_COMPILER)
+        enable_language(CUDA)
+        find_package(CUDAToolkit REQUIRED)
+        
+        # Find OptiX SDK (set OPTIX_ROOT or OptiX_INSTALL_DIR environment variable)
+        if(DEFINED ENV{OPTIX_ROOT})
+            set(OptiX_INSTALL_DIR $ENV{OPTIX_ROOT})
+        elseif(DEFINED ENV{OptiX_INSTALL_DIR})
+            set(OptiX_INSTALL_DIR $ENV{OptiX_INSTALL_DIR})
+        else()
+            # Default paths
+            if(WIN32)
+                file(GLOB OptiX_INSTALL_DIR "C:/ProgramData/NVIDIA Corporation/OptiX SDK 9.*")
+                if(NOT OptiX_INSTALL_DIR)
+                    file(GLOB OptiX_INSTALL_DIR "C:/ProgramData/NVIDIA Corporation/OptiX SDK 8.*")
+                endif()
+                if(NOT OptiX_INSTALL_DIR)
+                    file(GLOB OptiX_INSTALL_DIR "C:/ProgramData/NVIDIA Corporation/OptiX SDK 7.*")
+                endif()
             endif()
         endif()
-    endif()
-    
-    if(OptiX_INSTALL_DIR)
-        list(GET OptiX_INSTALL_DIR 0 OptiX_INSTALL_DIR)  # Take first match
-        message(STATUS "Found OptiX SDK: ${OptiX_INSTALL_DIR}")
-        set(OPTIX_INCLUDE_DIR "${OptiX_INSTALL_DIR}/include")
-        add_compile_definitions(LUCENT_ENABLE_OPTIX=1)
+        
+        if(OptiX_INSTALL_DIR)
+            list(GET OptiX_INSTALL_DIR 0 OptiX_INSTALL_DIR)  # Take first match
+            message(STATUS "Found OptiX SDK: ${OptiX_INSTALL_DIR}")
+            set(OPTIX_INCLUDE_DIR "${OptiX_INSTALL_DIR}/include")
+            add_compile_definitions(LUCENT_ENABLE_OPTIX=1)
+        else()
+            message(WARNING "OptiX SDK not found. Set OPTIX_ROOT environment variable. Disabling OptiX.")
+            set(LUCENT_ENABLE_OPTIX OFF)
+        endif()
     else()
-        message(WARNING "OptiX SDK not found. Set OPTIX_ROOT environment variable. Disabling OptiX.")
+        message(STATUS "CUDA not found. Disabling OptiX support.")
         set(LUCENT_ENABLE_OPTIX OFF)
     endif()
 endif()
@@ -87,6 +97,7 @@ endif()
 
 # Subdirectories
 add_subdirectory(engine/core)
+add_subdirectory(engine/mesh)
 add_subdirectory(engine/gfx)
 add_subdirectory(engine/scene)
 add_subdirectory(engine/assets)

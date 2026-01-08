@@ -346,6 +346,18 @@ bool VulkanContext::CreateLogicalDevice(const VulkanContextConfig& config) {
         for (const char* ext : s_RayTracingExtensions) {
             deviceExtensions.push_back(ext);
         }
+        LUCENT_CORE_INFO("  Ray Tracing extensions: ENABLED");
+    } else {
+        // Important: DeviceFeatures are also used to decide which Vulkan objects we create later.
+        // If we don't actually enable the RT extension stack on the logical device, we must not
+        // advertise RT descriptor types / pipelines as available.
+        m_DeviceFeatures.rayTracingPipeline = false;
+        m_DeviceFeatures.accelerationStructure = false;
+        m_DeviceFeatures.rayQuery = false;
+        m_DeviceFeatures.maxRayRecursionDepth = 0;
+        m_DeviceFeatures.shaderGroupHandleSize = 0;
+        m_DeviceFeatures.shaderGroupBaseAlignment = 0;
+        LUCENT_CORE_INFO("  Ray Tracing extensions: DISABLED");
     }
     
     // Add external memory extensions for CUDA/OptiX interop
@@ -369,6 +381,14 @@ bool VulkanContext::CreateLogicalDevice(const VulkanContextConfig& config) {
         LUCENT_CORE_INFO("  robustBufferAccess: ENABLED");
     } else {
         LUCENT_CORE_WARN("  robustBufferAccess: NOT AVAILABLE");
+    }
+
+    // Enable sampler anisotropy when supported (used by texture samplers)
+    if (coreFeatures.samplerAnisotropy) {
+        deviceFeatures2.features.samplerAnisotropy = VK_TRUE;
+        LUCENT_CORE_INFO("  samplerAnisotropy: ENABLED");
+    } else {
+        LUCENT_CORE_WARN("  samplerAnisotropy: NOT AVAILABLE");
     }
     
     // Vulkan 1.2 features - only request if device supports them

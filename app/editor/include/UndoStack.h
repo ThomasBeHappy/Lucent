@@ -178,6 +178,14 @@ namespace material {
     struct MaterialNode;
 }
 
+namespace mesh {
+    class EditableMesh;
+}
+
+namespace scene {
+    struct EditableMeshComponent;
+}
+
 // Material parameter edit command
 class MaterialParamCommand : public ICommand {
 public:
@@ -233,6 +241,46 @@ private:
     float m_FloatAfter = 0.0f;
     glm::vec3 m_Vec3Before{0.0f};
     glm::vec3 m_Vec3After{0.0f};
+};
+
+// Mesh edit command (snapshot-based undo/redo for Edit Mode)
+class MeshEditCommand : public ICommand {
+public:
+    // Snapshot of mesh state for undo/redo
+    struct MeshSnapshot {
+        std::vector<glm::vec3> positions;
+        std::vector<glm::vec2> uvs;
+        std::vector<std::vector<uint32_t>> faceVertexIndices;
+    };
+    
+    MeshEditCommand(scene::Scene* scene, uint32_t entityId,
+                    const std::string& operationName,
+                    MeshSnapshot before, MeshSnapshot after)
+        : m_Scene(scene)
+        , m_EntityId(entityId)
+        , m_OperationName(operationName)
+        , m_Before(std::move(before))
+        , m_After(std::move(after)) {}
+    
+    void Execute() override;
+    void Undo() override;
+    std::string GetDescription() const override { return "Mesh: " + m_OperationName; }
+    
+    COMMAND_TYPE_ID(MeshEditCommand)
+    uint64_t GetTargetId() const override { return m_EntityId; }
+    
+    // Capture current mesh state as a snapshot
+    static MeshSnapshot CaptureSnapshot(scene::EditableMeshComponent* meshComp);
+    
+    // Apply a snapshot to the mesh
+    static void ApplySnapshot(scene::EditableMeshComponent* meshComp, const MeshSnapshot& snapshot);
+    
+private:
+    scene::Scene* m_Scene;
+    uint32_t m_EntityId;
+    std::string m_OperationName;
+    MeshSnapshot m_Before;
+    MeshSnapshot m_After;
 };
 
 } // namespace lucent

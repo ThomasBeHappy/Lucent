@@ -4,6 +4,7 @@
 #include <sstream>
 #include <queue>
 #include <set>
+#include <mutex>
 
 namespace lucent::material {
 
@@ -47,14 +48,16 @@ void main() {
 )";
 
 static std::vector<uint32_t> s_StandardVertexShaderSPIRV;
+static std::once_flag s_StandardVertexShaderOnce;
 
 const std::vector<uint32_t>& MaterialCompiler::GetStandardVertexShaderSPIRV() {
-    if (s_StandardVertexShaderSPIRV.empty()) {
+    std::call_once(s_StandardVertexShaderOnce, []() {
         // Compile the standard vertex shader
         shaderc::Compiler compiler;
         shaderc::CompileOptions options;
         options.SetOptimizationLevel(shaderc_optimization_level_performance);
-        options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
+        // We target Vulkan 1.2 to keep SPIR-V compatible with fallback GPUs (SPIR-V 1.5).
+        options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_2);
         
         auto result = compiler.CompileGlslToSpv(
             s_StandardVertexShaderGLSL,
@@ -68,7 +71,7 @@ const std::vector<uint32_t>& MaterialCompiler::GetStandardVertexShaderSPIRV() {
         } else {
             LUCENT_CORE_ERROR("Failed to compile standard vertex shader: {}", result.GetErrorMessage());
         }
-    }
+    });
     return s_StandardVertexShaderSPIRV;
 }
 
@@ -123,8 +126,18 @@ std::string MaterialCompiler::GenerateFragmentGLSL(const MaterialGraph& graph) {
     
     // Texture samplers
     const auto& textureSlots = graph.GetTextureSlots();
+    // NOTE: Texture2D nodes sample from `textures[slot]`. If the graph has Texture2D nodes but no texture slots
+    // were registered, shader compilation would fail. We defensively declare at least one sampler to avoid
+    // hard shader errors, but the material will still render incorrectly until a slot is assigned.
+    bool hasTextureNodes = false;
+    for (const auto& [id, node] : graph.GetNodes()) {
+        if (node.type == NodeType::Texture2D) { hasTextureNodes = true; break; }
+        if (node.type == NodeType::NormalMap) { hasTextureNodes = true; break; }
+    }
     if (!textureSlots.empty()) {
         ss << "layout(set = 0, binding = 0) uniform sampler2D textures[" << textureSlots.size() << "];\n\n";
+    } else if (hasTextureNodes) {
+        ss << "layout(set = 0, binding = 0) uniform sampler2D textures[1];\n\n";
     }
 
     // Procedural helpers (inject only if needed)
@@ -328,7 +341,8 @@ bool MaterialCompiler::CompileGLSLToSPIRV(const std::string& glsl, std::vector<u
     shaderc::Compiler compiler;
     shaderc::CompileOptions options;
     options.SetOptimizationLevel(shaderc_optimization_level_performance);
-    options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
+    // We target Vulkan 1.2 to keep SPIR-V compatible with fallback GPUs (SPIR-V 1.5).
+    options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_2);
     
     auto result = compiler.CompileGlslToSpv(
         glsl,
@@ -440,7 +454,13 @@ std::string MaterialCompiler::GenerateNodeCode(const MaterialGraph& graph, const
         }
         
         case NodeType::Texture2D: {
-            std::string uvVal = GetPinValue(graph, node.inputPins[0], PinType::Vec2, pinVarNames);
+            // If UV is left unconnected, default to mesh UVs (otherwise you'll sample a single texel).
+            std::string uvVal;
+            if (graph.FindLinkByEndPin(node.inputPins[0]) != INVALID_LINK_ID) {
+                uvVal = GetPinValue(graph, node.inputPins[0], PinType::Vec2, pinVarNames);
+            } else {
+                uvVal = "inUV";
+            }
             // Get texture slot index from parameter
             int texSlot = 0; // Default to first texture
             if (std::holds_alternative<std::string>(node.parameter)) {
@@ -468,7 +488,13 @@ std::string MaterialCompiler::GenerateNodeCode(const MaterialGraph& graph, const
         }
         
         case NodeType::NormalMap: {
-            std::string uvVal = GetPinValue(graph, node.inputPins[0], PinType::Vec2, pinVarNames);
+            // If UV is left unconnected, default to mesh UVs.
+            std::string uvVal;
+            if (graph.FindLinkByEndPin(node.inputPins[0]) != INVALID_LINK_ID) {
+                uvVal = GetPinValue(graph, node.inputPins[0], PinType::Vec2, pinVarNames);
+            } else {
+                uvVal = "inUV";
+            }
             std::string strength = GetPinValue(graph, node.inputPins[1], PinType::Float, pinVarNames);
             
             // Sample normal map and decode
@@ -480,7 +506,14 @@ std::string MaterialCompiler::GenerateNodeCode(const MaterialGraph& graph, const
 
         case NodeType::Noise: {
             // Inputs
-            std::string vecIn = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
+            // If the coordinate is left unconnected, default to UVs so the node "just works".
+            // (Default vec3(0) would sample the same point and produce a flat color.)
+            std::string vecIn;
+            if (graph.FindLinkByEndPin(node.inputPins[0]) != INVALID_LINK_ID) {
+                vecIn = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
+            } else {
+                vecIn = "vec3(inUV, 0.0)";
+            }
             std::string scale = GetPinValue(graph, node.inputPins[1], PinType::Float, pinVarNames);
             std::string detail = GetPinValue(graph, node.inputPins[2], PinType::Float, pinVarNames);
             std::string rough = GetPinValue(graph, node.inputPins[3], PinType::Float, pinVarNames);

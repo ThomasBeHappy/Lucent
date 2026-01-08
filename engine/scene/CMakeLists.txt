@@ -13,6 +13,7 @@ target_include_directories(engine_scene
 target_link_libraries(engine_scene
     PUBLIC
         Lucent::Core
+        Lucent::Mesh
         Lucent::Gfx
         glm::glm
 )

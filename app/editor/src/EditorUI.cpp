@@ -1095,11 +1095,20 @@ void EditorUI::DrawViewportPanel() {
         ImGui::Text("Viewport not available");
     }
     
-    // Draw gizmo if entity selected
-    DrawGizmo();
+    // Draw gizmo if entity selected (only in Object Mode)
+    if (m_EditorMode == EditorMode::Object) {
+        DrawGizmo();
+    }
     
     // Handle viewport click for selection (after gizmo so gizmo takes priority)
-    HandleViewportClick();
+    if (m_EditorMode == EditorMode::Object) {
+        HandleViewportClick();
+    } else {
+        HandleEditModeClick();
+    }
+    
+    // Draw Edit Mode overlay (vertices, edges, faces)
+    DrawEditModeOverlay();
     
     // Gizmo toolbar overlay
     ImGui::SetCursorPos(ImVec2(10, 30));
@@ -1160,6 +1169,44 @@ void EditorUI::DrawViewportPanel() {
             ImGui::DragFloat("Scale", &m_ScaleSnap, 0.01f, 0.01f, 1.0f, "%.2f");
             ImGui::EndPopup();
         }
+    }
+    
+    // Editor Mode indicator (second row)
+    ImGui::SetCursorPos(ImVec2(10, 60));
+    
+    if (m_EditorMode == EditorMode::Object) {
+        ImGui::TextColored(ImVec4(0.7f, 0.8f, 1.0f, 1.0f), "Object Mode");
+        ImGui::SameLine();
+        ImGui::TextDisabled("(Tab to Edit)");
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Edit Mode");
+        ImGui::SameLine();
+        
+        // Selection mode buttons
+        const char* modes[] = { "Vertex", "Edge", "Face" };
+        const char* keys[] = { "1", "2", "3" };
+        for (int i = 0; i < 3; i++) {
+            ImGui::SameLine();
+            bool selected = (static_cast<int>(m_MeshSelectMode) == i);
+            if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.4f, 0.2f, 1.0f));
+            char label[32];
+            snprintf(label, sizeof(label), "[%s] %s", keys[i], modes[i]);
+            if (ImGui::SmallButton(label)) {
+                m_MeshSelectMode = static_cast<MeshSelectMode>(i);
+            }
+            if (selected) ImGui::PopStyleColor();
+        }
+        
+        ImGui::SameLine();
+        ImGui::TextDisabled("(Tab to exit)");
+    }
+    
+    // Draw interactive transform HUD
+    DrawInteractiveTransformHUD();
+    
+    // Update interactive transform if active
+    if (IsInInteractiveTransform()) {
+        UpdateInteractiveTransform();
     }
     
     ImGui::PopStyleVar(2);
@@ -2369,6 +2416,15 @@ void EditorUI::DrawRenderPropertiesPanel() {
         }
     }
     
+    // === Rasterization ===
+    if (ImGui::CollapsingHeader("Rasterization", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::Checkbox("Backface Culling", &settings.enableBackfaceCulling)) {
+            // No accumulation reset needed in Simple mode, but keep behavior consistent
+            settingsChanged = true;
+        }
+        ImGui::TextDisabled("Tip: disable this for debugging normals / editing open meshes.");
+    }
+    
     // === Denoise ===
     if (currentMode != gfx::RenderMode::Simple) {
         if (ImGui::CollapsingHeader("Denoise")) {
@@ -2891,6 +2947,94 @@ void EditorUI::HandleGlobalShortcuts() {
         return;
     }
     
+    // Handle interactive transform mode
+    if (IsInInteractiveTransform()) {
+        // Numeric input (simple): 0-9, '.', '-', backspace
+        auto appendChar = [&](char c) {
+            // Only allow one '-' at the start and one '.'
+            if (c == '-') {
+                if (!m_TransformNumeric.empty()) return;
+            }
+            if (c == '.') {
+                if (m_TransformNumeric.find('.') != std::string::npos) return;
+                if (m_TransformNumeric.empty()) m_TransformNumeric = "0";
+            }
+            m_TransformNumeric.push_back(c);
+        };
+        
+        if (ImGui::IsKeyPressed(ImGuiKey_Backspace) && !m_TransformNumeric.empty()) {
+            m_TransformNumeric.pop_back();
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Minus)) appendChar('-');
+        if (ImGui::IsKeyPressed(ImGuiKey_Period) || ImGui::IsKeyPressed(ImGuiKey_KeypadDecimal)) appendChar('.');
+        if (ImGui::IsKeyPressed(ImGuiKey_0) || ImGui::IsKeyPressed(ImGuiKey_Keypad0)) appendChar('0');
+        if (ImGui::IsKeyPressed(ImGuiKey_1) || ImGui::IsKeyPressed(ImGuiKey_Keypad1)) appendChar('1');
+        if (ImGui::IsKeyPressed(ImGuiKey_2) || ImGui::IsKeyPressed(ImGuiKey_Keypad2)) appendChar('2');
+        if (ImGui::IsKeyPressed(ImGuiKey_3) || ImGui::IsKeyPressed(ImGuiKey_Keypad3)) appendChar('3');
+        if (ImGui::IsKeyPressed(ImGuiKey_4) || ImGui::IsKeyPressed(ImGuiKey_Keypad4)) appendChar('4');
+        if (ImGui::IsKeyPressed(ImGuiKey_5) || ImGui::IsKeyPressed(ImGuiKey_Keypad5)) appendChar('5');
+        if (ImGui::IsKeyPressed(ImGuiKey_6) || ImGui::IsKeyPressed(ImGuiKey_Keypad6)) appendChar('6');
+        if (ImGui::IsKeyPressed(ImGuiKey_7) || ImGui::IsKeyPressed(ImGuiKey_Keypad7)) appendChar('7');
+        if (ImGui::IsKeyPressed(ImGuiKey_8) || ImGui::IsKeyPressed(ImGuiKey_Keypad8)) appendChar('8');
+        if (ImGui::IsKeyPressed(ImGuiKey_9) || ImGui::IsKeyPressed(ImGuiKey_Keypad9)) appendChar('9');
+        
+        // X/Y/Z - Set axis constraint
+        if (ImGui::IsKeyPressed(ImGuiKey_X)) {
+            m_AxisConstraint = (m_AxisConstraint == AxisConstraint::X) ? AxisConstraint::None : AxisConstraint::X;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Y)) {
+            m_AxisConstraint = (m_AxisConstraint == AxisConstraint::Y) ? AxisConstraint::None : AxisConstraint::Y;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Z)) {
+            m_AxisConstraint = (m_AxisConstraint == AxisConstraint::Z) ? AxisConstraint::None : AxisConstraint::Z;
+        }
+        
+        // Enter - Confirm (Blender-style)
+        if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
+            ConfirmInteractiveTransform();
+            return;
+        }
+        
+        // Left mouse button - Confirm
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            ConfirmInteractiveTransform();
+            return;
+        }
+        
+        // Escape or Right mouse button - Cancel
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape) || ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            CancelInteractiveTransform();
+            return;
+        }
+        
+        // Don't process other shortcuts while in interactive transform
+        return;
+    }
+    
+    // G - Start Grab in Object mode (only when viewport is hovered)
+    if (ImGui::IsKeyPressed(ImGuiKey_G) && !io.KeyCtrl && m_ViewportHovered) {
+        if (m_EditorMode == EditorMode::Object && !m_SelectedEntities.empty()) {
+            StartInteractiveTransform(InteractiveTransformType::Grab);
+            return;
+        }
+    }
+    
+    // R - Start Rotate in Object mode (only when viewport is hovered)
+    if (ImGui::IsKeyPressed(ImGuiKey_R) && !io.KeyCtrl && m_ViewportHovered) {
+        if (m_EditorMode == EditorMode::Object && !m_SelectedEntities.empty()) {
+            StartInteractiveTransform(InteractiveTransformType::Rotate);
+            return;
+        }
+    }
+    
+    // S - Start Scale in Object mode (only when viewport is hovered)
+    if (ImGui::IsKeyPressed(ImGuiKey_S) && !io.KeyCtrl && m_ViewportHovered) {
+        if (m_EditorMode == EditorMode::Object && !m_SelectedEntities.empty()) {
+            StartInteractiveTransform(InteractiveTransformType::Scale);
+            return;
+        }
+    }
+    
     // Ctrl+Z - Undo
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z) && !io.KeyShift) {
         if (UndoStack::Get().CanUndo()) {
@@ -3008,6 +3152,1142 @@ void EditorUI::HandleGlobalShortcuts() {
         for (auto& e : newEntities) AddToSelection(e);
         m_SceneDirty = true;
     }
+    
+    // Tab - Toggle Object/Edit mode
+    if (ImGui::IsKeyPressed(ImGuiKey_Tab) && !io.KeyCtrl && !io.KeyAlt) {
+        ToggleEditorMode();
+    }
+    
+    // In Edit Mode: 1/2/3 for selection mode
+    if (m_EditorMode == EditorMode::Edit) {
+        if (ImGui::IsKeyPressed(ImGuiKey_1)) {
+            SetMeshSelectMode(MeshSelectMode::Vertex);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_2)) {
+            SetMeshSelectMode(MeshSelectMode::Edge);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_3)) {
+            SetMeshSelectMode(MeshSelectMode::Face);
+        }
+        
+        // Get editable mesh for operations
+        scene::Entity entity = GetEditedEntity();
+        scene::EditableMeshComponent* editMesh = nullptr;
+        if (entity.IsValid()) {
+            editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+        }
+        
+        if (editMesh && editMesh->HasMesh()) {
+            auto* meshPtr = editMesh->mesh.get();
+            uint32_t entityId = entity.GetID();
+            
+            // Helper lambda to push undo command
+            auto pushMeshUndo = [this, editMesh, entityId](const std::string& opName, 
+                                                            const MeshEditCommand::MeshSnapshot& before) {
+                auto after = MeshEditCommand::CaptureSnapshot(editMesh);
+                auto cmd = std::make_unique<MeshEditCommand>(
+                    m_Scene, entityId, opName, before, std::move(after)
+                );
+                UndoStack::Get().Push(std::move(cmd));
+            };
+            
+            // E - Extrude
+            if (ImGui::IsKeyPressed(ImGuiKey_E) && !io.KeyCtrl) {
+                if (!meshPtr->GetSelection().faces.empty()) {
+                    auto before = MeshEditCommand::CaptureSnapshot(editMesh);
+                    mesh::MeshOps::ExtrudeFaces(*meshPtr, 0.5f);
+                    editMesh->MarkDirty();
+                    m_SceneDirty = true;
+                    pushMeshUndo("Extrude", before);
+                    LUCENT_CORE_INFO("Extruded {} faces", meshPtr->GetSelection().faces.size());
+                }
+            }
+            
+            // I - Inset
+            if (ImGui::IsKeyPressed(ImGuiKey_I) && !io.KeyCtrl) {
+                if (!meshPtr->GetSelection().faces.empty()) {
+                    auto before = MeshEditCommand::CaptureSnapshot(editMesh);
+                    mesh::MeshOps::InsetFaces(*meshPtr, 0.2f);
+                    editMesh->MarkDirty();
+                    m_SceneDirty = true;
+                    pushMeshUndo("Inset", before);
+                    LUCENT_CORE_INFO("Inset {} faces", meshPtr->GetSelection().faces.size());
+                }
+            }
+            
+            // X - Delete
+            if (ImGui::IsKeyPressed(ImGuiKey_X) && !io.KeyCtrl) {
+                auto before = MeshEditCommand::CaptureSnapshot(editMesh);
+                bool didDelete = false;
+                
+                switch (m_MeshSelectMode) {
+                    case MeshSelectMode::Vertex:
+                        if (!meshPtr->GetSelection().vertices.empty()) {
+                            mesh::MeshOps::DeleteVertices(*meshPtr);
+                            didDelete = true;
+                        }
+                        break;
+                    case MeshSelectMode::Edge:
+                        if (!meshPtr->GetSelection().edges.empty()) {
+                            mesh::MeshOps::DeleteEdges(*meshPtr);
+                            didDelete = true;
+                        }
+                        break;
+                    case MeshSelectMode::Face:
+                        if (!meshPtr->GetSelection().faces.empty()) {
+                            mesh::MeshOps::DeleteFaces(*meshPtr);
+                            didDelete = true;
+                        }
+                        break;
+                }
+                
+                if (didDelete) {
+                    editMesh->MarkDirty();
+                    m_SceneDirty = true;
+                    pushMeshUndo("Delete", before);
+                }
+            }
+            
+            // M - Merge vertices
+            if (ImGui::IsKeyPressed(ImGuiKey_M)) {
+                if (!meshPtr->GetSelection().vertices.empty()) {
+                    auto before = MeshEditCommand::CaptureSnapshot(editMesh);
+                    mesh::MeshOps::MergeVerticesAtCenter(*meshPtr);
+                    editMesh->MarkDirty();
+                    m_SceneDirty = true;
+                    pushMeshUndo("Merge", before);
+                    LUCENT_CORE_INFO("Merged vertices at center");
+                }
+            }
+            
+            // A - Select All / Deselect All
+            if (ImGui::IsKeyPressed(ImGuiKey_A) && !io.KeyCtrl) {
+                if (meshPtr->GetSelection().Empty()) {
+                    meshPtr->SelectAll();
+                } else {
+                    meshPtr->DeselectAll();
+                }
+            }
+            
+            // G - Start interactive Grab
+            if (ImGui::IsKeyPressed(ImGuiKey_G) && !io.KeyCtrl && m_ViewportHovered) {
+                if (!meshPtr->GetSelection().Empty()) {
+                    StartInteractiveTransform(InteractiveTransformType::Grab);
+                }
+            }
+            
+            // R - Rotate (still uses gizmo for now)
+            if (ImGui::IsKeyPressed(ImGuiKey_R) && !io.KeyCtrl && !io.KeyShift) {
+                m_GizmoOperation = GizmoOperation::Rotate;
+            }
+            
+            // S - Scale (still uses gizmo for now)
+            if (ImGui::IsKeyPressed(ImGuiKey_S) && !io.KeyCtrl) {
+                m_GizmoOperation = GizmoOperation::Scale;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Edit Mode
+// ============================================================================
+
+void EditorUI::SetEditorMode(EditorMode mode) {
+    if (m_EditorMode == mode) return;
+    
+    if (mode == EditorMode::Edit) {
+        // Entering Edit Mode - ensure we have a selected entity with a mesh
+        if (m_SelectedEntities.size() != 1) {
+            LUCENT_CORE_WARN("Edit Mode requires exactly one selected entity");
+            return;
+        }
+        
+        scene::Entity entity = m_Scene->GetEntity(m_SelectedEntities[0]);
+        if (!entity.IsValid()) {
+            LUCENT_CORE_WARN("Selected entity is invalid");
+            return;
+        }
+        
+        auto* meshRenderer = entity.GetComponent<scene::MeshRendererComponent>();
+        if (!meshRenderer) {
+            LUCENT_CORE_WARN("Selected entity has no mesh renderer");
+            return;
+        }
+        
+        // Create EditableMeshComponent if it doesn't exist
+        if (!entity.HasComponent<scene::EditableMeshComponent>()) {
+            auto& editMesh = entity.AddComponent<scene::EditableMeshComponent>();
+            
+            // Initialize from primitive type if applicable
+            if (meshRenderer->primitiveType != scene::MeshRendererComponent::PrimitiveType::None) {
+                editMesh.InitFromPrimitive(meshRenderer->primitiveType);
+            } else {
+                LUCENT_CORE_WARN("Cannot enter Edit Mode: mesh is not a primitive (import support TODO)");
+                return;
+            }
+        }
+        
+        m_EditedEntityID = m_SelectedEntities[0];
+        m_EditorMode = EditorMode::Edit;
+        m_MeshSelectMode = MeshSelectMode::Vertex;
+        
+        LUCENT_CORE_INFO("Entered Edit Mode for entity: {}", entity.GetComponent<scene::TagComponent>()->name);
+    } else {
+        // Exiting Edit Mode
+        m_EditorMode = EditorMode::Object;
+        m_EditedEntityID = UINT32_MAX;
+        
+        LUCENT_CORE_INFO("Exited Edit Mode");
+    }
+}
+
+void EditorUI::ToggleEditorMode() {
+    if (m_EditorMode == EditorMode::Object) {
+        SetEditorMode(EditorMode::Edit);
+    } else {
+        SetEditorMode(EditorMode::Object);
+    }
+}
+
+void EditorUI::SetMeshSelectMode(MeshSelectMode mode) {
+    if (m_EditorMode != EditorMode::Edit) return;
+    
+    m_MeshSelectMode = mode;
+    
+    const char* modeName = "Vertex";
+    switch (mode) {
+        case MeshSelectMode::Vertex: modeName = "Vertex"; break;
+        case MeshSelectMode::Edge: modeName = "Edge"; break;
+        case MeshSelectMode::Face: modeName = "Face"; break;
+    }
+    LUCENT_CORE_DEBUG("Mesh selection mode: {}", modeName);
+}
+
+scene::Entity EditorUI::GetEditedEntity() const {
+    if (m_EditorMode != EditorMode::Edit || m_EditedEntityID == UINT32_MAX || !m_Scene) {
+        return scene::Entity();
+    }
+    return m_Scene->GetEntity(m_EditedEntityID);
+}
+
+// ============================================================================
+// Edit Mode Picking and Overlay
+// ============================================================================
+
+glm::vec3 EditorUI::WorldToScreen(const glm::vec3& worldPos) {
+    if (!m_EditorCamera) return glm::vec3(0);
+    
+    glm::mat4 view = m_EditorCamera->GetViewMatrix();
+    glm::mat4 proj = m_EditorCamera->GetProjectionMatrix();
+    
+    glm::vec4 clipPos = proj * view * glm::vec4(worldPos, 1.0f);
+    if (clipPos.w <= 0.0f) return glm::vec3(-1000, -1000, -1); // Behind camera
+    
+    glm::vec3 ndcPos = glm::vec3(clipPos) / clipPos.w;
+    
+    // Convert to screen coordinates
+    // Note: Vulkan uses Y-down in framebuffer, and we're not flipping in the projection,
+    // so don't flip Y here either - just map NDC directly to screen space
+    float screenX = m_ViewportPosition.x + (ndcPos.x * 0.5f + 0.5f) * m_ViewportSize.x;
+    float screenY = m_ViewportPosition.y + (ndcPos.y * 0.5f + 0.5f) * m_ViewportSize.y;
+    
+    return glm::vec3(screenX, screenY, ndcPos.z);
+}
+
+void EditorUI::HandleEditModeClick() {
+    if (m_EditorMode != EditorMode::Edit) return;
+    if (!m_ViewportHovered || m_UsingGizmo) return;
+    
+    ImGuiIO& io = ImGui::GetIO();
+    if (!ImGui::IsMouseClicked(ImGuiMouseButton_Left)) return;
+    
+    glm::vec2 mousePos(io.MousePos.x, io.MousePos.y);
+    
+    scene::Entity entity = GetEditedEntity();
+    if (!entity.IsValid()) return;
+    
+    auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+    if (!editMesh || !editMesh->HasMesh()) return;
+    
+    auto* mesh = editMesh->mesh.get();
+    bool shiftHeld = io.KeyShift;
+    bool ctrlHeld = io.KeyCtrl;
+    
+    switch (m_MeshSelectMode) {
+        case MeshSelectMode::Vertex: {
+            mesh::VertexID vid = PickVertex(mousePos);
+            if (vid != mesh::INVALID_ID) {
+                if (ctrlHeld) {
+                    // Toggle selection
+                    if (mesh->GetSelection().vertices.count(vid)) {
+                        mesh->GetSelection().vertices.erase(vid);
+                        auto* v = mesh->GetVertex(vid);
+                        if (v) v->selected = false;
+                    } else {
+                        mesh->SelectVertex(vid, true);
+                    }
+                } else {
+                    mesh->SelectVertex(vid, shiftHeld);
+                }
+            } else if (!shiftHeld && !ctrlHeld) {
+                mesh->DeselectAll();
+            }
+            break;
+        }
+        case MeshSelectMode::Edge: {
+            mesh::EdgeID eid = PickEdge(mousePos);
+            if (eid != mesh::INVALID_ID) {
+                if (ctrlHeld) {
+                    if (mesh->GetSelection().edges.count(eid)) {
+                        mesh->GetSelection().edges.erase(eid);
+                        auto* e = mesh->GetEdge(eid);
+                        if (e) e->selected = false;
+                    } else {
+                        mesh->SelectEdge(eid, true);
+                    }
+                } else {
+                    mesh->SelectEdge(eid, shiftHeld);
+                }
+            } else if (!shiftHeld && !ctrlHeld) {
+                mesh->DeselectAll();
+            }
+            break;
+        }
+        case MeshSelectMode::Face: {
+            mesh::FaceID fid = PickFace(mousePos);
+            if (fid != mesh::INVALID_ID) {
+                if (ctrlHeld) {
+                    if (mesh->GetSelection().faces.count(fid)) {
+                        mesh->GetSelection().faces.erase(fid);
+                        auto* f = mesh->GetFace(fid);
+                        if (f) f->selected = false;
+                    } else {
+                        mesh->SelectFace(fid, true);
+                    }
+                } else {
+                    mesh->SelectFace(fid, shiftHeld);
+                }
+            } else if (!shiftHeld && !ctrlHeld) {
+                mesh->DeselectAll();
+            }
+            break;
+        }
+    }
+}
+
+mesh::VertexID EditorUI::PickVertex(const glm::vec2& mousePos, float radius) {
+    scene::Entity entity = GetEditedEntity();
+    if (!entity.IsValid()) return mesh::INVALID_ID;
+    
+    auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+    if (!editMesh || !editMesh->HasMesh()) return mesh::INVALID_ID;
+    
+    auto* transform = entity.GetComponent<scene::TransformComponent>();
+    glm::mat4 modelMatrix = transform ? transform->GetLocalMatrix() : glm::mat4(1.0f);
+    
+    auto* mesh = editMesh->mesh.get();
+    mesh::VertexID closestVid = mesh::INVALID_ID;
+    float closestDist = radius * radius;
+    
+    for (const auto& v : mesh->GetVertices()) {
+        if (v.id == mesh::INVALID_ID) continue;
+        
+        glm::vec3 worldPos = glm::vec3(modelMatrix * glm::vec4(v.position, 1.0f));
+        glm::vec3 screenPos = WorldToScreen(worldPos);
+        
+        if (screenPos.z < 0 || screenPos.z > 1) continue; // Behind camera or too far
+        
+        float dx = screenPos.x - mousePos.x;
+        float dy = screenPos.y - mousePos.y;
+        float distSq = dx * dx + dy * dy;
+        
+        if (distSq < closestDist) {
+            closestDist = distSq;
+            closestVid = v.id;
+        }
+    }
+    
+    return closestVid;
+}
+
+mesh::EdgeID EditorUI::PickEdge(const glm::vec2& mousePos, float radius) {
+    scene::Entity entity = GetEditedEntity();
+    if (!entity.IsValid()) return mesh::INVALID_ID;
+    
+    auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+    if (!editMesh || !editMesh->HasMesh()) return mesh::INVALID_ID;
+    
+    auto* transform = entity.GetComponent<scene::TransformComponent>();
+    glm::mat4 modelMatrix = transform ? transform->GetLocalMatrix() : glm::mat4(1.0f);
+    
+    auto* mesh = editMesh->mesh.get();
+    mesh::EdgeID closestEid = mesh::INVALID_ID;
+    float closestDist = radius;
+    
+    for (const auto& e : mesh->GetEdges()) {
+        if (e.id == mesh::INVALID_ID) continue;
+        
+        const mesh::EMVertex* v0 = mesh->GetVertex(e.v0);
+        const mesh::EMVertex* v1 = mesh->GetVertex(e.v1);
+        if (!v0 || !v1) continue;
+        
+        glm::vec3 worldP0 = glm::vec3(modelMatrix * glm::vec4(v0->position, 1.0f));
+        glm::vec3 worldP1 = glm::vec3(modelMatrix * glm::vec4(v1->position, 1.0f));
+        
+        glm::vec3 screenP0 = WorldToScreen(worldP0);
+        glm::vec3 screenP1 = WorldToScreen(worldP1);
+        
+        // Skip if edge is behind camera
+        if (screenP0.z < 0 || screenP1.z < 0 || screenP0.z > 1 || screenP1.z > 1) continue;
+        
+        // Calculate distance from point to line segment
+        glm::vec2 p0(screenP0.x, screenP0.y);
+        glm::vec2 p1(screenP1.x, screenP1.y);
+        glm::vec2 p(mousePos.x, mousePos.y);
+        
+        glm::vec2 lineDir = p1 - p0;
+        float lineLenSq = glm::dot(lineDir, lineDir);
+        if (lineLenSq < 0.0001f) continue;
+        
+        float t = glm::clamp(glm::dot(p - p0, lineDir) / lineLenSq, 0.0f, 1.0f);
+        glm::vec2 closest = p0 + t * lineDir;
+        float dist = glm::length(p - closest);
+        
+        if (dist < closestDist) {
+            closestDist = dist;
+            closestEid = e.id;
+        }
+    }
+    
+    return closestEid;
+}
+
+mesh::FaceID EditorUI::PickFace(const glm::vec2& mousePos) {
+    scene::Entity entity = GetEditedEntity();
+    if (!entity.IsValid()) return mesh::INVALID_ID;
+    
+    auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+    if (!editMesh || !editMesh->HasMesh()) return mesh::INVALID_ID;
+    
+    auto* transform = entity.GetComponent<scene::TransformComponent>();
+    glm::mat4 modelMatrix = transform ? transform->GetLocalMatrix() : glm::mat4(1.0f);
+    
+    auto* meshData = editMesh->mesh.get();
+    
+    // Cast a ray and check against triangulated faces
+    if (!m_EditorCamera) return mesh::INVALID_ID;
+    
+    // Convert mouse to normalized device coordinates
+    float ndcX = ((mousePos.x - m_ViewportPosition.x) / m_ViewportSize.x) * 2.0f - 1.0f;
+    float ndcY = 1.0f - ((mousePos.y - m_ViewportPosition.y) / m_ViewportSize.y) * 2.0f;
+    
+    glm::mat4 view = m_EditorCamera->GetViewMatrix();
+    glm::mat4 proj = m_EditorCamera->GetProjectionMatrix();
+    glm::mat4 invViewProj = glm::inverse(proj * view);
+    
+    glm::vec4 rayClipNear(ndcX, ndcY, 0.0f, 1.0f);
+    glm::vec4 rayClipFar(ndcX, ndcY, 1.0f, 1.0f);
+    
+    glm::vec4 rayWorldNear = invViewProj * rayClipNear;
+    glm::vec4 rayWorldFar = invViewProj * rayClipFar;
+    
+    rayWorldNear /= rayWorldNear.w;
+    rayWorldFar /= rayWorldFar.w;
+    
+    glm::vec3 rayOrigin = glm::vec3(rayWorldNear);
+    glm::vec3 rayDir = glm::normalize(glm::vec3(rayWorldFar - rayWorldNear));
+    
+    // Transform ray to model space
+    glm::mat4 invModel = glm::inverse(modelMatrix);
+    glm::vec3 localRayOrigin = glm::vec3(invModel * glm::vec4(rayOrigin, 1.0f));
+    glm::vec3 localRayDir = glm::normalize(glm::vec3(invModel * glm::vec4(rayDir, 0.0f)));
+    
+    mesh::FaceID closestFace = mesh::INVALID_ID;
+    float closestT = std::numeric_limits<float>::max();
+    
+    // Check each face
+    for (const auto& face : meshData->GetFaces()) {
+        if (face.id == mesh::INVALID_ID) continue;
+        
+        // Collect face vertices
+        std::vector<glm::vec3> faceVerts;
+        meshData->ForEachFaceVertex(face.id, [&](const mesh::EMVertex& v) {
+            faceVerts.push_back(v.position);
+        });
+        
+        if (faceVerts.size() < 3) continue;
+        
+        // Triangulate and test each triangle
+        for (size_t i = 1; i + 1 < faceVerts.size(); ++i) {
+            glm::vec3 v0 = faceVerts[0];
+            glm::vec3 v1 = faceVerts[i];
+            glm::vec3 v2 = faceVerts[i + 1];
+            
+            // Ray-triangle intersection (Moller-Trumbore)
+            glm::vec3 edge1 = v1 - v0;
+            glm::vec3 edge2 = v2 - v0;
+            glm::vec3 h = glm::cross(localRayDir, edge2);
+            float a = glm::dot(edge1, h);
+            
+            if (std::abs(a) < 0.00001f) continue;
+            
+            float f = 1.0f / a;
+            glm::vec3 s = localRayOrigin - v0;
+            float u = f * glm::dot(s, h);
+            
+            if (u < 0.0f || u > 1.0f) continue;
+            
+            glm::vec3 q = glm::cross(s, edge1);
+            float v = f * glm::dot(localRayDir, q);
+            
+            if (v < 0.0f || u + v > 1.0f) continue;
+            
+            float t = f * glm::dot(edge2, q);
+            
+            if (t > 0.001f && t < closestT) {
+                closestT = t;
+                closestFace = face.id;
+            }
+        }
+    }
+    
+    return closestFace;
+}
+
+void EditorUI::DrawEditModeOverlay() {
+    if (m_EditorMode != EditorMode::Edit) return;
+    
+    scene::Entity entity = GetEditedEntity();
+    if (!entity.IsValid()) return;
+    
+    auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+    if (!editMesh || !editMesh->HasMesh()) return;
+    
+    auto* transform = entity.GetComponent<scene::TransformComponent>();
+    glm::mat4 modelMatrix = transform ? transform->GetLocalMatrix() : glm::mat4(1.0f);
+    
+    auto* mesh = editMesh->mesh.get();
+    ImDrawList* drawList = ImGui::GetForegroundDrawList();
+    
+    // Colors
+    const ImU32 vertexColor = IM_COL32(200, 200, 255, 200);
+    const ImU32 vertexSelectedColor = IM_COL32(255, 150, 50, 255);
+    const ImU32 edgeColor = IM_COL32(150, 150, 200, 100);
+    const ImU32 edgeSelectedColor = IM_COL32(255, 150, 50, 255);
+    const ImU32 faceColor = IM_COL32(100, 100, 150, 40);           // Subtle face overlay
+    const ImU32 faceSelectedColor = IM_COL32(255, 150, 50, 120);   // Much more visible
+    const ImU32 faceOutlineColor = IM_COL32(255, 180, 100, 255);   // Bright outline
+    
+    // Draw faces (in face mode, show all faces with subtle overlay)
+    if (m_MeshSelectMode == MeshSelectMode::Face) {
+        for (const auto& face : mesh->GetFaces()) {
+            if (face.id == mesh::INVALID_ID) continue;
+            
+            std::vector<ImVec2> screenVerts;
+            bool allVisible = true;
+            
+            mesh->ForEachFaceVertex(face.id, [&](const mesh::EMVertex& v) {
+                glm::vec3 worldPos = glm::vec3(modelMatrix * glm::vec4(v.position, 1.0f));
+                glm::vec3 screenPos = WorldToScreen(worldPos);
+                if (screenPos.z < 0 || screenPos.z > 1) allVisible = false;
+                screenVerts.push_back(ImVec2(screenPos.x, screenPos.y));
+            });
+            
+            if (allVisible && screenVerts.size() >= 3) {
+                ImU32 fillColor = face.selected ? faceSelectedColor : faceColor;
+                drawList->AddConvexPolyFilled(screenVerts.data(), static_cast<int>(screenVerts.size()), fillColor);
+                
+                // Draw outline for selected faces
+                if (face.selected) {
+                    for (size_t i = 0; i < screenVerts.size(); ++i) {
+                        size_t next = (i + 1) % screenVerts.size();
+                        drawList->AddLine(screenVerts[i], screenVerts[next], faceOutlineColor, 2.0f);
+                    }
+                }
+            }
+        }
+    } else {
+        // In other modes, still show selected faces
+        for (const auto& face : mesh->GetFaces()) {
+            if (face.id == mesh::INVALID_ID) continue;
+            if (!face.selected) continue;
+            
+            std::vector<ImVec2> screenVerts;
+            bool allVisible = true;
+            
+            mesh->ForEachFaceVertex(face.id, [&](const mesh::EMVertex& v) {
+                glm::vec3 worldPos = glm::vec3(modelMatrix * glm::vec4(v.position, 1.0f));
+                glm::vec3 screenPos = WorldToScreen(worldPos);
+                if (screenPos.z < 0 || screenPos.z > 1) allVisible = false;
+                screenVerts.push_back(ImVec2(screenPos.x, screenPos.y));
+            });
+            
+            if (allVisible && screenVerts.size() >= 3) {
+                drawList->AddConvexPolyFilled(screenVerts.data(), static_cast<int>(screenVerts.size()), faceSelectedColor);
+            }
+        }
+    }
+    
+    // Draw edges (in all modes for better visibility)
+    if (m_MeshSelectMode == MeshSelectMode::Edge || m_MeshSelectMode == MeshSelectMode::Vertex || m_MeshSelectMode == MeshSelectMode::Face) {
+        for (const auto& e : mesh->GetEdges()) {
+            if (e.id == mesh::INVALID_ID) continue;
+            
+            const mesh::EMVertex* v0 = mesh->GetVertex(e.v0);
+            const mesh::EMVertex* v1 = mesh->GetVertex(e.v1);
+            if (!v0 || !v1) continue;
+            
+            glm::vec3 worldP0 = glm::vec3(modelMatrix * glm::vec4(v0->position, 1.0f));
+            glm::vec3 worldP1 = glm::vec3(modelMatrix * glm::vec4(v1->position, 1.0f));
+            
+            glm::vec3 screenP0 = WorldToScreen(worldP0);
+            glm::vec3 screenP1 = WorldToScreen(worldP1);
+            
+            if (screenP0.z < 0 || screenP1.z < 0 || screenP0.z > 1 || screenP1.z > 1) continue;
+            
+            ImU32 color = e.selected ? edgeSelectedColor : edgeColor;
+            float thickness = e.selected ? 2.0f : 1.0f;
+            
+            drawList->AddLine(
+                ImVec2(screenP0.x, screenP0.y),
+                ImVec2(screenP1.x, screenP1.y),
+                color, thickness
+            );
+        }
+    }
+    
+    // Draw vertices
+    if (m_MeshSelectMode == MeshSelectMode::Vertex) {
+        for (const auto& v : mesh->GetVertices()) {
+            if (v.id == mesh::INVALID_ID) continue;
+            
+            glm::vec3 worldPos = glm::vec3(modelMatrix * glm::vec4(v.position, 1.0f));
+            glm::vec3 screenPos = WorldToScreen(worldPos);
+            
+            if (screenPos.z < 0 || screenPos.z > 1) continue;
+            
+            ImU32 color = v.selected ? vertexSelectedColor : vertexColor;
+            float radius = v.selected ? 5.0f : 3.0f;
+            
+            drawList->AddCircleFilled(ImVec2(screenPos.x, screenPos.y), radius, color);
+        }
+    }
+}
+
+// ============================================================================
+// Interactive Transform (Blender-style G/R/S)
+// ============================================================================
+
+void EditorUI::StartInteractiveTransform(InteractiveTransformType type) {
+    if (type == InteractiveTransformType::None) return;
+    
+    // Store starting mouse position
+    ImVec2 mousePos = ImGui::GetMousePos();
+    m_TransformStartMousePos = glm::vec2(mousePos.x, mousePos.y);
+    m_AxisConstraint = AxisConstraint::None;
+    m_InteractiveTransform = type;
+    m_TransformNumeric.clear();
+    
+    if (m_EditorMode == EditorMode::Object) {
+        // Object mode - store starting position of selected entity
+        scene::Entity selected = GetSelectedEntity();
+        if (!selected.IsValid()) {
+            m_InteractiveTransform = InteractiveTransformType::None;
+            return;
+        }
+        
+        auto* transform = selected.GetComponent<scene::TransformComponent>();
+        if (!transform) {
+            m_InteractiveTransform = InteractiveTransformType::None;
+            return;
+        }
+        
+        m_TransformStartValue = transform->position;
+        m_TransformStartRotation = transform->rotation;
+        m_TransformStartScale = transform->scale;
+        m_TransformPivotLocal = glm::vec3(0.0f); // unused for object mode
+        switch (type) {
+            case InteractiveTransformType::Grab:   LUCENT_CORE_INFO("Started interactive Grab (Object Mode)"); break;
+            case InteractiveTransformType::Rotate: LUCENT_CORE_INFO("Started interactive Rotate (Object Mode)"); break;
+            case InteractiveTransformType::Scale:  LUCENT_CORE_INFO("Started interactive Scale (Object Mode)"); break;
+            default: break;
+        }
+    } else {
+        // Edit mode - store starting positions of all selected vertices
+        scene::Entity entity = GetEditedEntity();
+        if (!entity.IsValid()) {
+            m_InteractiveTransform = InteractiveTransformType::None;
+            return;
+        }
+        
+        auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+        if (!editMesh || !editMesh->HasMesh()) {
+            m_InteractiveTransform = InteractiveTransformType::None;
+            return;
+        }
+        
+        auto* meshPtr = editMesh->mesh.get();
+        
+        // Convert edge/face selection to vertex selection for grabbing
+        // Store IDs of vertices to move and their starting positions
+        m_TransformStartPositions.clear();
+        m_TransformVertexIDs.clear();
+        
+        std::unordered_set<mesh::VertexID> vertexSet;
+        
+        // Collect vertices from current selection based on mode
+        switch (m_MeshSelectMode) {
+            case MeshSelectMode::Vertex:
+                for (const auto& v : meshPtr->GetVertices()) {
+                    if (v.selected && v.id != mesh::INVALID_ID) {
+                        vertexSet.insert(v.id);
+                    }
+                }
+                break;
+            case MeshSelectMode::Edge:
+                for (const auto& e : meshPtr->GetEdges()) {
+                    if (e.selected && e.id != mesh::INVALID_ID) {
+                        if (e.v0 != mesh::INVALID_ID) vertexSet.insert(e.v0);
+                        if (e.v1 != mesh::INVALID_ID) vertexSet.insert(e.v1);
+                    }
+                }
+                break;
+            case MeshSelectMode::Face:
+                for (const auto& f : meshPtr->GetFaces()) {
+                    if (f.selected && f.id != mesh::INVALID_ID) {
+                        meshPtr->ForEachFaceVertex(f.id, [&](const mesh::EMVertex& v) {
+                            if (v.id != mesh::INVALID_ID) vertexSet.insert(v.id);
+                        });
+                    }
+                }
+                break;
+        }
+        
+        // Store starting positions for all affected vertices
+        for (mesh::VertexID vid : vertexSet) {
+            const auto* v = meshPtr->GetVertex(vid);
+            if (v) {
+                m_TransformVertexIDs.push_back(vid);
+                m_TransformStartPositions.push_back(v->position);
+            }
+        }
+        
+        if (m_TransformStartPositions.empty()) {
+            m_InteractiveTransform = InteractiveTransformType::None;
+            return;
+        }
+        
+        // Compute pivot (selection center) in local space
+        glm::vec3 center(0.0f);
+        for (const auto& p : m_TransformStartPositions) center += p;
+        center /= static_cast<float>(m_TransformStartPositions.size());
+        m_TransformPivotLocal = center;
+        
+        switch (type) {
+            case InteractiveTransformType::Grab:
+                LUCENT_CORE_INFO("Started interactive Grab (Edit Mode) - {} vertices", m_TransformStartPositions.size());
+                break;
+            case InteractiveTransformType::Rotate:
+                LUCENT_CORE_INFO("Started interactive Rotate (Edit Mode) - {} vertices", m_TransformStartPositions.size());
+                break;
+            case InteractiveTransformType::Scale:
+                LUCENT_CORE_INFO("Started interactive Scale (Edit Mode) - {} vertices", m_TransformStartPositions.size());
+                break;
+            default: break;
+        }
+    }
+}
+
+void EditorUI::UpdateInteractiveTransform() {
+    if (m_InteractiveTransform == InteractiveTransformType::None) return;
+    
+    auto parseNumeric = [&]() -> std::optional<float> {
+        if (m_TransformNumeric.empty()) return std::nullopt;
+        try {
+            size_t idx = 0;
+            float v = std::stof(m_TransformNumeric, &idx);
+            if (idx != m_TransformNumeric.size()) return std::nullopt;
+            return v;
+        } catch (...) {
+            return std::nullopt;
+        }
+    };
+    
+    // Calculate mouse delta
+    ImVec2 mousePos = ImGui::GetMousePos();
+    glm::vec2 mouseDelta = glm::vec2(mousePos.x, mousePos.y) - m_TransformStartMousePos;
+    
+    // Get camera for screen-to-world conversion
+    if (!m_EditorCamera) return;
+    
+    // Get camera basis vectors from the view matrix
+    // The view matrix rows contain the camera's basis vectors in world space
+    glm::mat4 view = m_EditorCamera->GetViewMatrix();
+    glm::vec3 camRight = glm::normalize(glm::vec3(view[0][0], view[1][0], view[2][0]));
+    glm::vec3 camUp = glm::normalize(glm::vec3(view[0][1], view[1][1], view[2][1]));
+    
+    float sensitivity = m_TransformSensitivity;
+    std::optional<float> numeric = parseNumeric();
+    
+    // =========================================================================
+    // Grab (Translate)
+    // =========================================================================
+    if (m_InteractiveTransform == InteractiveTransformType::Grab) {
+        glm::vec3 worldDelta(0.0f);
+        
+        switch (m_AxisConstraint) {
+            case AxisConstraint::X: {
+                float magnitude = numeric ? *numeric : (mouseDelta.x * sensitivity);
+                worldDelta = glm::vec3(magnitude, 0, 0);
+                break;
+            }
+            case AxisConstraint::Y: {
+                float magnitude = numeric ? *numeric : (-mouseDelta.y * sensitivity);
+                worldDelta = glm::vec3(0, magnitude, 0);
+                break;
+            }
+            case AxisConstraint::Z: {
+                float magnitude = numeric ? *numeric : (mouseDelta.x * sensitivity);
+                worldDelta = glm::vec3(0, 0, magnitude);
+                break;
+            }
+            case AxisConstraint::None:
+            default: {
+                worldDelta = (camRight * mouseDelta.x - camUp * mouseDelta.y) * sensitivity;
+                if (numeric) {
+                    float len = glm::length(worldDelta);
+                    if (len > 1e-6f) worldDelta = (worldDelta / len) * (*numeric);
+                }
+                break;
+            }
+        }
+        
+        if (m_SnapEnabled) {
+            worldDelta.x = std::round(worldDelta.x / m_TranslateSnap) * m_TranslateSnap;
+            worldDelta.y = std::round(worldDelta.y / m_TranslateSnap) * m_TranslateSnap;
+            worldDelta.z = std::round(worldDelta.z / m_TranslateSnap) * m_TranslateSnap;
+        }
+        
+        if (m_EditorMode == EditorMode::Object) {
+            scene::Entity selected = GetSelectedEntity();
+            if (!selected.IsValid()) return;
+            auto* transform = selected.GetComponent<scene::TransformComponent>();
+            if (!transform) return;
+            transform->position = m_TransformStartValue + worldDelta;
+            m_SceneDirty = true;
+        } else {
+            scene::Entity entity = GetEditedEntity();
+            if (!entity.IsValid()) return;
+            auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+            if (!editMesh || !editMesh->HasMesh()) return;
+            
+            auto* transform = entity.GetComponent<scene::TransformComponent>();
+            glm::mat4 modelMatrix = transform ? transform->GetLocalMatrix() : glm::mat4(1.0f);
+            glm::mat4 invModelMatrix = glm::inverse(modelMatrix);
+            glm::vec3 localDelta = glm::vec3(invModelMatrix * glm::vec4(worldDelta, 0.0f));
+            
+            for (size_t idx = 0; idx < m_TransformVertexIDs.size() && idx < m_TransformStartPositions.size(); ++idx) {
+                auto* vert = editMesh->mesh->GetVertex(m_TransformVertexIDs[idx]);
+                if (vert) vert->position = m_TransformStartPositions[idx] + localDelta;
+            }
+            
+            editMesh->mesh->RecalculateNormals();
+            editMesh->MarkDirty();
+            m_SceneDirty = true;
+        }
+        
+        return;
+    }
+    
+    // =========================================================================
+    // Rotate
+    // =========================================================================
+    if (m_InteractiveTransform == InteractiveTransformType::Rotate) {
+        float degrees = numeric ? *numeric : (mouseDelta.x * sensitivity * 50.0f);
+        if (m_SnapEnabled) degrees = std::round(degrees / m_RotateSnap) * m_RotateSnap;
+        
+        glm::vec3 axis(0.0f, 1.0f, 0.0f);
+        switch (m_AxisConstraint) {
+            case AxisConstraint::X: axis = glm::vec3(1, 0, 0); break;
+            case AxisConstraint::Y: axis = glm::vec3(0, 1, 0); break;
+            case AxisConstraint::Z: axis = glm::vec3(0, 0, 1); break;
+            case AxisConstraint::None: default: break;
+        }
+        
+        if (m_EditorMode == EditorMode::Object) {
+            scene::Entity selected = GetSelectedEntity();
+            if (!selected.IsValid()) return;
+            auto* transform = selected.GetComponent<scene::TransformComponent>();
+            if (!transform) return;
+            
+            if (m_AxisConstraint == AxisConstraint::None) {
+                transform->rotation = m_TransformStartRotation + glm::vec3(mouseDelta.y, -mouseDelta.x, 0.0f) * (sensitivity * 50.0f);
+            } else {
+                glm::vec3 delta(0.0f);
+                if (axis.x != 0) delta.x = degrees;
+                if (axis.y != 0) delta.y = degrees;
+                if (axis.z != 0) delta.z = degrees;
+                transform->rotation = m_TransformStartRotation + delta;
+            }
+            m_SceneDirty = true;
+        } else {
+            scene::Entity entity = GetEditedEntity();
+            if (!entity.IsValid()) return;
+            auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+            if (!editMesh || !editMesh->HasMesh()) return;
+            
+            glm::mat4 rot(1.0f);
+            if (m_AxisConstraint == AxisConstraint::None) {
+                float yaw = (-mouseDelta.x) * (sensitivity * 50.0f);
+                float pitch = (mouseDelta.y) * (sensitivity * 50.0f);
+                rot = glm::rotate(glm::mat4(1.0f), glm::radians(yaw), glm::vec3(0, 1, 0));
+                rot = glm::rotate(rot, glm::radians(pitch), glm::vec3(1, 0, 0));
+            } else {
+                rot = glm::rotate(glm::mat4(1.0f), glm::radians(degrees), axis);
+            }
+            
+            for (size_t idx = 0; idx < m_TransformVertexIDs.size() && idx < m_TransformStartPositions.size(); ++idx) {
+                auto* vert = editMesh->mesh->GetVertex(m_TransformVertexIDs[idx]);
+                if (!vert) continue;
+                glm::vec3 p = m_TransformStartPositions[idx] - m_TransformPivotLocal;
+                glm::vec3 pr = glm::vec3(rot * glm::vec4(p, 0.0f));
+                vert->position = m_TransformPivotLocal + pr;
+            }
+            
+            editMesh->mesh->RecalculateNormals();
+            editMesh->MarkDirty();
+            m_SceneDirty = true;
+        }
+        
+        return;
+    }
+    
+    // =========================================================================
+    // Scale
+    // =========================================================================
+    if (m_InteractiveTransform == InteractiveTransformType::Scale) {
+        float factor = numeric ? *numeric : (1.0f + (mouseDelta.x * sensitivity));
+        factor = std::max(factor, 0.001f);
+        
+        if (m_SnapEnabled) {
+            float step = m_ScaleSnap;
+            float delta = factor - 1.0f;
+            delta = std::round(delta / step) * step;
+            factor = 1.0f + delta;
+        }
+        
+        if (m_EditorMode == EditorMode::Object) {
+            scene::Entity selected = GetSelectedEntity();
+            if (!selected.IsValid()) return;
+            auto* transform = selected.GetComponent<scene::TransformComponent>();
+            if (!transform) return;
+            
+            glm::vec3 newScale = m_TransformStartScale;
+            switch (m_AxisConstraint) {
+                case AxisConstraint::X: newScale.x = m_TransformStartScale.x * factor; break;
+                case AxisConstraint::Y: newScale.y = m_TransformStartScale.y * factor; break;
+                case AxisConstraint::Z: newScale.z = m_TransformStartScale.z * factor; break;
+                case AxisConstraint::None: default: newScale = m_TransformStartScale * factor; break;
+            }
+            transform->scale = newScale;
+            m_SceneDirty = true;
+        } else {
+            scene::Entity entity = GetEditedEntity();
+            if (!entity.IsValid()) return;
+            auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+            if (!editMesh || !editMesh->HasMesh()) return;
+            
+            glm::vec3 scaleVec(1.0f);
+            switch (m_AxisConstraint) {
+                case AxisConstraint::X: scaleVec = glm::vec3(factor, 1, 1); break;
+                case AxisConstraint::Y: scaleVec = glm::vec3(1, factor, 1); break;
+                case AxisConstraint::Z: scaleVec = glm::vec3(1, 1, factor); break;
+                case AxisConstraint::None: default: scaleVec = glm::vec3(factor); break;
+            }
+            
+            for (size_t idx = 0; idx < m_TransformVertexIDs.size() && idx < m_TransformStartPositions.size(); ++idx) {
+                auto* vert = editMesh->mesh->GetVertex(m_TransformVertexIDs[idx]);
+                if (!vert) continue;
+                glm::vec3 p = m_TransformStartPositions[idx] - m_TransformPivotLocal;
+                vert->position = m_TransformPivotLocal + (p * scaleVec);
+            }
+            
+            editMesh->mesh->RecalculateNormals();
+            editMesh->MarkDirty();
+            m_SceneDirty = true;
+        }
+        
+        return;
+    }
+}
+
+void EditorUI::ConfirmInteractiveTransform() {
+    if (m_InteractiveTransform == InteractiveTransformType::None) return;
+    
+    if (m_EditorMode == EditorMode::Object) {
+        // Push undo command for object transform
+        scene::Entity selected = GetSelectedEntity();
+        if (selected.IsValid()) {
+            auto* transform = selected.GetComponent<scene::TransformComponent>();
+            if (transform) {
+                TransformCommand::TransformState before{
+                    m_TransformStartValue,
+                    m_TransformStartRotation,
+                    m_TransformStartScale
+                };
+                TransformCommand::TransformState after{
+                    transform->position,
+                    transform->rotation,
+                    transform->scale
+                };
+                auto cmd = std::make_unique<TransformCommand>(
+                    m_Scene, 
+                    selected.GetID(),
+                    before,
+                    after
+                );
+                UndoStack::Get().Push(std::move(cmd));
+            }
+        }
+        switch (m_InteractiveTransform) {
+            case InteractiveTransformType::Grab:   LUCENT_CORE_INFO("Confirmed interactive Grab (Object Mode)"); break;
+            case InteractiveTransformType::Rotate: LUCENT_CORE_INFO("Confirmed interactive Rotate (Object Mode)"); break;
+            case InteractiveTransformType::Scale:  LUCENT_CORE_INFO("Confirmed interactive Scale (Object Mode)"); break;
+            default: break;
+        }
+    } else {
+        // In Edit mode, push a mesh edit command
+        scene::Entity entity = GetEditedEntity();
+        if (entity.IsValid()) {
+            auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+            if (editMesh && editMesh->HasMesh()) {
+                // We need to capture before/after snapshots - for now just log
+                switch (m_InteractiveTransform) {
+                    case InteractiveTransformType::Grab:   LUCENT_CORE_INFO("Confirmed interactive Grab (Edit Mode)"); break;
+                    case InteractiveTransformType::Rotate: LUCENT_CORE_INFO("Confirmed interactive Rotate (Edit Mode)"); break;
+                    case InteractiveTransformType::Scale:  LUCENT_CORE_INFO("Confirmed interactive Scale (Edit Mode)"); break;
+                    default: break;
+                }
+                // TODO: Add proper undo for edit mode vertex movement
+            }
+        }
+    }
+    
+    m_InteractiveTransform = InteractiveTransformType::None;
+    m_AxisConstraint = AxisConstraint::None;
+    m_TransformStartPositions.clear();
+    m_TransformVertexIDs.clear();
+    m_TransformNumeric.clear();
+}
+
+void EditorUI::CancelInteractiveTransform() {
+    if (m_InteractiveTransform == InteractiveTransformType::None) return;
+    
+    if (m_EditorMode == EditorMode::Object) {
+        // Restore original transform
+        scene::Entity selected = GetSelectedEntity();
+        if (selected.IsValid()) {
+            auto* transform = selected.GetComponent<scene::TransformComponent>();
+            if (transform) {
+                transform->position = m_TransformStartValue;
+                transform->rotation = m_TransformStartRotation;
+                transform->scale = m_TransformStartScale;
+            }
+        }
+        switch (m_InteractiveTransform) {
+            case InteractiveTransformType::Grab:   LUCENT_CORE_INFO("Cancelled interactive Grab (Object Mode)"); break;
+            case InteractiveTransformType::Rotate: LUCENT_CORE_INFO("Cancelled interactive Rotate (Object Mode)"); break;
+            case InteractiveTransformType::Scale:  LUCENT_CORE_INFO("Cancelled interactive Scale (Object Mode)"); break;
+            default: break;
+        }
+    } else {
+        // Restore original vertex positions using stored IDs
+        scene::Entity entity = GetEditedEntity();
+        if (entity.IsValid()) {
+            auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>();
+            if (editMesh && editMesh->HasMesh()) {
+                for (size_t idx = 0; idx < m_TransformVertexIDs.size() && idx < m_TransformStartPositions.size(); ++idx) {
+                    auto* vert = editMesh->mesh->GetVertex(m_TransformVertexIDs[idx]);
+                    if (vert) {
+                        vert->position = m_TransformStartPositions[idx];
+                    }
+                }
+                editMesh->mesh->RecalculateNormals();
+                editMesh->MarkDirty();
+            }
+        }
+        switch (m_InteractiveTransform) {
+            case InteractiveTransformType::Grab:   LUCENT_CORE_INFO("Cancelled interactive Grab (Edit Mode)"); break;
+            case InteractiveTransformType::Rotate: LUCENT_CORE_INFO("Cancelled interactive Rotate (Edit Mode)"); break;
+            case InteractiveTransformType::Scale:  LUCENT_CORE_INFO("Cancelled interactive Scale (Edit Mode)"); break;
+            default: break;
+        }
+    }
+    
+    m_InteractiveTransform = InteractiveTransformType::None;
+    m_AxisConstraint = AxisConstraint::None;
+    m_TransformStartPositions.clear();
+    m_TransformVertexIDs.clear();
+    m_TransformNumeric.clear();
+    m_SceneDirty = true;
+}
+
+void EditorUI::DrawInteractiveTransformHUD() {
+    if (m_InteractiveTransform == InteractiveTransformType::None) return;
+    
+    // Draw HUD at bottom of viewport
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    
+    float hudY = m_ViewportPosition.y + m_ViewportSize.y - 40;
+    float hudX = m_ViewportPosition.x + 10;
+    
+    // Background
+    ImVec2 bgMin(hudX - 5, hudY - 5);
+    ImVec2 bgMax(hudX + 350, hudY + 30);
+    drawList->AddRectFilled(bgMin, bgMax, IM_COL32(0, 0, 0, 180), 4.0f);
+    
+    // Build status string
+    std::string typeStr;
+    switch (m_InteractiveTransform) {
+        case InteractiveTransformType::Grab: typeStr = "GRAB (G)"; break;
+        case InteractiveTransformType::Rotate: typeStr = "ROTATE (R)"; break;
+        case InteractiveTransformType::Scale: typeStr = "SCALE (S)"; break;
+        default: break;
+    }
+    
+    std::string axisStr;
+    ImU32 axisColor = IM_COL32(255, 255, 255, 255);
+    switch (m_AxisConstraint) {
+        case AxisConstraint::X: 
+            axisStr = " [X AXIS]"; 
+            axisColor = IM_COL32(255, 80, 80, 255);
+            break;
+        case AxisConstraint::Y: 
+            axisStr = " [Y AXIS]"; 
+            axisColor = IM_COL32(80, 255, 80, 255);
+            break;
+        case AxisConstraint::Z: 
+            axisStr = " [Z AXIS]"; 
+            axisColor = IM_COL32(80, 80, 255, 255);
+            break;
+        default:
+            axisStr = " [FREE]";
+            break;
+    }
+    
+    // Draw type text
+    drawList->AddText(ImVec2(hudX, hudY), IM_COL32(255, 200, 100, 255), typeStr.c_str());
+    
+    // Draw axis constraint
+    drawList->AddText(ImVec2(hudX + 100, hudY), axisColor, axisStr.c_str());
+    
+    // Draw help text
+    std::string help = "X/Y/Z: Lock axis | Enter/LMB: Confirm | ESC/RMB: Cancel";
+    if (!m_TransformNumeric.empty()) {
+        help += " | Value: " + m_TransformNumeric;
+    }
+    drawList->AddText(ImVec2(hudX, hudY + 15), IM_COL32(180, 180, 180, 255), help.c_str());
 }
 
 } // namespace lucent

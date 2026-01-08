@@ -20,8 +20,8 @@ bool Renderer::Init(VulkanContext* context, Device* device, const RendererConfig
         VK_API_VERSION_1_3  // We request 1.3, actual support may be lower
     );
     
-    // Select best available render mode
-    m_RenderMode = m_Capabilities.GetBestMode();
+    // Always start in Simple mode for stability, user can switch to Traced/RayTraced
+    m_RenderMode = RenderMode::Simple;
     LUCENT_CORE_INFO("Initial render mode: {}", RenderModeName(m_RenderMode));
     
     // Initialize debug utils
@@ -200,6 +200,17 @@ bool Renderer::BeginFrame() {
     
     // Wait for previous frame to finish
     vkWaitForFences(device, 1, &frame.inFlightFence, VK_TRUE, UINT64_MAX);
+
+    // Safe point: we know this frame's command buffer is no longer in-flight,
+    // so we can update per-frame descriptor sets without validation errors.
+    if (m_ShadowDescriptorDirty && m_ShadowDescriptorSets[m_CurrentFrame] != VK_NULL_HANDLE) {
+        DescriptorWriter writer;
+        writer.WriteImage(0, m_ShadowMap.GetView(), m_ShadowSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        writer.WriteBuffer(1, m_LightBuffer.GetHandle(), m_ShadowLightRangeBytes, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        writer.UpdateSet(device, m_ShadowDescriptorSets[m_CurrentFrame]);
+        // We'll update the other frame's set when that frame becomes active.
+        m_ShadowDescriptorDirty = false;
+    }
     
     // Acquire next swapchain image
     if (!m_Swapchain.AcquireNextImage(frame.imageAvailableSemaphore, m_CurrentImageIndex)) {
@@ -569,6 +580,26 @@ bool Renderer::CreatePipelines() {
         return false;
     }
     
+    // Create double-sided variant of mesh pipeline (no backface culling)
+    PipelineBuilder meshDoubleSidedBuilder;
+    meshDoubleSidedBuilder
+        .AddShaderStage(VK_SHADER_STAGE_VERTEX_BIT, m_MeshVertShader)
+        .AddShaderStage(VK_SHADER_STAGE_FRAGMENT_BIT, m_MeshFragShader)
+        .SetVertexInput(meshBindings, meshAttributes)
+        .SetColorAttachmentFormat(VK_FORMAT_R16G16B16A16_SFLOAT)
+        .SetDepthAttachmentFormat(VK_FORMAT_D32_SFLOAT)
+        .SetDepthStencil(true, true, VK_COMPARE_OP_LESS_OR_EQUAL)
+        .SetRasterizer(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+        .SetLayout(m_MeshPipelineLayout);
+    if (!UseDynamicRendering()) {
+        meshDoubleSidedBuilder.SetRenderPass(m_OffscreenRenderPass);
+    }
+    
+    m_MeshDoubleSidedPipeline = meshDoubleSidedBuilder.Build(device);
+    if (!m_MeshDoubleSidedPipeline) {
+        return false;
+    }
+    
     // Create wireframe variant of mesh pipeline (same vertex input, different rasterizer)
     PipelineBuilder wireframeBuilder;
     wireframeBuilder
@@ -845,6 +876,10 @@ void Renderer::DestroyPipelines() {
     if (m_MeshPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device, m_MeshPipeline, nullptr);
         m_MeshPipeline = VK_NULL_HANDLE;
+    }
+    if (m_MeshDoubleSidedPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, m_MeshDoubleSidedPipeline, nullptr);
+        m_MeshDoubleSidedPipeline = VK_NULL_HANDLE;
     }
     if (m_MeshWireframePipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device, m_MeshWireframePipeline, nullptr);
@@ -1476,10 +1511,12 @@ bool Renderer::CreateShadowResources() {
     
     // Use the mesh descriptor layout (already has shadow map binding at set 0, binding 0)
     // Allocate descriptor set for the shadow map
-    m_ShadowDescriptorSet = m_DescriptorAllocator.Allocate(m_MeshDescriptorLayout);
-    if (m_ShadowDescriptorSet == VK_NULL_HANDLE) {
-        LUCENT_CORE_ERROR("Failed to allocate shadow descriptor set");
-        return false;
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        m_ShadowDescriptorSets[i] = m_DescriptorAllocator.Allocate(m_MeshDescriptorLayout);
+        if (m_ShadowDescriptorSets[i] == VK_NULL_HANDLE) {
+            LUCENT_CORE_ERROR("Failed to allocate shadow descriptor set (frame {})", i);
+            return false;
+        }
     }
     
     // Create default light buffer (single directional light)
@@ -1503,11 +1540,15 @@ bool Renderer::CreateShadowResources() {
     }
     m_LightBuffer.Upload(&defaultLight, sizeof(GPULight));
     
-    // Update descriptor set (shadow map + light buffer)
-    DescriptorWriter writer;
-    writer.WriteImage(0, m_ShadowMap.GetView(), m_ShadowSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    writer.WriteBuffer(1, m_LightBuffer.GetHandle(), m_LightBuffer.GetSize(), 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-    writer.UpdateSet(device, m_ShadowDescriptorSet);
+    // Update descriptor sets (shadow map + light buffer)
+    m_ShadowLightRangeBytes = m_LightBuffer.GetSize();
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        DescriptorWriter writer;
+        writer.WriteImage(0, m_ShadowMap.GetView(), m_ShadowSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        writer.WriteBuffer(1, m_LightBuffer.GetHandle(), m_ShadowLightRangeBytes, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        writer.UpdateSet(device, m_ShadowDescriptorSets[i]);
+    }
+    m_ShadowDescriptorDirty = false;
     
     // Load shadow shader
     m_ShadowVertShader = PipelineBuilder::LoadShaderModule(device, "shaders/shadow_depth.vert.spv");
@@ -1542,10 +1583,8 @@ bool Renderer::CreateShadowResources() {
         {0, sizeof(float) * 12, VK_VERTEX_INPUT_RATE_VERTEX} // pos + normal + uv + tangent
     };
     std::vector<VkVertexInputAttributeDescription> attributes = {
-        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, // position
-        {1, 0, VK_FORMAT_R32G32B32_SFLOAT, sizeof(float) * 3}, // normal
-        {2, 0, VK_FORMAT_R32G32_SFLOAT, sizeof(float) * 6}, // uv
-        {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, sizeof(float) * 8} // tangent
+        // Shadow shader only needs position
+        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}
     };
     builder.SetVertexInput(bindings, attributes);
     builder.SetInputAssembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
@@ -1598,6 +1637,10 @@ void Renderer::DestroyShadowResources() {
     }
     m_ShadowMap.Shutdown();
     m_LightBuffer.Shutdown();
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        m_ShadowDescriptorSets[i] = VK_NULL_HANDLE;
+    }
+    m_ShadowDescriptorDirty = true;
 }
 
 void Renderer::SetLights(const std::vector<GPULight>& lights) {
@@ -1636,15 +1679,11 @@ void Renderer::SetLights(const std::vector<GPULight>& lights) {
         defaultLight.range = 0.0f;
         m_LightBuffer.Upload(&defaultLight, sizeof(GPULight));
     }
-    
-    // ALWAYS update descriptor with the EXACT size of uploaded data
-    // This is critical because GLSL's lights.length() returns descriptorRange/sizeof(GPULight)
-    if (m_ShadowDescriptorSet != VK_NULL_HANDLE) {
-        DescriptorWriter writer;
-        writer.WriteImage(0, m_ShadowMap.GetView(), m_ShadowSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        writer.WriteBuffer(1, m_LightBuffer.GetHandle(), actualDataSize, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-        writer.UpdateSet(m_Context->GetDevice(), m_ShadowDescriptorSet);
-    }
+
+    // Defer descriptor writes to BeginFrame() after we've waited on the per-frame fence.
+    // This avoids "vkUpdateDescriptorSets while descriptor set is in use" validation errors.
+    m_ShadowLightRangeBytes = actualDataSize;
+    m_ShadowDescriptorDirty = true;
 }
 
 void Renderer::BeginShadowPass(VkCommandBuffer cmd) {

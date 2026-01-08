@@ -2,12 +2,15 @@
 
 #include "lucent/material/MaterialGraph.h"
 #include "lucent/material/MaterialAsset.h"
+#include "lucent/gfx/Image.h"
+#include "lucent/assets/Mesh.h"
 #include <imgui.h>
 #include <imgui-node-editor/imgui_node_editor.h>
 #include <glm/glm.hpp>
 #include <string>
 #include <unordered_map>
 #include <functional>
+#include <memory>
 
 namespace lucent {
 
@@ -51,6 +54,9 @@ private:
     void DrawNodeEditor();
     void DrawNodeCreationMenu();
     void DrawCompileStatus();
+    void HandleAutoCompile();
+    void RenderMaterialPreviewIfNeeded();
+    void RenderMaterialPreview();
     
     // Node drawing helpers
     void DrawNode(const material::MaterialNode& node);
@@ -87,6 +93,24 @@ private:
     
     // Compile status animation
     float m_CompileAnimTimer = 0.0f;
+    
+    // Auto compile (debounced)
+    bool m_AutoCompile = true;
+    bool m_WasDirty = false;
+    float m_DirtySinceTime = 0.0f;
+    
+    // Material preview (offscreen)
+    bool m_ShowPreview = true;
+    bool m_PreviewDirty = true;
+    uint64_t m_PreviewGraphHash = 0;
+    uint32_t m_PreviewSize = 256;
+    gfx::Image m_PreviewColor;
+    gfx::Image m_PreviewDepth;
+    VkSampler m_PreviewSampler = VK_NULL_HANDLE;
+    VkRenderPass m_PreviewRenderPass = VK_NULL_HANDLE;
+    VkFramebuffer m_PreviewFramebuffer = VK_NULL_HANDLE;
+    VkDescriptorSet m_PreviewImGuiTex = VK_NULL_HANDLE;
+    std::unique_ptr<assets::Mesh> m_PreviewSphere;
     
     // Asset navigation callback
     NavigateToAssetCallback m_NavigateToAsset;

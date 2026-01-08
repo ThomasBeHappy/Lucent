@@ -246,6 +246,8 @@ bool Texture::CreateSolidColor(gfx::Device* device, uint8_t r, uint8_t g, uint8_
 
 void Texture::Destroy() {
     if (m_Device && m_Sampler != VK_NULL_HANDLE) {
+        // Texture sampler might still be referenced by in-flight descriptor sets.
+        vkDeviceWaitIdle(m_Device->GetContext()->GetDevice());
         vkDestroySampler(m_Device->GetContext()->GetDevice(), m_Sampler, nullptr);
         m_Sampler = VK_NULL_HANDLE;
     }
@@ -260,8 +262,21 @@ bool Texture::CreateSampler() {
     samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.anisotropyEnable = VK_TRUE;
-    samplerInfo.maxAnisotropy = 16.0f;
+    // Only enable anisotropy if the feature is enabled on the logical device.
+    // (Some GPUs support it but it must be explicitly enabled at device creation.)
+    VkPhysicalDeviceFeatures features{};
+    vkGetPhysicalDeviceFeatures(m_Device->GetContext()->GetPhysicalDevice(), &features);
+    if (features.samplerAnisotropy) {
+        samplerInfo.anisotropyEnable = VK_TRUE;
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(m_Device->GetContext()->GetPhysicalDevice(), &props);
+        samplerInfo.maxAnisotropy = (props.limits.maxSamplerAnisotropy > 0.0f)
+            ? std::min(16.0f, props.limits.maxSamplerAnisotropy)
+            : 1.0f;
+    } else {
+        samplerInfo.anisotropyEnable = VK_FALSE;
+        samplerInfo.maxAnisotropy = 1.0f;
+    }
     samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
     samplerInfo.unnormalizedCoordinates = VK_FALSE;
     samplerInfo.compareEnable = VK_FALSE;

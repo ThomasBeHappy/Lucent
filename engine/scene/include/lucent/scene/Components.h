@@ -1,12 +1,14 @@
 #pragma once
 
 #include "lucent/core/Core.h"
+#include "lucent/mesh/EditableMesh.h"
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtx/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <string>
+#include <memory>
 
 namespace lucent::scene {
 
@@ -143,6 +145,62 @@ struct MeshRendererComponent {
     float emissiveIntensity = 0.0f;
     
     bool UsesMaterialAsset() const { return !materialPath.empty(); }
+};
+
+// Editable mesh component for mesh editing in Edit Mode
+// Stores per-instance mesh data that can be edited (ngons supported)
+struct EditableMeshComponent {
+    // The editable mesh data (ngon-capable, half-edge structure)
+    std::unique_ptr<mesh::EditableMesh> mesh;
+    
+    // Cached triangulated mesh ID for rendering (updated when mesh changes)
+    uint32_t runtimeMeshID = UINT32_MAX;
+    
+    // Dirty flag - set when mesh needs re-triangulation
+    bool dirty = true;
+    
+    // Source primitive type (if created from primitive, used for reset)
+    MeshRendererComponent::PrimitiveType sourcePrimitive = MeshRendererComponent::PrimitiveType::None;
+    
+    // Whether mesh was imported from file (vs created from primitive)
+    bool fromImport = false;
+    
+    EditableMeshComponent() = default;
+    ~EditableMeshComponent() = default;
+    
+    // Move only (unique_ptr)
+    EditableMeshComponent(EditableMeshComponent&&) = default;
+    EditableMeshComponent& operator=(EditableMeshComponent&&) = default;
+    
+    // No copy
+    EditableMeshComponent(const EditableMeshComponent&) = delete;
+    EditableMeshComponent& operator=(const EditableMeshComponent&) = delete;
+    
+    bool HasMesh() const { return mesh != nullptr; }
+    
+    // Create editable mesh from current MeshRenderer primitive
+    void InitFromPrimitive(MeshRendererComponent::PrimitiveType type);
+    
+    // Create editable mesh from triangle data
+    void InitFromTriangles(
+        const std::vector<glm::vec3>& positions,
+        const std::vector<glm::vec3>& normals,
+        const std::vector<glm::vec2>& uvs,
+        const std::vector<uint32_t>& indices
+    );
+    
+    // Mark mesh as modified (triggers re-triangulation)
+    void MarkDirty() { dirty = true; }
+    
+    // Get triangulated output for rendering
+    // Returns true if mesh was re-triangulated
+    bool GetTriangulatedOutput(
+        std::vector<glm::vec3>& outPositions,
+        std::vector<glm::vec3>& outNormals,
+        std::vector<glm::vec2>& outUVs,
+        std::vector<glm::vec4>& outTangents,
+        std::vector<uint32_t>& outIndices
+    );
 };
 
 } // namespace lucent::scene

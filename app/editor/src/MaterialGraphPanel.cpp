@@ -4,13 +4,31 @@
 #include "lucent/material/MaterialAsset.h"
 #include "lucent/core/Log.h"
 #include <imgui-node-editor/imgui_node_editor.h>
+#include <imgui_impl_vulkan.h>
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <imgui_internal.h>
+#include <glm/gtc/matrix_transform.hpp>
 
 namespace ed = ax::NodeEditor;
 
 namespace lucent {
+
+namespace {
+static void EnsureTextureSlot(material::MaterialGraph& graph, const std::string& path, bool sRGB) {
+    if (path.empty()) return;
+    const auto& slots = graph.GetTextureSlots();
+    for (size_t i = 0; i < slots.size(); ++i) {
+        if (slots[i].path == path) {
+            // Keep sRGB flag in sync with usage (albedo vs data)
+            graph.SetTextureSlot(static_cast<int>(i), path, sRGB);
+            return;
+        }
+    }
+    graph.AddTextureSlot(path, sRGB);
+}
+} // namespace
 
 namespace {
 
@@ -42,6 +60,29 @@ void MaterialGraphPanel::Shutdown() {
         ed::DestroyEditor(m_NodeEditorContext);
         m_NodeEditorContext = nullptr;
     }
+    
+    // Preview resources
+    if (m_Device) {
+        VkDevice device = m_Device->GetHandle();
+        if (m_PreviewFramebuffer != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(device, m_PreviewFramebuffer, nullptr);
+            m_PreviewFramebuffer = VK_NULL_HANDLE;
+        }
+        if (m_PreviewRenderPass != VK_NULL_HANDLE) {
+            vkDestroyRenderPass(device, m_PreviewRenderPass, nullptr);
+            m_PreviewRenderPass = VK_NULL_HANDLE;
+        }
+        if (m_PreviewSampler != VK_NULL_HANDLE) {
+            vkDestroySampler(device, m_PreviewSampler, nullptr);
+            m_PreviewSampler = VK_NULL_HANDLE;
+        }
+    }
+    m_PreviewImGuiTex = VK_NULL_HANDLE;
+    m_PreviewColor.Shutdown();
+    m_PreviewDepth.Shutdown();
+    m_PreviewSphere.reset();
+    
+    m_Device = nullptr;
 }
 
 void MaterialGraphPanel::SetMaterial(material::MaterialAsset* material) {
@@ -53,7 +94,7 @@ material::MaterialAsset* MaterialGraphPanel::CreateNewMaterial() {
     auto& manager = material::MaterialAssetManager::Get();
     auto* mat = manager.CreateMaterial("New Material");
     if (mat) {
-        mat->Recompile();
+        mat->Recompile(); // initial compile can stay synchronous (one-time)
         SetMaterial(mat);
     }
     return mat;
@@ -66,10 +107,324 @@ void MaterialGraphPanel::Draw() {
     
     if (ImGui::Begin("Material Graph", &m_Visible, ImGuiWindowFlags_MenuBar)) {
         DrawToolbar();
+        // Apply any finished background compiles (pipeline swap happens here on main thread)
+        if (m_Material) {
+            m_Material->PumpAsyncRecompile();
+        }
+        HandleAutoCompile();
+        RenderMaterialPreviewIfNeeded();
+        
         DrawNodeEditor();
         DrawCompileStatus();
     }
     ImGui::End();
+}
+
+void MaterialGraphPanel::HandleAutoCompile() {
+    if (!m_Material) return;
+    if (!m_AutoCompile) {
+        m_WasDirty = false;
+        return;
+    }
+    
+    // Debounce recompiles while user is actively editing
+    const float now = static_cast<float>(ImGui::GetTime());
+    if (m_Material->IsDirty()) {
+        if (!m_WasDirty) {
+            m_WasDirty = true;
+            m_DirtySinceTime = now;
+        }
+        
+        // Wait a little before recompiling to avoid compiling every keystroke/drag tick
+        const float debounceSeconds = 0.35f;
+        if ((now - m_DirtySinceTime) >= debounceSeconds) {
+            m_Material->RequestRecompileAsync();
+            m_CompileAnimTimer = 1.0f;
+            m_WasDirty = false;
+        }
+    } else {
+        m_WasDirty = false;
+    }
+}
+
+void MaterialGraphPanel::RenderMaterialPreviewIfNeeded() {
+    if (!m_Device) return;
+    
+    if (!ImGui::CollapsingHeader("Preview", ImGuiTreeNodeFlags_DefaultOpen)) {
+        return;
+    }
+    
+    ImGui::Checkbox("Show Preview", &m_ShowPreview);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110.0f);
+    int previewSize = (int)m_PreviewSize;
+    if (ImGui::DragInt("Size", &previewSize, 1.0f, 64, 512)) {
+        m_PreviewSize = (uint32_t)previewSize;
+        m_PreviewDirty = true;
+        
+        // Force recreate render targets
+        if (m_PreviewFramebuffer != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(m_Device->GetHandle(), m_PreviewFramebuffer, nullptr);
+            m_PreviewFramebuffer = VK_NULL_HANDLE;
+        }
+        m_PreviewColor.Shutdown();
+        m_PreviewDepth.Shutdown();
+        m_PreviewImGuiTex = VK_NULL_HANDLE;
+    }
+    
+    if (!m_ShowPreview) {
+        ImGui::TextDisabled("Preview hidden.");
+        return;
+    }
+    
+    if (!m_Material) {
+        ImGui::TextDisabled("No material selected.");
+        return;
+    }
+    
+    // Re-render if graph hash changed (after a successful compile)
+    if (m_Material->IsValid()) {
+        uint64_t h = m_Material->GetGraphHash();
+        if (h != 0 && h != m_PreviewGraphHash) {
+            m_PreviewDirty = true;
+        }
+    }
+    
+    if (!m_Material->IsValid() && !m_Material->GetCompileError().empty()) {
+        ImGui::TextColored(ThemeError(), "Compile error (preview uses last valid pipeline)");
+    }
+    
+    if (ImGui::Button("Re-render Preview")) {
+        m_PreviewDirty = true;
+    }
+    
+    if (m_PreviewDirty) {
+        RenderMaterialPreview();
+        if (m_Material->IsValid()) {
+            m_PreviewGraphHash = m_Material->GetGraphHash();
+        }
+        m_PreviewDirty = false;
+    }
+    
+    if (m_PreviewImGuiTex != VK_NULL_HANDLE) {
+        ImGui::Image((ImTextureID)m_PreviewImGuiTex, ImVec2((float)m_PreviewSize, (float)m_PreviewSize));
+    } else {
+        ImGui::TextDisabled("Preview not ready yet.");
+    }
+}
+
+void MaterialGraphPanel::RenderMaterialPreview() {
+    if (!m_Device || !m_Material) return;
+    if (!m_Material->IsValid() || m_Material->GetPipeline() == VK_NULL_HANDLE) return;
+    
+    VkDevice device = m_Device->GetHandle();
+    
+    // Create/recreate images if needed
+    if (m_PreviewColor.GetHandle() == VK_NULL_HANDLE || m_PreviewDepth.GetHandle() == VK_NULL_HANDLE) {
+        gfx::ImageDesc colorDesc{};
+        colorDesc.width = m_PreviewSize;
+        colorDesc.height = m_PreviewSize;
+        colorDesc.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        colorDesc.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        colorDesc.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        colorDesc.debugName = "MaterialPreviewColor";
+        m_PreviewColor.Init(m_Device, colorDesc);
+        
+        gfx::ImageDesc depthDesc{};
+        depthDesc.width = m_PreviewSize;
+        depthDesc.height = m_PreviewSize;
+        depthDesc.format = VK_FORMAT_D32_SFLOAT;
+        depthDesc.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        depthDesc.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+        depthDesc.debugName = "MaterialPreviewDepth";
+        m_PreviewDepth.Init(m_Device, depthDesc);
+    }
+    
+    if (m_PreviewSampler == VK_NULL_HANDLE) {
+        VkSamplerCreateInfo samplerInfo{};
+        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.maxLod = 1.0f;
+        vkCreateSampler(device, &samplerInfo, nullptr, &m_PreviewSampler);
+    }
+    
+    if (!m_PreviewSphere) {
+        std::vector<assets::Vertex> verts;
+        std::vector<uint32_t> inds;
+        assets::Primitives::GenerateSphere(verts, inds, 0.6f, 48, 24);
+        m_PreviewSphere = std::make_unique<assets::Mesh>();
+        m_PreviewSphere->Create(m_Device, verts, inds, "PreviewSphere");
+    }
+    
+    // Legacy mode needs a render pass + framebuffer. Create a pass compatible with the main offscreen pass.
+    if (m_Material->UsesLegacyRenderPass() && m_PreviewRenderPass == VK_NULL_HANDLE) {
+        VkAttachmentDescription colorAttachment{};
+        colorAttachment.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        
+        VkAttachmentDescription depthAttachment{};
+        depthAttachment.format = VK_FORMAT_D32_SFLOAT;
+        depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        
+        VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkAttachmentReference depthRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &colorRef;
+        subpass.pDepthStencilAttachment = &depthRef;
+        
+        VkSubpassDependency dependency{};
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        
+        std::array<VkAttachmentDescription, 2> attachments = { colorAttachment, depthAttachment };
+        VkRenderPassCreateInfo rpInfo{};
+        rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        rpInfo.attachmentCount = (uint32_t)attachments.size();
+        rpInfo.pAttachments = attachments.data();
+        rpInfo.subpassCount = 1;
+        rpInfo.pSubpasses = &subpass;
+        rpInfo.dependencyCount = 1;
+        rpInfo.pDependencies = &dependency;
+        vkCreateRenderPass(device, &rpInfo, nullptr, &m_PreviewRenderPass);
+    }
+    
+    if (m_Material->UsesLegacyRenderPass() && m_PreviewFramebuffer == VK_NULL_HANDLE && m_PreviewRenderPass != VK_NULL_HANDLE) {
+        std::array<VkImageView, 2> views = { m_PreviewColor.GetView(), m_PreviewDepth.GetView() };
+        VkFramebufferCreateInfo fbInfo{};
+        fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fbInfo.renderPass = m_PreviewRenderPass;
+        fbInfo.attachmentCount = (uint32_t)views.size();
+        fbInfo.pAttachments = views.data();
+        fbInfo.width = m_PreviewSize;
+        fbInfo.height = m_PreviewSize;
+        fbInfo.layers = 1;
+        vkCreateFramebuffer(device, &fbInfo, nullptr, &m_PreviewFramebuffer);
+    }
+    
+    if (m_PreviewImGuiTex == VK_NULL_HANDLE) {
+        m_PreviewImGuiTex = ImGui_ImplVulkan_AddTexture(
+            m_PreviewSampler,
+            m_PreviewColor.GetView(),
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        );
+    }
+    
+    m_Device->ImmediateSubmit([this](VkCommandBuffer cmd) {
+        glm::vec3 camPos(1.4f, 1.0f, 1.4f);
+        glm::mat4 view = glm::lookAt(camPos, glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
+        glm::mat4 proj = glm::perspective(glm::radians(45.0f), 1.0f, 0.1f, 10.0f);
+        glm::mat4 viewProj = proj * view;
+        
+        VkViewport vp{0, 0, (float)m_PreviewSize, (float)m_PreviewSize, 0.0f, 1.0f};
+        VkRect2D sc{{0, 0}, {m_PreviewSize, m_PreviewSize}};
+        
+        if (!m_Material->UsesLegacyRenderPass()) {
+            m_PreviewColor.TransitionLayout(cmd, m_PreviewColor.GetCurrentLayout(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            m_PreviewDepth.TransitionLayout(cmd, m_PreviewDepth.GetCurrentLayout(), VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            
+            VkRenderingAttachmentInfo colorAtt{};
+            colorAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            colorAtt.imageView = m_PreviewColor.GetView();
+            colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            colorAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            colorAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            colorAtt.clearValue.color = { {0.08f, 0.08f, 0.09f, 1.0f} };
+            
+            VkRenderingAttachmentInfo depthAtt{};
+            depthAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            depthAtt.imageView = m_PreviewDepth.GetView();
+            depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            depthAtt.clearValue.depthStencil = { 1.0f, 0 };
+            
+            VkRenderingInfo ri{};
+            ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            ri.renderArea = sc;
+            ri.layerCount = 1;
+            ri.colorAttachmentCount = 1;
+            ri.pColorAttachments = &colorAtt;
+            ri.pDepthAttachment = &depthAtt;
+            vkCmdBeginRendering(cmd, &ri);
+        } else {
+            VkClearValue clears[2]{};
+            clears[0].color = { {0.08f, 0.08f, 0.09f, 1.0f} };
+            clears[1].depthStencil = { 1.0f, 0 };
+            
+            VkRenderPassBeginInfo rpBegin{};
+            rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+            rpBegin.renderPass = m_PreviewRenderPass;
+            rpBegin.framebuffer = m_PreviewFramebuffer;
+            rpBegin.renderArea = sc;
+            rpBegin.clearValueCount = 2;
+            rpBegin.pClearValues = clears;
+            vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+        }
+        
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+        
+        VkPipeline pipe = m_Material->GetPipeline();
+        VkPipelineLayout layout = m_Material->GetPipelineLayout();
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        
+        if (m_Material->HasDescriptorSet()) {
+            VkDescriptorSet set = m_Material->GetDescriptorSet();
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, nullptr);
+        }
+        
+        struct PushConstants {
+            glm::mat4 model;
+            glm::mat4 viewProj;
+            glm::vec4 baseColor;
+            glm::vec4 materialParams;
+            glm::vec4 emissive;
+            glm::vec4 cameraPos;
+        } pc;
+        pc.model = glm::mat4(1.0f);
+        pc.viewProj = viewProj;
+        pc.baseColor = glm::vec4(1, 1, 1, 1);
+        pc.materialParams = glm::vec4(0.0f, 0.5f, 0.0f, 0.0f);
+        pc.emissive = glm::vec4(0, 0, 0, 0);
+        pc.cameraPos = glm::vec4(camPos, 1.0f);
+        
+        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &pc);
+        
+        if (m_PreviewSphere) {
+            m_PreviewSphere->Bind(cmd);
+            m_PreviewSphere->Draw(cmd);
+        }
+        
+        if (!m_Material->UsesLegacyRenderPass()) {
+            vkCmdEndRendering(cmd);
+            m_PreviewColor.TransitionLayout(cmd, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        } else {
+            vkCmdEndRenderPass(cmd);
+        }
+    });
 }
 
 void MaterialGraphPanel::DrawToolbar() {
@@ -119,14 +474,19 @@ void MaterialGraphPanel::DrawToolbar() {
         
         // Compile button
         if (ImGui::Button(LUCENT_ICON_PLAY " Compile")) {
-            m_Material->Recompile();
+            m_Material->RequestRecompileAsync();
             m_CompileAnimTimer = 1.0f;
         }
         
         ImGui::SameLine();
+        ImGui::Checkbox("Auto-Compile", &m_AutoCompile);
+        
+        ImGui::SameLine();
         
         // Status indicator
-        if (m_Material->IsValid()) {
+    if (m_Material->IsRecompileInProgress()) {
+        ImGui::TextColored(ThemeWarning(), "[COMPILING]");
+    } else if (m_Material->IsValid()) {
             ImGui::TextColored(ThemeSuccess(), "[OK]");
         } else {
             ImGui::TextColored(ThemeError(), "[ERROR]");
@@ -464,6 +824,7 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
         case material::NodeType::NormalMap: {
             std::string path = std::holds_alternative<std::string>(node.parameter) ?
                                std::get<std::string>(node.parameter) : "";
+            const bool wantsSRGB = (node.type == material::NodeType::Texture2D);
             
             // Extract just the filename for display
             std::string displayName = path.empty() ? "(no texture)" : path;
@@ -502,6 +863,7 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
                     std::string newPath(static_cast<const char*>(payload->Data));
                     auto* mutableNode = const_cast<material::MaterialNode*>(&node);
                     mutableNode->parameter = newPath;
+                    EnsureTextureSlot(m_Material->GetGraph(), newPath, wantsSRGB);
                     m_Material->MarkDirty();
                     LUCENT_CORE_INFO("Updated texture node: {}", newPath);
                 }
@@ -510,9 +872,10 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
                     // Check if it's a texture
                     std::string ext = newPath.substr(newPath.find_last_of('.'));
                     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".hdr" || ext == ".tga") {
+                    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".hdr" || ext == ".tga" || ext == ".bmp") {
                         auto* mutableNode = const_cast<material::MaterialNode*>(&node);
                         mutableNode->parameter = newPath;
+                        EnsureTextureSlot(m_Material->GetGraph(), newPath, wantsSRGB);
                         m_Material->MarkDirty();
                         LUCENT_CORE_INFO("Updated texture node: {}", newPath);
                     }
@@ -1018,6 +1381,7 @@ void MaterialGraphPanel::CreateNodeFromDrop(const std::string& path, const ImVec
         auto* node = graph.GetNode(nodeId);
         if (node) {
             node->parameter = path;
+            EnsureTextureSlot(graph, path, /*sRGB*/ true);
             LUCENT_CORE_INFO("Created Texture2D node from drop: {}", path);
         }
         

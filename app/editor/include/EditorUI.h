@@ -3,6 +3,8 @@
 #include "lucent/core/Core.h"
 #include "lucent/scene/Scene.h"
 #include "lucent/scene/EditorCamera.h"
+#include "lucent/mesh/EditableMesh.h"
+#include "lucent/mesh/MeshOps.h"
 #include "MaterialGraphPanel.h"
 #include <vulkan/vulkan.h>
 #include <imgui.h>
@@ -39,6 +41,35 @@ enum class RenderMode {
     Shaded,       // Full PBR lighting
     Solid,        // Flat shading (no specular)
     Wireframe     // Wireframe overlay
+};
+
+// Editor interaction mode
+enum class EditorMode {
+    Object,       // Object selection and manipulation
+    Edit          // Mesh editing (vertex/edge/face)
+};
+
+// Mesh selection mode (in Edit mode)
+enum class MeshSelectMode {
+    Vertex,       // Select vertices (key: 1)
+    Edge,         // Select edges (key: 2)
+    Face          // Select faces (key: 3)
+};
+
+// Interactive transform type (Blender-style G/R/S)
+enum class InteractiveTransformType {
+    None,
+    Grab,         // G key - translate
+    Rotate,       // R key - rotate (future)
+    Scale         // S key - scale (future)
+};
+
+// Axis constraint for interactive transforms
+enum class AxisConstraint {
+    None,         // Free transform
+    X,            // Lock to X axis
+    Y,            // Lock to Y axis
+    Z             // Lock to Z axis
 };
 
 class EditorUI : public NonCopyable {
@@ -115,6 +146,18 @@ public:
     MaterialGraphPanel& GetMaterialGraphPanel() { return m_MaterialGraphPanel; }
     void ShowMaterialGraphPanel() { m_MaterialGraphPanel.SetVisible(true); }
     
+    // Edit Mode
+    EditorMode GetEditorMode() const { return m_EditorMode; }
+    void SetEditorMode(EditorMode mode);
+    void ToggleEditorMode(); // Switch between Object and Edit mode (Tab key)
+    
+    MeshSelectMode GetMeshSelectMode() const { return m_MeshSelectMode; }
+    void SetMeshSelectMode(MeshSelectMode mode);
+    
+    // Returns true if an entity is being edited
+    bool IsInEditMode() const { return m_EditorMode == EditorMode::Edit; }
+    scene::Entity GetEditedEntity() const;
+    
 private:
     void SetupStyle();
     void SetupFonts();
@@ -139,6 +182,22 @@ private:
                            const glm::vec3& aabbMin, const glm::vec3& aabbMax, float& tOut);
     bool RayIntersectsSphere(const glm::vec3& rayOrigin, const glm::vec3& rayDir,
                              const glm::vec3& center, float radius, float& tOut);
+    
+    // Edit Mode picking and overlay
+    void HandleEditModeClick();
+    mesh::VertexID PickVertex(const glm::vec2& mousePos, float radius = 10.0f);
+    mesh::EdgeID PickEdge(const glm::vec2& mousePos, float radius = 5.0f);
+    mesh::FaceID PickFace(const glm::vec2& mousePos);
+    void DrawEditModeOverlay();
+    glm::vec3 WorldToScreen(const glm::vec3& worldPos);
+    
+    // Interactive Transform (Blender-style G/R/S)
+    void StartInteractiveTransform(InteractiveTransformType type);
+    void UpdateInteractiveTransform();
+    void ConfirmInteractiveTransform();
+    void CancelInteractiveTransform();
+    bool IsInInteractiveTransform() const { return m_InteractiveTransform != InteractiveTransformType::None; }
+    void DrawInteractiveTransformHUD();
     
     // Asset navigation
     void NavigateToAsset(const std::string& path);
@@ -198,6 +257,26 @@ private:
     
     // Render mode
     RenderMode m_RenderMode = RenderMode::Shaded;
+    
+    // Edit Mode
+    EditorMode m_EditorMode = EditorMode::Object;
+    MeshSelectMode m_MeshSelectMode = MeshSelectMode::Vertex;
+    scene::EntityID m_EditedEntityID = UINT32_MAX;  // Entity being edited in Edit Mode
+    
+    // Interactive Transform (Blender-style G/R/S)
+    InteractiveTransformType m_InteractiveTransform = InteractiveTransformType::None;
+    AxisConstraint m_AxisConstraint = AxisConstraint::None;
+    glm::vec2 m_TransformStartMousePos{0.0f};
+    glm::vec3 m_TransformStartValue{0.0f};  // Starting position/rotation/scale
+    glm::vec3 m_TransformStartRotation{0.0f};
+    glm::vec3 m_TransformStartScale{1.0f};
+    std::vector<glm::vec3> m_TransformStartPositions;  // For Edit mode: original vertex positions
+    std::vector<mesh::VertexID> m_TransformVertexIDs;  // Vertex IDs being transformed
+    glm::vec3 m_TransformPivotLocal{0.0f};
+    float m_TransformSensitivity = 0.01f;
+    
+    // Numeric input during interactive transforms (e.g. G X 1 Enter)
+    std::string m_TransformNumeric;
     
     // PostFX settings
     float m_Exposure = 1.0f;

@@ -91,8 +91,19 @@ VkDescriptorPool DescriptorAllocator::GrabPool() {
 VkDescriptorPool DescriptorAllocator::CreatePool(uint32_t count, VkDescriptorPoolCreateFlags flags) {
     std::vector<VkDescriptorPoolSize> sizes;
     sizes.reserve(m_PoolSizes.sizes.size());
+
+    // Only include descriptor types that are actually enabled on this logical device.
+    // In particular, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR requires enabling
+    // VK_KHR_acceleration_structure at device creation time.
+    const bool accelStructEnabled =
+        m_Device &&
+        m_Device->GetContext() &&
+        m_Device->GetContext()->GetDeviceFeatures().accelerationStructure;
     
     for (const auto& [type, ratio] : m_PoolSizes.sizes) {
+        if (type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR && !accelStructEnabled) {
+            continue;
+        }
         sizes.push_back({ type, static_cast<uint32_t>(ratio * count) });
     }
     
