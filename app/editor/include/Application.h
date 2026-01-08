@@ -68,6 +68,7 @@ private:
 #ifdef _WIN32
     void* m_SplashWindow = nullptr;
     void* m_SplashIcon = nullptr;
+    bool m_SplashIconOwned = false;
 #endif
     
     gfx::VulkanContext m_VulkanContext;

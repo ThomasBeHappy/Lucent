@@ -16,6 +16,7 @@
 #include <GLFW/glfw3native.h>
 #include <GLFW/glfw3native.h>
 #include <Windows.h>
+#include <commctrl.h>
 
 namespace lucent {
 
@@ -64,6 +65,38 @@ static bool HasCameraChanged(const CameraSnapshot& prev, const scene::EditorCame
 
 #ifdef _WIN32
 constexpr wchar_t kSplashClassName[] = L"LucentSplashWindow";
+
+struct SplashIconResult {
+    HICON icon = nullptr;
+    bool owned = false;
+};
+
+static SplashIconResult LoadBestSplashIcon(HINSTANCE instance, int desiredSize) {
+    INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES };
+    InitCommonControlsEx(&icc);
+
+    // Try to load icon at the desired size (best for splash screen)
+    HICON icon = static_cast<HICON>(LoadImageW(
+        instance,
+        MAKEINTRESOURCEW(1),
+        IMAGE_ICON,
+        desiredSize,
+        desiredSize,
+        LR_DEFAULTCOLOR
+    ));
+    if (icon) {
+        return { icon, true };
+    }
+
+    // Fallback: try LoadIconMetric for a large icon
+    if (SUCCEEDED(LoadIconMetric(instance, MAKEINTRESOURCEW(1), LIM_LARGE, &icon)) && icon) {
+        return { icon, true };
+    }
+
+    // Last resort: standard LoadIcon
+    icon = LoadIconW(instance, MAKEINTRESOURCEW(1));
+    return { icon, false };
+}
 
 LRESULT CALLBACK SplashWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -654,17 +687,13 @@ void Application::ShowSplashScreen() {
     if (m_SplashWindow) return;
 
     HINSTANCE instance = GetModuleHandle(nullptr);
-    HICON icon = static_cast<HICON>(LoadImage(
-        instance,
-        MAKEINTRESOURCE(1),
-        IMAGE_ICON,
-        256,
-        256,
-        LR_DEFAULTCOLOR
-    ));
-    if (!icon) {
-        icon = LoadIcon(instance, MAKEINTRESOURCE(1));
-    }
+
+    int width = 420;
+    int height = 300;
+    int iconSize = std::min(width, height) - 40;  // Match the size used in WM_PAINT
+
+    SplashIconResult iconResult = LoadBestSplashIcon(instance, iconSize);
+    HICON icon = iconResult.icon;
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = SplashWindowProc;
@@ -678,9 +707,6 @@ void Application::ShowSplashScreen() {
             return;
         }
     }
-
-    int width = 420;
-    int height = 300;
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     int screenHeight = GetSystemMetrics(SM_CYSCREEN);
     int x = (screenWidth - width) / 2;
@@ -702,14 +728,21 @@ void Application::ShowSplashScreen() {
     );
 
     if (!hwnd) {
-        if (icon) {
+        if (icon && iconResult.owned) {
             DestroyIcon(icon);
         }
         return;
     }
 
+    if (icon) {
+        SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(icon));
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon));
+    }
+
+
     m_SplashWindow = hwnd;
     m_SplashIcon = icon;
+    m_SplashIconOwned = iconResult.owned;
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
 
@@ -726,9 +759,12 @@ void Application::HideSplashScreen() {
         m_SplashWindow = nullptr;
     }
     if (m_SplashIcon) {
-        DestroyIcon(reinterpret_cast<HICON>(m_SplashIcon));
+        if (m_SplashIconOwned) {
+            DestroyIcon(reinterpret_cast<HICON>(m_SplashIcon));
+        }
         m_SplashIcon = nullptr;
     }
+    m_SplashIconOwned = false;
 }
 #endif
 

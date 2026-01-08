@@ -17,6 +17,11 @@ add_executable(editor
     ${CMAKE_CURRENT_BINARY_DIR}/editor.rc
 )
 
+# Add manifest for comctl32 v6.0 (required for LoadIconMetric)
+if(WIN32)
+    target_sources(editor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/editor.manifest)
+endif()
+
 target_include_directories(editor
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -36,6 +41,10 @@ target_link_libraries(editor
         imguizmo::imguizmo
         unofficial::imgui-node-editor::imgui-node-editor
 )
+
+if(WIN32)
+    target_link_libraries(editor PRIVATE comctl32)
+endif()
 
 # Ensure shaders are compiled before building editor
 add_dependencies(editor shaders)
