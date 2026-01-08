@@ -860,6 +860,23 @@ void Application::RenderFrame() {
         m_ViewportTextureReady = true;
     }
     
+    // Update render preview texture if final render image changed
+    if (m_EditorUI.IsRenderPreviewVisible()) {
+        gfx::FinalRender* finalRender = m_Renderer.GetFinalRender();
+        if (finalRender) {
+            gfx::Image* renderImage = finalRender->GetRenderImage();
+            if (renderImage && renderImage->GetView() != VK_NULL_HANDLE) {
+                // Update texture when image is available (recreate if image changed)
+                static VkImageView lastRenderView = VK_NULL_HANDLE;
+                if (!m_RenderPreviewTextureReady || lastRenderView != renderImage->GetView()) {
+                    m_EditorUI.SetRenderPreviewTexture(renderImage->GetView(), m_Renderer.GetOffscreenSampler());
+                    lastRenderView = renderImage->GetView();
+                    m_RenderPreviewTextureReady = true;
+                }
+            }
+        }
+    }
+    
     // =========================================================================
     // Pass 2: Begin ImGui frame and prepare UI
     // =========================================================================
@@ -914,28 +931,53 @@ void Application::KeyCallback(GLFWwindow* window, int key, int scancode, int act
     auto* app = static_cast<Application*>(glfwGetWindowUserPointer(window));
     if (!app) return;
     
-    // Let ImGui handle key input first
     ImGuiIO& io = ImGui::GetIO();
-    if (io.WantCaptureKeyboard) {
+    
+    // Check if this is a shortcut key that should work even when ImGui has focus
+    bool isShortcutKey = (action == GLFW_PRESS) && (
+        key == GLFW_KEY_ESCAPE ||
+        key == GLFW_KEY_HOME ||
+        key == GLFW_KEY_F12 ||
+        key == GLFW_KEY_W ||
+        key == GLFW_KEY_E ||
+        key == GLFW_KEY_R ||
+        key == GLFW_KEY_F
+    );
+    
+    // For shortcut keys, only skip if ImGui is actively using text input
+    // For other keys, respect ImGui's keyboard capture
+    if (!isShortcutKey && io.WantCaptureKeyboard) {
         return;
     }
     
-    // Forward to editor camera
+    if (isShortcutKey && io.WantTextInput) {
+        // Don't process shortcuts if user is typing in a text field
+        return;
+    }
+    
+    // Forward to editor camera (always, unless ImGui wants keyboard for non-shortcuts)
+    if (!io.WantCaptureKeyboard || isShortcutKey) {
+        if (action == GLFW_PRESS) {
+            app->m_EditorCamera.OnKeyInput(key, true);
+        } else if (action == GLFW_RELEASE) {
+            app->m_EditorCamera.OnKeyInput(key, false);
+        }
+    }
+    
+    // Handle shortcuts
     if (action == GLFW_PRESS) {
-        app->m_EditorCamera.OnKeyInput(key, true);
-        
         if (key == GLFW_KEY_ESCAPE) {
             glfwSetWindowShouldClose(window, GLFW_TRUE);
         }
         
         // Gizmo operation shortcuts (W/E/R)
-        if (key == GLFW_KEY_W && !io.WantTextInput) {
+        if (key == GLFW_KEY_W) {
             app->m_EditorUI.SetGizmoOperation(GizmoOperation::Translate);
         }
-        if (key == GLFW_KEY_E && !io.WantTextInput) {
+        if (key == GLFW_KEY_E) {
             app->m_EditorUI.SetGizmoOperation(GizmoOperation::Rotate);
         }
-        if (key == GLFW_KEY_R && !io.WantTextInput) {
+        if (key == GLFW_KEY_R) {
             app->m_EditorUI.SetGizmoOperation(GizmoOperation::Scale);
         }
         
@@ -944,13 +986,21 @@ void Application::KeyCallback(GLFWwindow* window, int key, int scancode, int act
             app->m_EditorCamera.Reset();
         }
 
-        // Final render from primary camera
-        if (key == GLFW_KEY_F12 && !io.WantTextInput) {
-            app->StartFinalRenderFromMainCamera();
+        // Final render from primary camera - toggle preview window
+        if (key == GLFW_KEY_F12) {
+            bool wasVisible = app->m_EditorUI.IsRenderPreviewVisible();
+            app->m_EditorUI.ShowRenderPreview(!wasVisible);
+            // Start render if not already rendering
+            if (!wasVisible) {
+                gfx::FinalRender* finalRender = app->m_Renderer.GetFinalRender();
+                if (finalRender && finalRender->GetStatus() != gfx::FinalRenderStatus::Rendering) {
+                    app->StartFinalRenderFromMainCamera();
+                }
+            }
         }
         
         // Toggle camera mode with F key
-        if (key == GLFW_KEY_F && !io.WantTextInput) {
+        if (key == GLFW_KEY_F) {
             auto mode = app->m_EditorCamera.GetMode();
             if (mode == scene::EditorCamera::Mode::Orbit) {
                 app->m_EditorCamera.SetMode(scene::EditorCamera::Mode::Fly);
@@ -960,8 +1010,6 @@ void Application::KeyCallback(GLFWwindow* window, int key, int scancode, int act
                 LUCENT_CORE_DEBUG("Camera mode: Orbit");
             }
         }
-    } else if (action == GLFW_RELEASE) {
-        app->m_EditorCamera.OnKeyInput(key, false);
     }
 }
 

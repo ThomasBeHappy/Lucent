@@ -87,12 +87,14 @@ void main() {
     // Entry point for this hit
     float tEnter = gl_HitTEXT;
 
-    // Compute exit distance by intersecting the same AABB
+    // Compute exit distance by intersecting the same AABB.
+    // We store per-volume bounds in VolumeBuffer; TLAS volume instance transform is identity,
+    // so object space == world space for volumes.
     vec3 ro = gl_ObjectRayOriginEXT;
     vec3 rd = gl_ObjectRayDirectionEXT;
     vec3 invDir = 1.0 / rd;
-    vec3 t0 = (gl_AABBMinEXT - ro) * invDir;
-    vec3 t1 = (gl_AABBMaxEXT - ro) * invDir;
+    vec3 t0 = (vol.aabbMin - ro) * invDir;
+    vec3 t1 = (vol.aabbMax - ro) * invDir;
     vec3 tMin = min(t0, t1);
     vec3 tMax = max(t0, t1);
     float tNear = max(max(tMin.x, tMin.y), tMin.z);

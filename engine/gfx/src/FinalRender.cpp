@@ -167,6 +167,11 @@ bool FinalRender::Start(const FinalRenderConfig& config, const GPUCamera& camera
     }
     
     m_CurrentSample = 0;
+    // Init tiling (dispatch one tile per frame to avoid GPU TDR on slow devices)
+    m_TileSize = 256;
+    m_TilesX = std::max(1u, (config.width + m_TileSize - 1) / m_TileSize);
+    m_TilesY = std::max(1u, (config.height + m_TileSize - 1) / m_TileSize);
+    m_CurrentTile = 0;
     m_StartTime = glfwGetTime();
     m_CancelRequested = false;
     m_Status = FinalRenderStatus::Rendering;
@@ -212,7 +217,7 @@ bool FinalRender::RenderSample() {
         return false;
     }
     
-    // Create render settings for this sample
+    // Create render settings for this sample (tile-based)
     RenderSettings settings;
     settings.activeMode = m_Config.useRayTracing ? RenderMode::RayTraced : RenderMode::Traced;
     settings.maxBounces = m_Config.maxBounces;
@@ -224,16 +229,32 @@ bool FinalRender::RenderSample() {
     // Record command buffer
     VkCommandBuffer cmd = m_Renderer->GetDevice()->BeginSingleTimeCommands();
     
-    // Trace one sample
+    // Compute current tile rect
+    const uint32_t totalTiles = std::max(1u, m_TilesX * m_TilesY);
+    const uint32_t tileIdx = std::min(m_CurrentTile, totalTiles - 1);
+    const uint32_t tileX = tileIdx % m_TilesX;
+    const uint32_t tileY = tileIdx / m_TilesX;
+    const uint32_t offsetX = tileX * m_TileSize;
+    const uint32_t offsetY = tileY * m_TileSize;
+    const uint32_t tileW = std::min(m_TileSize, m_Config.width - offsetX);
+    const uint32_t tileH = std::min(m_TileSize, m_Config.height - offsetY);
+
+    // Trace one tile of the current sample
     if (m_Config.useRayTracing && m_Renderer->GetTracerRayKHR() && m_Renderer->GetTracerRayKHR()->IsSupported()) {
+        // Ray tracing path not yet tiled; fall back to full dispatch (unsupported on GT 730 anyway)
         m_Renderer->GetTracerRayKHR()->Trace(cmd, m_Camera, settings, &m_AccumImage);
     } else if (m_Renderer->GetTracerCompute()) {
-        m_Renderer->GetTracerCompute()->Trace(cmd, m_Camera, settings, &m_AccumImage);
+        m_Renderer->GetTracerCompute()->TraceRegion(cmd, m_Camera, settings, &m_AccumImage, offsetX, offsetY, tileW, tileH);
     }
     
     m_Renderer->GetDevice()->EndSingleTimeCommands(cmd);
-    
-    m_CurrentSample++;
+
+    // Advance tile/sample
+    m_CurrentTile++;
+    if (m_CurrentTile >= totalTiles) {
+        m_CurrentTile = 0;
+        m_CurrentSample++;
+    }
     
     // Call progress callback
     if (m_ProgressCallback) {
@@ -245,7 +266,13 @@ bool FinalRender::RenderSample() {
 
 float FinalRender::GetProgress() const {
     if (m_Config.samples == 0) return 0.0f;
-    return static_cast<float>(m_CurrentSample) / static_cast<float>(m_Config.samples);
+    const float base = static_cast<float>(m_CurrentSample);
+    float tileFrac = 0.0f;
+    if (m_Status == FinalRenderStatus::Rendering) {
+        const uint32_t totalTiles = std::max(1u, m_TilesX * m_TilesY);
+        tileFrac = static_cast<float>(std::min(m_CurrentTile, totalTiles)) / static_cast<float>(totalTiles);
+    }
+    return std::clamp((base + tileFrac) / static_cast<float>(m_Config.samples), 0.0f, 1.0f);
 }
 
 float FinalRender::GetElapsedTime() const {
@@ -424,6 +451,60 @@ bool FinalRender::ApplyTonemap() {
     
     stagingBuffer.Unmap();
     stagingBuffer.Shutdown();
+
+    // Upload tonemapped 8-bit RGBA to GPU output image for in-editor preview
+    {
+        VkDeviceSize ldrSize = static_cast<VkDeviceSize>(m_PixelBuffer.size());
+
+        BufferDesc uploadDesc{};
+        uploadDesc.size = static_cast<size_t>(ldrSize);
+        uploadDesc.usage = BufferUsage::Staging;
+        uploadDesc.hostVisible = true;
+        uploadDesc.debugName = "FinalRenderUpload";
+
+        Buffer uploadBuffer;
+        if (!uploadBuffer.Init(device, uploadDesc)) {
+            LUCENT_CORE_ERROR("FinalRender: Failed to create upload buffer for preview");
+            return false;
+        }
+        uploadBuffer.Upload(m_PixelBuffer.data(), static_cast<size_t>(ldrSize));
+
+        VkCommandBuffer uploadCmd = device->BeginSingleTimeCommands();
+
+        // Transition output image for copy
+        VkImageLayout curLayout = m_RenderImage.GetCurrentLayout();
+        if (curLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+            m_RenderImage.TransitionLayout(uploadCmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        } else if (curLayout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+            m_RenderImage.TransitionLayout(uploadCmd, curLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        }
+
+        VkBufferImageCopy copyRegion{};
+        copyRegion.bufferOffset = 0;
+        copyRegion.bufferRowLength = 0;
+        copyRegion.bufferImageHeight = 0;
+        copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copyRegion.imageSubresource.mipLevel = 0;
+        copyRegion.imageSubresource.baseArrayLayer = 0;
+        copyRegion.imageSubresource.layerCount = 1;
+        copyRegion.imageOffset = {0, 0, 0};
+        copyRegion.imageExtent = {m_Config.width, m_Config.height, 1};
+
+        vkCmdCopyBufferToImage(
+            uploadCmd,
+            uploadBuffer.GetHandle(),
+            m_RenderImage.GetHandle(),
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &copyRegion
+        );
+
+        // Transition for sampling in ImGui
+        m_RenderImage.TransitionLayout(uploadCmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        device->EndSingleTimeCommands(uploadCmd);
+        uploadBuffer.Shutdown();
+    }
     
     return true;
 }

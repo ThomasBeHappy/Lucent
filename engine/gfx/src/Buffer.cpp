@@ -32,7 +32,10 @@ bool Buffer::Init(Device* device, const BufferDesc& desc) {
             bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
             break;
         case BufferUsage::Staging:
-            bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            // Staging buffers are used for both:
+            // - CPU->GPU uploads (staging as TRANSFER_SRC)
+            // - GPU->CPU readback (staging as TRANSFER_DST)
+            bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             break;
         case BufferUsage::AccelerationStructure:
             // Ray tracing buffers often serve multiple purposes:

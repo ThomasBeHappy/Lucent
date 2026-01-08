@@ -107,6 +107,12 @@ private:
     uint32_t m_CurrentSample = 0;
     double m_StartTime = 0.0;
     RenderProgressCallback m_ProgressCallback;
+
+    // Tile-based rendering to avoid long GPU dispatches (prevents TDR/device-lost on low-end GPUs)
+    uint32_t m_TileSize = 256;
+    uint32_t m_TilesX = 1;
+    uint32_t m_TilesY = 1;
+    uint32_t m_CurrentTile = 0;
     
     // Scene data
     std::vector<BVHBuilder::Triangle> m_Triangles;

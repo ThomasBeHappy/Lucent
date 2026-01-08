@@ -117,8 +117,11 @@ struct TracerPushConstants {
     uint32_t useEnvMap;
     uint32_t transparentBackground;
     uint32_t volumeCount;  // Number of volume instances
-    uint32_t pad0;
-    uint32_t pad1;
+    // Tiled rendering support (used by FinalRender to avoid long GPU dispatches on low-end GPUs)
+    uint32_t tileOffsetX;
+    uint32_t tileOffsetY;
+    uint32_t tileWidth;
+    uint32_t tileHeight;
 };
 
 // Scene data for GPU
@@ -193,6 +196,16 @@ public:
                const RenderSettings& settings,
                Image* outputImage);
     
+    // Render a sample for a sub-rectangle of the output image (tile-based)
+    void TraceRegion(VkCommandBuffer cmd,
+                     const GPUCamera& camera,
+                     const RenderSettings& settings,
+                     Image* outputImage,
+                     uint32_t tileOffsetX,
+                     uint32_t tileOffsetY,
+                     uint32_t tileWidth,
+                     uint32_t tileHeight);
+    
     // Reset accumulation
     void ResetAccumulation();
     
@@ -211,6 +224,11 @@ private:
     bool CreateDescriptorSets();
     bool CreateAccumulationImage(uint32_t width, uint32_t height);
     void UpdateDescriptors();
+
+    // When non-null, we bind this image as the accumulation target (binding 0) instead of m_AccumulationImage.
+    // Used by FinalRender so it can read back the exact image the tracer wrote.
+    Image* m_ExternalAccumImage = nullptr;
+    VkImageView m_ExternalAccumView = VK_NULL_HANDLE;
     
 private:
     VulkanContext* m_Context = nullptr;

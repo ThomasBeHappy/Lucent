@@ -94,8 +94,10 @@ layout(push_constant) uniform PushConstants {
     uint useEnvMap;
     uint transparentBackground;
     uint volumeCount;
-    uint pad0;
-    uint pad1;
+    uint tileOffsetX;
+    uint tileOffsetY;
+    uint tileWidth;
+    uint tileHeight;
 } pc;
 
 // Light types
@@ -676,9 +678,16 @@ PathTraceResult pathTrace(Ray ray, inout uint seed) {
 }
 
 void main() {
-    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 localCoord = ivec2(gl_GlobalInvocationID.xy);
     ivec2 imageSize = imageSize(accumImage);
     
+    // Tile bounds (local dispatch coords)
+    if (localCoord.x >= int(pc.tileWidth) || localCoord.y >= int(pc.tileHeight)) {
+        return;
+    }
+
+    ivec2 pixelCoord = localCoord + ivec2(int(pc.tileOffsetX), int(pc.tileOffsetY));
+
     if (pixelCoord.x >= imageSize.x || pixelCoord.y >= imageSize.y) {
         return;
     }

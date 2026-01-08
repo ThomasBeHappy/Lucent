@@ -455,6 +455,9 @@ void EditorUI::BeginFrame() {
     // Draw material graph panel
     m_MaterialGraphPanel.Draw();
     
+    // Draw render preview window (if requested)
+    DrawRenderPreviewWindow(&m_ShowRenderPreview);
+    
     // Draw modals
     DrawModals();
 }
@@ -482,6 +485,110 @@ void EditorUI::SetViewportTexture(VkImageView view, VkSampler sampler) {
     
     // Create new descriptor for the viewport texture
     m_ViewportDescriptor = ImGui_ImplVulkan_AddTexture(sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+void EditorUI::SetRenderPreviewTexture(VkImageView view, VkSampler sampler) {
+    // Remove old descriptor if exists
+    if (m_RenderPreviewDescriptor != VK_NULL_HANDLE) {
+        // ImGui will handle cleanup
+    }
+    
+    // Create new descriptor for the render preview texture
+    m_RenderPreviewDescriptor = ImGui_ImplVulkan_AddTexture(sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+void EditorUI::DrawRenderPreviewWindow(bool* pOpen) {
+    if (!pOpen || !*pOpen) return;
+    
+    if (!m_Renderer) return;
+    
+    gfx::FinalRender* finalRender = m_Renderer->GetFinalRender();
+    if (!finalRender) {
+        ImGui::Begin("Render Preview", pOpen);
+        ImGui::TextDisabled("Final render is not available in this build.");
+        ImGui::End();
+        return;
+    }
+    
+    if (m_RenderPreviewJustOpened) {
+        ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.5f),
+                                ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowFocus();
+        m_RenderPreviewJustOpened = false;
+    }
+    ImGui::SetNextWindowSize(ImVec2(900, 650), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Render Preview", pOpen)) {
+        gfx::FinalRenderStatus status = finalRender->GetStatus();
+        
+        // Status header
+        ImGui::Text("Status: ");
+        ImGui::SameLine();
+        switch (status) {
+            case gfx::FinalRenderStatus::Rendering:
+                ImGui::TextColored(ThemeAccent(), "Rendering...");
+                break;
+            case gfx::FinalRenderStatus::Completed:
+                ImGui::TextColored(ThemeSuccess(), "Completed");
+                break;
+            case gfx::FinalRenderStatus::Failed:
+                ImGui::TextColored(ThemeError(), "Failed");
+                break;
+            case gfx::FinalRenderStatus::Cancelled:
+                ImGui::TextColored(ThemeWarning(), "Cancelled");
+                break;
+            default:
+                ImGui::TextDisabled("Idle");
+                break;
+        }
+        
+        // Progress bar
+        if (status == gfx::FinalRenderStatus::Rendering) {
+            ImGui::ProgressBar(finalRender->GetProgress(), ImVec2(-1, 0));
+            ImGui::Text("Samples: %u / %u", finalRender->GetCurrentSample(), finalRender->GetTotalSamples());
+            ImGui::Text("Time: %.2f seconds", finalRender->GetElapsedTime());
+            
+            if (ImGui::Button("Cancel Render")) {
+                finalRender->Cancel();
+            }
+        }
+        
+        ImGui::Separator();
+        
+        // Display render image
+        gfx::Image* renderImage = finalRender->GetRenderImage();
+        if (renderImage && renderImage->GetView() != VK_NULL_HANDLE && m_RenderPreviewDescriptor != VK_NULL_HANDLE) {
+            ImVec2 availSize = ImGui::GetContentRegionAvail();
+            
+            // Maintain aspect ratio
+            uint32_t imgWidth = renderImage->GetWidth();
+            uint32_t imgHeight = renderImage->GetHeight();
+            if (imgWidth > 0 && imgHeight > 0) {
+                float aspect = (float)imgWidth / (float)imgHeight;
+                ImVec2 displaySize = availSize;
+                if (availSize.x / availSize.y > aspect) {
+                    displaySize.x = availSize.y * aspect;
+                } else {
+                    displaySize.y = availSize.x / aspect;
+                }
+                
+                ImGui::Image((ImTextureID)m_RenderPreviewDescriptor, displaySize);
+            }
+        } else {
+            ImGui::TextDisabled("No render image available.");
+        }
+        
+        // Export button
+        if (status == gfx::FinalRenderStatus::Completed) {
+            ImGui::Separator();
+            static char outputPath[256] = "render.png";
+            ImGui::InputText("Output Path", outputPath, sizeof(outputPath));
+            if (ImGui::Button("Save Render")) {
+                finalRender->ExportImage(outputPath);
+            }
+        }
+    }
+    ImGui::End();
 }
 
 void EditorUI::SaveLayout() {
@@ -1109,6 +1216,9 @@ void EditorUI::DrawViewportPanel() {
     
     // Draw Edit Mode overlay (vertices, edges, faces)
     DrawEditModeOverlay();
+
+    // Draw scene indicators (lights/cameras) as 2D overlay projected from world space
+    DrawEntityIndicators();
     
     // Gizmo toolbar overlay
     ImGui::SetCursorPos(ImVec2(10, 30));
@@ -1213,6 +1323,226 @@ void EditorUI::DrawViewportPanel() {
     
     ImGui::End();
     ImGui::PopStyleVar();
+}
+
+// ============================================================================
+// Scene Indicators (lights/cameras)
+// ============================================================================
+
+namespace {
+
+inline bool IsOnScreen01(float z) {
+    return z >= 0.0f && z <= 1.0f;
+}
+
+inline ImU32 MulAlpha(ImU32 c, float a01) {
+    const ImU32 a = (c >> IM_COL32_A_SHIFT) & 0xFF;
+    const ImU32 na = (ImU32)glm::clamp((float)a * a01, 0.0f, 255.0f);
+    return (c & ~(0xFFu << IM_COL32_A_SHIFT)) | (na << IM_COL32_A_SHIFT);
+}
+
+} // namespace
+
+void EditorUI::DrawEntityIndicators() {
+    if (!m_ShowIndicators) return;
+    if (!m_Scene || !m_EditorCamera) return;
+    if (m_ViewportSize.x <= 1.0f || m_ViewportSize.y <= 1.0f) return;
+
+    // Draw in the viewport window, not the global foreground layer (prevents drawing over UI).
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImVec2 clipMin(m_ViewportPosition.x, m_ViewportPosition.y);
+    const ImVec2 clipMax(m_ViewportPosition.x + m_ViewportSize.x, m_ViewportPosition.y + m_ViewportSize.y);
+    drawList->PushClipRect(clipMin, clipMax, true);
+
+    const float aspect = (m_ViewportSize.y > 0.0f) ? (m_ViewportSize.x / m_ViewportSize.y) : 1.0f;
+
+    auto drawLine3D = [&](const glm::vec3& a, const glm::vec3& b, ImU32 color, float thickness) {
+        glm::vec3 sa = WorldToScreen(a);
+        glm::vec3 sb = WorldToScreen(b);
+        // Keep overlays stable: only discard if behind camera. Allow partially clipped segments.
+        if (sa.z < 0.0f || sb.z < 0.0f) return;
+        drawList->AddLine(ImVec2(sa.x, sa.y), ImVec2(sb.x, sb.y), color, thickness);
+    };
+
+    auto drawCircle3D = [&](const glm::vec3& center, const glm::vec3& axisX, const glm::vec3& axisY,
+                            float radius, ImU32 color, int segments, float thickness) {
+        if (segments < 8) segments = 8;
+        glm::vec3 ax = glm::normalize(axisX);
+        glm::vec3 ay = glm::normalize(axisY);
+        glm::vec3 prev = center + radius * ax;
+        for (int i = 1; i <= segments; ++i) {
+            float t = (float)i / (float)segments;
+            float ang = t * glm::two_pi<float>();
+            glm::vec3 p = center + radius * (std::cos(ang) * ax + std::sin(ang) * ay);
+            drawLine3D(prev, p, color, thickness);
+            prev = p;
+        }
+    };
+
+    auto drawWireSphere = [&](const glm::vec3& center, float radius, ImU32 color, float thickness) {
+        const int seg = 48;
+        // 3 great circles in world axes
+        drawCircle3D(center, glm::vec3(1, 0, 0), glm::vec3(0, 1, 0), radius, MulAlpha(color, 0.85f), seg, thickness);
+        drawCircle3D(center, glm::vec3(1, 0, 0), glm::vec3(0, 0, 1), radius, MulAlpha(color, 0.70f), seg, thickness);
+        drawCircle3D(center, glm::vec3(0, 1, 0), glm::vec3(0, 0, 1), radius, MulAlpha(color, 0.70f), seg, thickness);
+    };
+
+    auto drawArrow = [&](const glm::vec3& origin, const glm::vec3& dir, float length, ImU32 color) {
+        glm::vec3 d = glm::normalize(dir);
+        glm::vec3 tip = origin + d * length;
+        drawLine3D(origin, tip, color, 2.0f);
+
+        // Arrow head (simple V)
+        glm::vec3 up = glm::abs(glm::dot(d, glm::vec3(0, 1, 0))) > 0.95f ? glm::vec3(1, 0, 0) : glm::vec3(0, 1, 0);
+        glm::vec3 right = glm::normalize(glm::cross(d, up));
+        glm::vec3 headUp = glm::normalize(glm::cross(right, d));
+        float headLen = length * 0.12f;
+        float headWid = length * 0.06f;
+        drawLine3D(tip, tip - d * headLen + right * headWid, color, 2.0f);
+        drawLine3D(tip, tip - d * headLen - right * headWid, color, 2.0f);
+        drawLine3D(tip, tip - d * headLen + headUp * headWid, color, 2.0f);
+        drawLine3D(tip, tip - d * headLen - headUp * headWid, color, 2.0f);
+    };
+
+    auto drawWireCone = [&](const glm::vec3& apex, const glm::vec3& forward, const glm::vec3& right, const glm::vec3& up,
+                            float length, float outerAngleDeg, ImU32 color) {
+        if (length <= 0.001f) return;
+        float ang = glm::radians(glm::clamp(outerAngleDeg, 0.1f, 89.0f));
+        float radius = std::tan(ang) * length;
+        glm::vec3 f = glm::normalize(forward);
+        glm::vec3 r = glm::normalize(right);
+        glm::vec3 u = glm::normalize(up);
+        glm::vec3 baseCenter = apex + f * length;
+
+        const int seg = 40;
+        // Base circle
+        drawCircle3D(baseCenter, r, u, radius, MulAlpha(color, 0.85f), seg, 1.6f);
+
+        // Side lines (apex -> base)
+        for (int i = 0; i < 8; ++i) {
+            float t = (float)i / 8.0f;
+            float a = t * glm::two_pi<float>();
+            glm::vec3 rim = baseCenter + radius * (std::cos(a) * r + std::sin(a) * u);
+            drawLine3D(apex, rim, MulAlpha(color, 0.80f), 1.4f);
+        }
+
+        // Direction line
+        drawLine3D(apex, baseCenter, MulAlpha(color, 0.90f), 1.8f);
+    };
+
+    auto drawCameraFrustum = [&](const glm::vec3& pos, const glm::vec3& fwd, const glm::vec3& right, const glm::vec3& up,
+                                 const scene::CameraComponent& cam, ImU32 color) {
+        glm::vec3 f = glm::normalize(fwd);
+        glm::vec3 r = glm::normalize(right);
+        glm::vec3 u = glm::normalize(up);
+
+        const float n = std::max(0.001f, cam.nearClip);
+        const float fdist = std::max(n + 0.001f, cam.farClip);
+
+        glm::vec3 nc = pos + f * n;
+        glm::vec3 fc = pos + f * fdist;
+
+        glm::vec3 ntr, ntl, nbr, nbl;
+        glm::vec3 ftr, ftl, fbr, fbl;
+
+        if (cam.projectionType == scene::CameraComponent::ProjectionType::Perspective) {
+            float vFov = glm::radians(glm::clamp(cam.fov, 1.0f, 179.0f));
+            float nh = std::tan(vFov * 0.5f) * n;
+            float nw = nh * aspect;
+            float fh = std::tan(vFov * 0.5f) * fdist;
+            float fw = fh * aspect;
+
+            ntl = nc + u * nh - r * nw;
+            ntr = nc + u * nh + r * nw;
+            nbl = nc - u * nh - r * nw;
+            nbr = nc - u * nh + r * nw;
+
+            ftl = fc + u * fh - r * fw;
+            ftr = fc + u * fh + r * fw;
+            fbl = fc - u * fh - r * fw;
+            fbr = fc - u * fh + r * fw;
+        } else {
+            float oh = std::max(0.001f, cam.orthoSize);
+            float ow = oh * aspect;
+
+            ntl = nc + u * oh - r * ow;
+            ntr = nc + u * oh + r * ow;
+            nbl = nc - u * oh - r * ow;
+            nbr = nc - u * oh + r * ow;
+
+            ftl = fc + u * oh - r * ow;
+            ftr = fc + u * oh + r * ow;
+            fbl = fc - u * oh - r * ow;
+            fbr = fc - u * oh + r * ow;
+        }
+
+        const ImU32 c = MulAlpha(color, 0.90f);
+        const float t = 1.6f;
+
+        // Near plane
+        drawLine3D(ntl, ntr, c, t); drawLine3D(ntr, nbr, c, t);
+        drawLine3D(nbr, nbl, c, t); drawLine3D(nbl, ntl, c, t);
+        // Far plane
+        drawLine3D(ftl, ftr, c, t); drawLine3D(ftr, fbr, c, t);
+        drawLine3D(fbr, fbl, c, t); drawLine3D(fbl, ftl, c, t);
+        // Connectors
+        drawLine3D(ntl, ftl, c, t); drawLine3D(ntr, ftr, c, t);
+        drawLine3D(nbl, fbl, c, t); drawLine3D(nbr, fbr, c, t);
+
+        // Forward axis (small)
+        drawArrow(pos, f, std::min(1.5f, std::max(0.3f, n * 6.0f)), MulAlpha(color, 1.0f));
+    };
+
+    // Color palette
+    const ImU32 pointColor = IM_COL32(255, 220, 80, 255);
+    const ImU32 spotColor  = IM_COL32(255, 170, 80, 255);
+    const ImU32 dirColor   = IM_COL32(120, 200, 255, 255);
+    const ImU32 camColor   = IM_COL32(160, 255, 170, 255);
+
+    if (m_ShowLightIndicators) {
+        auto viewLights = m_Scene->GetView<scene::LightComponent, scene::TransformComponent>();
+        viewLights.Each([&](scene::Entity e, scene::LightComponent& light, scene::TransformComponent& tr) {
+            if (m_IndicatorsSelectedOnly && !IsSelected(e)) return;
+
+            const glm::vec3 pos = tr.position;
+            const glm::vec3 fwd = tr.GetForward();
+            const glm::vec3 right = tr.GetRight();
+            const glm::vec3 up = tr.GetUp();
+
+            switch (light.type) {
+                case scene::LightType::Point: {
+                    drawWireSphere(pos, std::max(0.0f, light.range), pointColor, 1.4f);
+                    drawList->AddCircleFilled(ImVec2(WorldToScreen(pos).x, WorldToScreen(pos).y), 3.0f, pointColor);
+                    break;
+                }
+                case scene::LightType::Spot: {
+                    drawWireCone(pos, fwd, right, up, std::max(0.0f, light.range), light.outerAngle, spotColor);
+                    drawList->AddCircleFilled(ImVec2(WorldToScreen(pos).x, WorldToScreen(pos).y), 3.0f, spotColor);
+                    break;
+                }
+                case scene::LightType::Directional: {
+                    // Draw an arrow showing direction (longer when selected)
+                    float len = IsSelected(e) ? 4.0f : 2.5f;
+                    // Match engine convention: directional lights are uploaded as -transform.forward
+                    // (see Application.cpp -> gpuLight.direction = -forward).
+                    drawArrow(pos, -fwd, len, dirColor);
+                    break;
+                }
+                default:
+                    break;
+            }
+        });
+    }
+
+    if (m_ShowCameraIndicators) {
+        auto viewCams = m_Scene->GetView<scene::CameraComponent, scene::TransformComponent>();
+        viewCams.Each([&](scene::Entity e, scene::CameraComponent& cam, scene::TransformComponent& tr) {
+            if (m_CameraIndicatorsSelectedOnly && !IsSelected(e)) return;
+            drawCameraFrustum(tr.position, tr.GetForward(), tr.GetRight(), tr.GetUp(), cam, camColor);
+        });
+    }
+
+    drawList->PopClipRect();
 }
 
 void EditorUI::DrawGizmo() {
@@ -2436,6 +2766,24 @@ void EditorUI::DrawRenderPropertiesPanel() {
         }
         ImGui::TextDisabled("Tip: disable this for debugging normals / editing open meshes.");
     }
+
+    // === Editor Overlays ===
+    if (ImGui::CollapsingHeader("Editor Overlays", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Show Indicators", &m_ShowIndicators);
+        ImGui::SameLine();
+        ImGui::Checkbox("Light Selected Only", &m_IndicatorsSelectedOnly);
+
+        ImGui::Indent();
+        ImGui::Checkbox("Lights", &m_ShowLightIndicators);
+        ImGui::SameLine();
+        ImGui::Checkbox("Cameras", &m_ShowCameraIndicators);
+        if (m_ShowCameraIndicators) {
+            ImGui::Checkbox("Camera Selected Only", &m_CameraIndicatorsSelectedOnly);
+        }
+        ImGui::Unindent();
+
+        ImGui::TextDisabled("Indicators are editor-only overlays (sphere/cone/frustum).");
+    }
     
     // === Denoise ===
     if (currentMode != gfx::RenderMode::Simple) {
@@ -2543,7 +2891,7 @@ void EditorUI::DrawRenderPropertiesPanel() {
                     ImGui::TextColored(ThemeError(), "Failed");
                     break;
                 case gfx::FinalRenderStatus::Cancelled:
-                    ImGui::TextColored(ThemeWarn(), "Cancelled");
+                    ImGui::TextColored(ThemeWarning(), "Cancelled");
                     break;
                 default:
                     ImGui::TextDisabled("Idle");
@@ -2558,7 +2906,7 @@ void EditorUI::DrawRenderPropertiesPanel() {
                 }
             }
 
-            ImGui::TextDisabled("Press F12 to render from the primary camera.");
+            ImGui::TextDisabled("Press F12 to open render preview window.");
         }
     }
     
@@ -3433,7 +3781,16 @@ glm::vec3 EditorUI::WorldToScreen(const glm::vec3& worldPos) {
     if (!m_EditorCamera) return glm::vec3(0);
     
     glm::mat4 view = m_EditorCamera->GetViewMatrix();
-    glm::mat4 proj = m_EditorCamera->GetProjectionMatrix();
+
+    // IMPORTANT: Use viewport aspect for overlays/picking. The editor camera's stored aspect
+    // can lag behind docking/resizing and causes overlays (e.g. camera frustums) to drift/flicker.
+    const float aspectRatio = (m_ViewportSize.y > 0.0f) ? (m_ViewportSize.x / m_ViewportSize.y) : 1.0f;
+    glm::mat4 proj = glm::perspective(
+        glm::radians(m_EditorCamera->GetFOV()),
+        aspectRatio,
+        m_EditorCamera->GetNearClip(),
+        m_EditorCamera->GetFarClip()
+    );
     
     glm::vec4 clipPos = proj * view * glm::vec4(worldPos, 1.0f);
     if (clipPos.w <= 0.0f) return glm::vec3(-1000, -1000, -1); // Behind camera

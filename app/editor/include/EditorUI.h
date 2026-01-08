@@ -104,6 +104,10 @@ public:
     // Viewport texture for ImGui rendering
     void SetViewportTexture(VkImageView view, VkSampler sampler);
     
+    // Render preview window
+    void SetRenderPreviewTexture(VkImageView view, VkSampler sampler);
+    void DrawRenderPreviewWindow(bool* pOpen);
+    
     // Layout
     void SaveLayout();
     void LoadLayout();
@@ -145,6 +149,10 @@ public:
     // Material graph panel
     MaterialGraphPanel& GetMaterialGraphPanel() { return m_MaterialGraphPanel; }
     void ShowMaterialGraphPanel() { m_MaterialGraphPanel.SetVisible(true); }
+    
+    // Render preview window
+    void ShowRenderPreview(bool show) { m_ShowRenderPreview = show; if (show) m_RenderPreviewJustOpened = true; }
+    bool IsRenderPreviewVisible() const { return m_ShowRenderPreview; }
     
     // Edit Mode
     EditorMode GetEditorMode() const { return m_EditorMode; }
@@ -190,6 +198,9 @@ private:
     mesh::FaceID PickFace(const glm::vec2& mousePos);
     void DrawEditModeOverlay();
     glm::vec3 WorldToScreen(const glm::vec3& worldPos);
+
+    // Scene indicators (lights/cameras)
+    void DrawEntityIndicators();
     
     // Interactive Transform (Blender-style G/R/S)
     void StartInteractiveTransform(InteractiveTransformType type);
@@ -233,6 +244,14 @@ private:
     
     // Viewport texture
     VkDescriptorSet m_ViewportDescriptor = VK_NULL_HANDLE;
+    VkDescriptorSet m_RenderPreviewDescriptor = VK_NULL_HANDLE;
+
+    // Indicators
+    bool m_ShowIndicators = true;
+    bool m_IndicatorsSelectedOnly = false; // lights
+    bool m_ShowLightIndicators = true;
+    bool m_ShowCameraIndicators = true;
+    bool m_CameraIndicatorsSelectedOnly = true;
     ImVec2 m_ViewportSize = { 0, 0 };
     ImVec2 m_ViewportPosition = { 0, 0 };
     bool m_ViewportHovered = false;
@@ -293,6 +312,8 @@ private:
     bool m_ShowContentBrowser = true;
     bool m_ShowConsole = true;
     bool m_ShowRenderProperties = false;
+    bool m_ShowRenderPreview = false;
+    bool m_RenderPreviewJustOpened = false;
     
     bool m_FirstFrame = true;
     

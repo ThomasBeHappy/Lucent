@@ -289,6 +289,66 @@ bool TracerCompute::CreateDescriptorSets() {
 }
 
 bool TracerCompute::CreateAccumulationImage(uint32_t width, uint32_t height) {
+    // If FinalRender provided an external accumulation image, we don't create our own accumulation image.
+    // We still create AOV images at the same resolution.
+    if (m_ExternalAccumImage) {
+        if (m_ExternalAccumImage->GetHandle() == VK_NULL_HANDLE ||
+            m_ExternalAccumImage->GetWidth() != width ||
+            m_ExternalAccumImage->GetHeight() != height) {
+            LUCENT_CORE_ERROR("TracerCompute: External accumulation image is invalid or wrong size");
+            return false;
+        }
+
+        if (width == m_AccumWidth && height == m_AccumHeight &&
+            m_AlbedoImage.GetHandle() != VK_NULL_HANDLE &&
+            m_NormalImage.GetHandle() != VK_NULL_HANDLE &&
+            m_ExternalAccumView == m_ExternalAccumImage->GetView()) {
+            return true;
+        }
+
+        // Recreate only AOV images
+        m_AlbedoImage.Shutdown();
+        m_NormalImage.Shutdown();
+
+        ImageDesc desc{};
+        desc.width = width;
+        desc.height = height;
+        desc.format = VK_FORMAT_R32G32B32A32_SFLOAT;  // HDR AOVs
+        desc.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        desc.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+
+        desc.debugName = "TracerAlbedoImage";
+        if (!m_AlbedoImage.Init(m_Device, desc)) {
+            LUCENT_CORE_ERROR("Failed to create tracer albedo image");
+            return false;
+        }
+
+        desc.debugName = "TracerNormalImage";
+        if (!m_NormalImage.Init(m_Device, desc)) {
+            LUCENT_CORE_ERROR("Failed to create tracer normal image");
+            return false;
+        }
+
+        // Ensure external accumulation image is in GENERAL for storage writes
+        VkCommandBuffer cmd = m_Device->BeginSingleTimeCommands();
+        if (m_ExternalAccumImage->GetCurrentLayout() == VK_IMAGE_LAYOUT_UNDEFINED) {
+            m_ExternalAccumImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        } else if (m_ExternalAccumImage->GetCurrentLayout() != VK_IMAGE_LAYOUT_GENERAL) {
+            m_ExternalAccumImage->TransitionLayout(cmd, m_ExternalAccumImage->GetCurrentLayout(), VK_IMAGE_LAYOUT_GENERAL);
+        }
+        m_AlbedoImage.TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        m_NormalImage.TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        m_Device->EndSingleTimeCommands(cmd);
+
+        m_AccumWidth = width;
+        m_AccumHeight = height;
+        m_ExternalAccumView = m_ExternalAccumImage->GetView();
+        m_DescriptorsDirty = true;
+
+        LUCENT_CORE_DEBUG("TracerCompute AOV images created (external accum): {}x{}", width, height);
+        return true;
+    }
+
     if (width == m_AccumWidth && height == m_AccumHeight && m_AccumulationImage.GetHandle() != VK_NULL_HANDLE) {
         return true;
     }
@@ -343,7 +403,7 @@ void TracerCompute::UpdateDescriptors() {
     
     // Accumulation image
     VkDescriptorImageInfo imageInfo{};
-    imageInfo.imageView = m_AccumulationImage.GetView();
+    imageInfo.imageView = m_ExternalAccumImage ? m_ExternalAccumImage->GetView() : m_AccumulationImage.GetView();
     imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     
     // AOV images for denoiser
@@ -740,10 +800,42 @@ void TracerCompute::Trace(VkCommandBuffer cmd,
                            const GPUCamera& camera,
                            const RenderSettings& settings,
                            Image* outputImage) {
+    if (!outputImage) return;
+    TraceRegion(cmd, camera, settings, outputImage, 0, 0, outputImage->GetWidth(), outputImage->GetHeight());
+}
+
+void TracerCompute::TraceRegion(VkCommandBuffer cmd,
+                           const GPUCamera& camera,
+                           const RenderSettings& settings,
+                           Image* outputImage,
+                           uint32_t tileOffsetX,
+                           uint32_t tileOffsetY,
+                           uint32_t tileWidth,
+                           uint32_t tileHeight) {
     if (!m_SceneGPU.valid) return;
+
+    // Bind external accumulation target if provided (FinalRender path)
+    if (outputImage) {
+        if (m_ExternalAccumImage != outputImage || m_ExternalAccumView != outputImage->GetView()) {
+            m_ExternalAccumImage = outputImage;
+            m_ExternalAccumView = outputImage->GetView();
+            m_DescriptorsDirty = true;
+            // Force accumulation recreation path to update AOV images + layouts
+            m_AccumWidth = 0;
+            m_AccumHeight = 0;
+        }
+    } else {
+        if (m_ExternalAccumImage) {
+            m_ExternalAccumImage = nullptr;
+            m_ExternalAccumView = VK_NULL_HANDLE;
+            m_DescriptorsDirty = true;
+            m_AccumWidth = 0;
+            m_AccumHeight = 0;
+        }
+    }
     
-    uint32_t width = outputImage->GetWidth();
-    uint32_t height = outputImage->GetHeight();
+    uint32_t width = outputImage ? outputImage->GetWidth() : m_AccumWidth;
+    uint32_t height = outputImage ? outputImage->GetHeight() : m_AccumHeight;
     
     // Ensure accumulation image is correct size
     if (!CreateAccumulationImage(width, height)) {
@@ -773,6 +865,12 @@ void TracerCompute::Trace(VkCommandBuffer cmd,
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_PipelineLayout, 
         0, 1, &m_DescriptorSet, 0, nullptr);
     
+    // Clamp tile rect to output bounds
+    tileOffsetX = std::min(tileOffsetX, width);
+    tileOffsetY = std::min(tileOffsetY, height);
+    tileWidth = std::min(tileWidth, width - tileOffsetX);
+    tileHeight = std::min(tileHeight, height - tileOffsetY);
+
     // Push constants
     TracerPushConstants pc{};
     pc.frameIndex = m_FrameIndex;
@@ -785,13 +883,17 @@ void TracerCompute::Trace(VkCommandBuffer cmd,
     pc.useEnvMap = (m_EnvMap && m_EnvMap->IsLoaded() && settings.useEnvMap) ? 1 : 0;
     pc.transparentBackground = settings.transparentBackground ? 1 : 0;
     pc.volumeCount = m_SceneGPU.volumeCount;
-    
+    pc.tileOffsetX = tileOffsetX;
+    pc.tileOffsetY = tileOffsetY;
+    pc.tileWidth = tileWidth;
+    pc.tileHeight = tileHeight;
+
     vkCmdPushConstants(cmd, m_PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 
         0, sizeof(TracerPushConstants), &pc);
     
     // Dispatch
-    uint32_t groupX = (width + 7) / 8;
-    uint32_t groupY = (height + 7) / 8;
+    uint32_t groupX = (tileWidth + 7) / 8;
+    uint32_t groupY = (tileHeight + 7) / 8;
     vkCmdDispatch(cmd, groupX, groupY, 1);
     
     // Memory barrier for accumulation image
@@ -811,7 +913,8 @@ void TracerCompute::ResetAccumulation() {
     m_FrameIndex = 0;
     
     // Clear accumulation and AOV images if they exist
-    if (m_AccumulationImage.GetHandle() != VK_NULL_HANDLE) {
+    Image* accum = m_ExternalAccumImage ? m_ExternalAccumImage : &m_AccumulationImage;
+    if (accum && accum->GetHandle() != VK_NULL_HANDLE) {
         VkCommandBuffer cmd = m_Device->BeginSingleTimeCommands();
         
         VkClearColorValue clearColor = {{ 0.0f, 0.0f, 0.0f, 0.0f }};
@@ -822,7 +925,13 @@ void TracerCompute::ResetAccumulation() {
         range.baseArrayLayer = 0;
         range.layerCount = 1;
         
-        vkCmdClearColorImage(cmd, m_AccumulationImage.GetHandle(), VK_IMAGE_LAYOUT_GENERAL, 
+        // Ensure accumulation target is in GENERAL before clearing
+        if (accum->GetCurrentLayout() == VK_IMAGE_LAYOUT_UNDEFINED) {
+            accum->TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        } else if (accum->GetCurrentLayout() != VK_IMAGE_LAYOUT_GENERAL) {
+            accum->TransitionLayout(cmd, accum->GetCurrentLayout(), VK_IMAGE_LAYOUT_GENERAL);
+        }
+        vkCmdClearColorImage(cmd, accum->GetHandle(), VK_IMAGE_LAYOUT_GENERAL, 
             &clearColor, 1, &range);
         
         if (m_AlbedoImage.GetHandle() != VK_NULL_HANDLE) {

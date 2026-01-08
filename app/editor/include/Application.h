@@ -116,6 +116,10 @@ private:
     bool m_TracerSceneDirty = true;
     std::vector<gfx::GPULight> m_LastTracerLights;
     
+    // Render preview window
+    bool m_ShowRenderPreview = false;
+    bool m_RenderPreviewTextureReady = false;
+    
     // Environment mapping (HDRI)
     gfx::EnvironmentMap m_EnvironmentMap;
     void InitEnvironmentMap();
