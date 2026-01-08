@@ -92,10 +92,10 @@ layout(push_constant) uniform PushConstants {
     float envIntensity;
     float envRotation;
     uint useEnvMap;
+    uint transparentBackground;
     uint volumeCount;
     uint pad0;
     uint pad1;
-    uint pad2;
 } pc;
 
 // Light types
@@ -456,6 +456,7 @@ struct PathTraceResult {
     vec3 radiance;
     vec3 albedo;   // First-hit albedo for denoiser
     vec3 normal;   // First-hit normal for denoiser
+    bool hitPrimary;
 };
 
 // Path trace
@@ -464,6 +465,7 @@ PathTraceResult pathTrace(Ray ray, inout uint seed) {
     result.radiance = vec3(0.0);
     result.albedo = vec3(0.0);
     result.normal = vec3(0.0);
+    result.hitPrimary = false;
     
     vec3 throughput = vec3(1.0);
     bool firstHit = true;
@@ -483,6 +485,10 @@ PathTraceResult pathTrace(Ray ray, inout uint seed) {
                 // Apply volume contribution with premultiplied alpha
                 result.radiance += throughput * volResult.rgb;
                 throughput *= (1.0 - volResult.a);
+
+                if (firstHit) {
+                    result.hitPrimary = true;
+                }
                 
                 // If volume is opaque, stop tracing
                 if (volResult.a > 0.99) {
@@ -499,12 +505,19 @@ PathTraceResult pathTrace(Ray ray, inout uint seed) {
             // Sky color (simple gradient)
             // Sample environment map
             vec3 envColor = sampleEnvironment(ray.direction);
-            result.radiance += throughput * envColor;
+            if (pc.transparentBackground == 0u || !firstHit) {
+                result.radiance += throughput * envColor;
+            }
             
             // For sky hits on first bounce, use env as albedo
             if (firstHit) {
-                result.albedo = envColor;
-                result.normal = -ray.direction;  // Normal pointing back at camera
+                if (pc.transparentBackground == 0u) {
+                    result.albedo = envColor;
+                    result.normal = -ray.direction;  // Normal pointing back at camera
+                } else {
+                    result.albedo = vec3(0.0);
+                    result.normal = vec3(0.5);
+                }
             }
             break;
         }
@@ -526,6 +539,7 @@ PathTraceResult pathTrace(Ray ray, inout uint seed) {
         
         // Capture first-hit AOVs for denoiser
         if (firstHit) {
+            result.hitPrimary = true;
             result.albedo = baseColor.rgb;
             result.normal = normal * 0.5 + 0.5;  // Remap to [0,1] for storage
             firstHit = false;
@@ -684,7 +698,9 @@ void main() {
     vec4 prevColor = imageLoad(accumImage, pixelCoord);
     float sampleWeight = 1.0 / float(pc.sampleIndex + 1);
     vec3 accumulated = mix(prevColor.rgb, result.radiance, sampleWeight);
-    imageStore(accumImage, pixelCoord, vec4(accumulated, 1.0));
+    float sampleAlpha = (pc.transparentBackground != 0u && !result.hitPrimary) ? 0.0 : 1.0;
+    float accumulatedAlpha = mix(prevColor.a, sampleAlpha, sampleWeight);
+    imageStore(accumImage, pixelCoord, vec4(accumulated, accumulatedAlpha));
     
     // Accumulate AOVs (albedo and normal - these converge quickly)
     vec4 prevAlbedo = imageLoad(albedoImage, pixelCoord);
@@ -694,4 +710,3 @@ void main() {
     imageStore(albedoImage, pixelCoord, vec4(accumAlbedo, 1.0));
     imageStore(normalImage, pixelCoord, vec4(accumNormal, 1.0));
 }
-

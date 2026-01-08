@@ -53,7 +53,12 @@ struct RenderSettings {
     uint32_t viewportSamples = 32;      // Max samples for viewport (progressive)
     uint32_t finalSamples = 128;        // Samples for final render
     uint32_t minSamples = 1;            // Minimum samples before converge check
-    
+
+    // === Output ===
+    uint32_t renderWidth = 1920;        // Final render width
+    uint32_t renderHeight = 1080;       // Final render height
+    bool transparentBackground = false; // Render with transparent background
+
     // === Bounces ===
     uint32_t maxBounces = 4;            // Total max bounces
     uint32_t diffuseBounces = 4;        // Max diffuse bounces
@@ -129,4 +134,3 @@ struct RenderSettings {
 };
 
 } // namespace lucent::gfx
-

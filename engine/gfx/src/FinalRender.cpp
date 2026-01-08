@@ -132,7 +132,9 @@ void FinalRender::Shutdown() {
 
 bool FinalRender::Start(const FinalRenderConfig& config, const GPUCamera& camera,
                          const std::vector<BVHBuilder::Triangle>& triangles,
-                         const std::vector<GPUMaterial>& materials) {
+                         const std::vector<GPUMaterial>& materials,
+                         const std::vector<GPULight>& lights,
+                         const std::vector<GPUVolume>& volumes) {
     if (m_Status == FinalRenderStatus::Rendering) {
         LUCENT_CORE_WARN("FinalRender: Already rendering");
         return false;
@@ -153,10 +155,10 @@ bool FinalRender::Start(const FinalRenderConfig& config, const GPUCamera& camera
     
     // Update tracer scene
     if (m_Config.useRayTracing && m_Renderer->GetTracerRayKHR() && m_Renderer->GetTracerRayKHR()->IsSupported()) {
-        m_Renderer->GetTracerRayKHR()->UpdateScene(triangles, materials);
+        m_Renderer->GetTracerRayKHR()->UpdateScene(triangles, materials, lights, volumes);
         m_Renderer->GetTracerRayKHR()->ResetAccumulation();
     } else if (m_Renderer->GetTracerCompute()) {
-        m_Renderer->GetTracerCompute()->UpdateScene(triangles, materials);
+        m_Renderer->GetTracerCompute()->UpdateScene(triangles, materials, lights, volumes);
         m_Renderer->GetTracerCompute()->ResetAccumulation();
     } else {
         LUCENT_CORE_ERROR("FinalRender: No tracer available");
@@ -217,6 +219,7 @@ bool FinalRender::RenderSample() {
     settings.clampIndirect = 10.0f;
     settings.accumulatedSamples = m_CurrentSample;
     settings.viewportSamples = m_Config.samples;
+    settings.transparentBackground = m_Config.transparentBackground;
     
     // Record command buffer
     VkCommandBuffer cmd = m_Renderer->GetDevice()->BeginSingleTimeCommands();
@@ -415,7 +418,8 @@ bool FinalRender::ApplyTonemap() {
         m_PixelBuffer[i * 4 + 0] = static_cast<uint8_t>(r * 255.0f);
         m_PixelBuffer[i * 4 + 1] = static_cast<uint8_t>(g * 255.0f);
         m_PixelBuffer[i * 4 + 2] = static_cast<uint8_t>(b * 255.0f);
-        m_PixelBuffer[i * 4 + 3] = 255;
+        float a = std::clamp(hdrData[i * 4 + 3], 0.0f, 1.0f);
+        m_PixelBuffer[i * 4 + 3] = static_cast<uint8_t>(a * 255.0f);
     }
     
     stagingBuffer.Unmap();

@@ -59,10 +59,10 @@ layout(push_constant) uniform PushConstants {
     float envIntensity;
     float envRotation;
     uint useEnvMap;
+    uint transparentBackground;
     uint volumeCount;
     uint pad0;
     uint pad1;
-    uint pad2;
 } pc;
 
 // Ray payload: carries radiance, throughput, hit info for multi-bounce
@@ -220,6 +220,7 @@ void main() {
     vec3 firstHitAlbedo = vec3(0.0);
     vec3 firstHitNormal = vec3(0.0);
     bool capturedAOV = false;
+    bool hitPrimary = false;
     
     for (uint bounce = 0; bounce <= pc.maxBounces; bounce++) {
         // Initialize payload
@@ -240,12 +241,19 @@ void main() {
         if (!payload.hit) {
             // Miss - add sky contribution
             vec3 skyColor = getSkyColor(direction);
-            radiance += throughput * skyColor;
+            if (pc.transparentBackground == 0u || bounce > 0u) {
+                radiance += throughput * skyColor;
+            }
             
             // For sky hits on first bounce, use sky as albedo
             if (!capturedAOV) {
-                firstHitAlbedo = skyColor;
-                firstHitNormal = -direction * 0.5 + 0.5;  // Remap to [0,1]
+                if (pc.transparentBackground == 0u) {
+                    firstHitAlbedo = skyColor;
+                    firstHitNormal = -direction * 0.5 + 0.5;  // Remap to [0,1]
+                } else {
+                    firstHitAlbedo = vec3(0.0);
+                    firstHitNormal = vec3(0.5);
+                }
             }
             break;
         }
@@ -259,6 +267,9 @@ void main() {
                 firstHitAlbedo = payload.volumeColor;
                 firstHitNormal = vec3(0.5); // neutral
                 capturedAOV = true;
+            }
+            if (bounce == 0u) {
+                hitPrimary = true;
             }
 
             origin = payload.volumeExitPos + direction * 0.001;
@@ -275,6 +286,9 @@ void main() {
             firstHitAlbedo = payload.albedo;
             firstHitNormal = payload.hitNormal * 0.5 + 0.5;  // Remap to [0,1]
             capturedAOV = true;
+        }
+        if (bounce == 0u) {
+            hitPrimary = true;
         }
         
         // Add emissive contribution
@@ -414,7 +428,9 @@ void main() {
     vec4 prevColor = imageLoad(accumImage, ivec2(pixel));
     float sampleWeight = 1.0 / float(pc.sampleIndex + 1);
     vec3 accumulated = mix(prevColor.rgb, radiance, sampleWeight);
-    imageStore(accumImage, ivec2(pixel), vec4(accumulated, 1.0));
+    float sampleAlpha = (pc.transparentBackground != 0u && !hitPrimary) ? 0.0 : 1.0;
+    float accumulatedAlpha = mix(prevColor.a, sampleAlpha, sampleWeight);
+    imageStore(accumImage, ivec2(pixel), vec4(accumulated, accumulatedAlpha));
     
     // Accumulate AOVs (albedo and normal - these converge quickly)
     vec4 prevAlbedo = imageLoad(albedoImage, ivec2(pixel));
@@ -424,4 +440,3 @@ void main() {
     imageStore(albedoImage, ivec2(pixel), vec4(accumAlbedo, 1.0));
     imageStore(normalImage, ivec2(pixel), vec4(accumNormal, 1.0));
 }
-

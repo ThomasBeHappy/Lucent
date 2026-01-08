@@ -67,10 +67,10 @@ struct RTPushConstants {
     float envIntensity;
     float envRotation;
     uint32_t useEnvMap;
+    uint32_t transparentBackground;
     uint32_t volumeCount;
     uint32_t pad0;
     uint32_t pad1;
-    uint32_t pad2;
 };
 
 // Vulkan KHR ray tracing based path tracer
@@ -203,5 +203,4 @@ private:
 };
 
 } // namespace lucent::gfx
-
 

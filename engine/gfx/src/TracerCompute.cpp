@@ -783,6 +783,7 @@ void TracerCompute::Trace(VkCommandBuffer cmd,
     pc.envIntensity = settings.envIntensity;
     pc.envRotation = settings.envRotation;
     pc.useEnvMap = (m_EnvMap && m_EnvMap->IsLoaded() && settings.useEnvMap) ? 1 : 0;
+    pc.transparentBackground = settings.transparentBackground ? 1 : 0;
     pc.volumeCount = m_SceneGPU.volumeCount;
     
     vkCmdPushConstants(cmd, m_PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 
@@ -840,4 +841,3 @@ void TracerCompute::ResetAccumulation() {
 }
 
 } // namespace lucent::gfx
-
