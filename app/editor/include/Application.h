@@ -46,6 +46,10 @@ public:
     
 private:
     bool InitWindow(const ApplicationConfig& config);
+#ifdef _WIN32
+    void ShowSplashScreen();
+    void HideSplashScreen();
+#endif
     void InitScene();
     void ProcessInput();
     void RenderFrame();
@@ -60,6 +64,11 @@ private:
 private:
     GLFWwindow* m_Window = nullptr;
     ApplicationConfig m_Config;
+
+#ifdef _WIN32
+    void* m_SplashWindow = nullptr;
+    void* m_SplashIcon = nullptr;
+#endif
     
     gfx::VulkanContext m_VulkanContext;
     gfx::Device m_Device;

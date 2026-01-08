@@ -61,6 +61,44 @@ static bool HasCameraChanged(const CameraSnapshot& prev, const scene::EditorCame
     return false;
 }
 
+#ifdef _WIN32
+constexpr wchar_t kSplashClassName[] = L"LucentSplashWindow";
+
+LRESULT CALLBACK SplashWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            auto* create = reinterpret_cast<CREATESTRUCT*>(lParam);
+            SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rect{};
+            GetClientRect(hwnd, &rect);
+            HBRUSH brush = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+            FillRect(hdc, &rect, brush);
+            auto iconHandle = reinterpret_cast<HICON>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+            if (iconHandle) {
+                int width = rect.right - rect.left;
+                int height = rect.bottom - rect.top;
+                int size = std::min(width, height) - 40;
+                size = std::max(size, 64);
+                int x = (width - size) / 2;
+                int y = (height - size) / 2;
+                DrawIconEx(hdc, x, y, iconHandle, size, size, 0, nullptr, DI_NORMAL);
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        default:
+            return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+}
+#endif
+
 } // namespace
 
 Application::~Application() {
@@ -69,9 +107,16 @@ Application::~Application() {
 
 bool Application::Init(const ApplicationConfig& config) {
     m_Config = config;
+
+#ifdef _WIN32
+    ShowSplashScreen();
+#endif
     
     if (!InitWindow(config)) {
         LUCENT_CORE_ERROR("Failed to initialize window");
+#ifdef _WIN32
+        HideSplashScreen();
+#endif
         return false;
     }
     
@@ -89,12 +134,18 @@ bool Application::Init(const ApplicationConfig& config) {
     
     if (!m_VulkanContext.Init(vulkanConfig, m_Window)) {
         LUCENT_CORE_ERROR("Failed to initialize Vulkan context");
+#ifdef _WIN32
+        HideSplashScreen();
+#endif
         return false;
     }
     
     // Initialize device
     if (!m_Device.Init(&m_VulkanContext)) {
         LUCENT_CORE_ERROR("Failed to initialize device");
+#ifdef _WIN32
+        HideSplashScreen();
+#endif
         return false;
     }
     
@@ -106,12 +157,18 @@ bool Application::Init(const ApplicationConfig& config) {
     
     if (!m_Renderer.Init(&m_VulkanContext, &m_Device, rendererConfig)) {
         LUCENT_CORE_ERROR("Failed to initialize renderer");
+#ifdef _WIN32
+        HideSplashScreen();
+#endif
         return false;
     }
     
     // Initialize editor UI
     if (!m_EditorUI.Init(m_Window, &m_VulkanContext, &m_Device, &m_Renderer)) {
         LUCENT_CORE_ERROR("Failed to initialize editor UI");
+#ifdef _WIN32
+        HideSplashScreen();
+#endif
         return false;
     }
     
@@ -135,6 +192,13 @@ bool Application::Init(const ApplicationConfig& config) {
     
     m_Running = true;
     m_LastFrameTime = glfwGetTime();
+
+    glfwShowWindow(m_Window);
+    glfwFocusWindow(m_Window);
+
+#ifdef _WIN32
+    HideSplashScreen();
+#endif
     
     LUCENT_INFO("Application initialized successfully");
     return true;
@@ -517,6 +581,9 @@ void Application::ProcessInput() {
 }
 
 void Application::Shutdown() {
+#ifdef _WIN32
+    HideSplashScreen();
+#endif
     if (!m_Window) return;
     
     material::MaterialAssetManager::Get().Shutdown();
@@ -543,6 +610,7 @@ bool Application::InitWindow(const ApplicationConfig& config) {
     // Don't create OpenGL context
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     
     m_Window = glfwCreateWindow(
         static_cast<int>(config.width),
@@ -579,6 +647,89 @@ bool Application::InitWindow(const ApplicationConfig& config) {
     LUCENT_CORE_INFO("Window created: {}x{}", config.width, config.height);
     return true;
 }
+
+#ifdef _WIN32
+void Application::ShowSplashScreen() {
+    if (m_SplashWindow) return;
+
+    HINSTANCE instance = GetModuleHandle(nullptr);
+    HICON icon = static_cast<HICON>(LoadImage(
+        instance,
+        MAKEINTRESOURCE(1),
+        IMAGE_ICON,
+        256,
+        256,
+        LR_DEFAULTCOLOR
+    ));
+    if (!icon) {
+        icon = LoadIcon(instance, MAKEINTRESOURCE(1));
+    }
+
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = SplashWindowProc;
+    wc.hInstance = instance;
+    wc.lpszClassName = kSplashClassName;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+    if (!RegisterClassW(&wc)) {
+        DWORD error = GetLastError();
+        if (error != ERROR_CLASS_ALREADY_EXISTS) {
+            return;
+        }
+    }
+
+    int width = 420;
+    int height = 300;
+    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    int x = (screenWidth - width) / 2;
+    int y = (screenHeight - height) / 2;
+
+    HWND hwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW,
+        kSplashClassName,
+        L"Lucent",
+        WS_POPUP,
+        x,
+        y,
+        width,
+        height,
+        nullptr,
+        nullptr,
+        instance,
+        icon
+    );
+
+    if (!hwnd) {
+        if (icon) {
+            DestroyIcon(icon);
+        }
+        return;
+    }
+
+    m_SplashWindow = hwnd;
+    m_SplashIcon = icon;
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    MSG msg{};
+    while (PeekMessage(&msg, hwnd, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+}
+
+void Application::HideSplashScreen() {
+    if (m_SplashWindow) {
+        DestroyWindow(reinterpret_cast<HWND>(m_SplashWindow));
+        m_SplashWindow = nullptr;
+    }
+    if (m_SplashIcon) {
+        DestroyIcon(reinterpret_cast<HICON>(m_SplashIcon));
+        m_SplashIcon = nullptr;
+    }
+}
+#endif
 
 void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
     gfx::Image* offscreen = m_Renderer.GetOffscreenImage();
