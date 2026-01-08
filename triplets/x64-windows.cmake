@@ -4,5 +4,5 @@ set(VCPKG_CRT_LINKAGE dynamic)
 set(VCPKG_LIBRARY_LINKAGE dynamic)
 
 # Force vcpkg to use the same MSVC version that VS defaults to
-#set(VCPKG_PLATFORM_TOOLSET_VERSION 14.38)
+set(VCPKG_PLATFORM_TOOLSET_VERSION 14.38)
 

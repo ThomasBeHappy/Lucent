@@ -561,10 +561,10 @@ PathTraceResult pathTrace(Ray ray, inout uint seed) {
             vec3 sampledPos = light.position;
             
             if (light.type == LIGHT_DIRECTIONAL) {
-                // Directional light - use per-light softness or fallback to default
+                // Soft sun: sample direction within angular radius (consistent with RT pipeline)
                 float angularRadius = (light.areaWidth > 0.0) ? light.areaWidth : SUN_ANGULAR_RADIUS;
                 float cosMax = cos(angularRadius);
-                lightDir = sampleCone(light.direction, cosMax, seed);
+                lightDir = sampleCone(normalize(light.direction), cosMax, seed);
             } else if (light.type == LIGHT_AREA) {
                 // Area light - sample a point on the surface
                 vec3 tangent = light.areaTangent;

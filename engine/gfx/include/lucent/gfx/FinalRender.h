@@ -88,6 +88,8 @@ private:
     bool CreateRenderResources();
     void DestroyRenderResources();
     bool ApplyTonemap();
+    bool UpdatePreviewTonemap(bool finalPass);
+    Image* GetAccumulationSource();
     bool SaveToPNG(const std::string& path);
     bool SaveToEXR(const std::string& path);
     
@@ -113,6 +115,8 @@ private:
     uint32_t m_TilesX = 1;
     uint32_t m_TilesY = 1;
     uint32_t m_CurrentTile = 0;
+
+    bool m_UsingRayTracing = false;
     
     // Scene data
     std::vector<BVHBuilder::Triangle> m_Triangles;

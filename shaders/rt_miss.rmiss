@@ -16,10 +16,12 @@ struct RayPayload {
     vec3 emissive;
     float metallic;
     float roughness;
+    float hitT;
     // Volume payload (only valid for volume hits)
     bool volumeHit;
-    vec3 volumeColor;   // premultiplied
-    float volumeAlpha;
+    uint volumeIdx;
+    float volumeEnterT;
+    float volumeExitT;
     vec3 volumeExitPos;
 };
 

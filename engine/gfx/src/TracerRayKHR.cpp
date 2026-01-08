@@ -724,7 +724,12 @@ bool TracerRayKHR::BuildTLAS() {
         volInstance.transform.matrix[2][2] = 1.0f;
         volInstance.instanceCustomIndex = 0;
         volInstance.mask = 0x02; // volume mask
-        volInstance.instanceShaderBindingTableRecordOffset = 1; // selects the volume hit group (see raygen stride=2)
+        // Hit group table layout (stride = 2 ray types):
+        //   0: triangle primary
+        //   1: triangle shadow
+        //   2: volume primary
+        // Shadow rays use cullMask=0x01 (ignore volumes), so we only need the primary volume hit group.
+        volInstance.instanceShaderBindingTableRecordOffset = 2;
         volInstance.flags = 0;
         volInstance.accelerationStructureReference = m_VolumeBLAS.deviceAddress;
         instances.push_back(volInstance);
@@ -997,6 +1002,10 @@ void TracerRayKHR::UpdateScene(const std::vector<BVHBuilder::Triangle>& triangle
         LUCENT_CORE_ERROR("TracerRayKHR: Failed to build volume BLAS");
         return;
     }
+
+    // IMPORTANT: BuildTLAS() decides whether to include the volume instance based on m_VolumeCount.
+    // Set it here (before TLAS build), otherwise volumes won't be present in the TLAS and can never be hit.
+    m_VolumeCount = static_cast<uint32_t>(volumes.size());
     
     if (!BuildTLAS()) {
         LUCENT_CORE_ERROR("TracerRayKHR: Failed to build TLAS");

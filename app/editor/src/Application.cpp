@@ -9,6 +9,7 @@
 #include <GLFW/glfw3.h>
 #include <algorithm>
 #include <cmath>
+#include <optional>
 
 // GLFW native access (Win32 HWND)
 #define GLFW_EXPOSE_NATIVE_WIN32
@@ -1403,31 +1404,275 @@ void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& t
             gfx::GPUVolume vol{};
             vol.transform = glm::inverse(modelMatrix);
 
-            // Pull default values from the VolumetricOutput node input pin defaults (V1)
+            // Pull volume parameters from the VolumetricOutput inputs.
+            // We prefer evaluating connected constant/math subgraphs so users can drive density, etc.,
+            // and fall back to pin defaults when the graph isn't constant-evaluable.
             const auto& graph = matAsset->GetGraph();
             const auto* volNode = graph.GetNode(graph.GetVolumeOutputNodeId());
             if (volNode && volNode->type == material::NodeType::VolumetricOutput) {
-                auto getFloatDefault = [&](size_t pinIdx, float fallback) -> float {
-                    if (pinIdx >= volNode->inputPins.size()) return fallback;
-                    const auto* pin = graph.GetPin(volNode->inputPins[pinIdx]);
+                // Helpers to read defaults
+                auto getFloatDefault = [&](material::PinID pinId, float fallback) -> float {
+                    const auto* pin = graph.GetPin(pinId);
                     if (!pin) return fallback;
                     if (std::holds_alternative<float>(pin->defaultValue)) return std::get<float>(pin->defaultValue);
                     return fallback;
                 };
-                auto getVec3Default = [&](size_t pinIdx, glm::vec3 fallback) -> glm::vec3 {
-                    if (pinIdx >= volNode->inputPins.size()) return fallback;
-                    const auto* pin = graph.GetPin(volNode->inputPins[pinIdx]);
+                auto getVec3Default = [&](material::PinID pinId, glm::vec3 fallback) -> glm::vec3 {
+                    const auto* pin = graph.GetPin(pinId);
                     if (!pin) return fallback;
                     if (std::holds_alternative<glm::vec3>(pin->defaultValue)) return std::get<glm::vec3>(pin->defaultValue);
+                    if (std::holds_alternative<glm::vec4>(pin->defaultValue)) return glm::vec3(std::get<glm::vec4>(pin->defaultValue));
                     return fallback;
                 };
 
-                vol.scatterColor = getVec3Default(0, glm::vec3(0.8f));
-                vol.density = getFloatDefault(1, 1.0f);
-                vol.anisotropy = getFloatDefault(2, 0.0f);
-                vol.absorption = getVec3Default(3, glm::vec3(0.0f));
-                vol.emission = getVec3Default(4, glm::vec3(0.0f));
-                vol.emissionStrength = getFloatDefault(5, 1.0f);
+                // Constant evaluation for traced volumes (supports const + simple math chains)
+                std::function<std::optional<float>(material::PinID)> evalFloat;
+                std::function<std::optional<glm::vec3>(material::PinID)> evalVec3;
+                std::unordered_set<material::PinID> visitingF;
+                std::unordered_set<material::PinID> visitingV3;
+
+                auto evalInputLink = [&](material::PinID inputPin) -> material::PinID {
+                    material::LinkID linkId = graph.FindLinkByEndPin(inputPin);
+                    if (linkId != material::INVALID_LINK_ID) {
+                        const auto* link = graph.GetLink(linkId);
+                        if (link) return link->startPinId;
+                    }
+                    return material::INVALID_PIN_ID;
+                };
+
+                evalFloat = [&](material::PinID pinId) -> std::optional<float> {
+                    if (pinId == material::INVALID_PIN_ID) return std::nullopt;
+                    if (visitingF.count(pinId)) return std::nullopt;
+                    visitingF.insert(pinId);
+                    const auto* pin = graph.GetPin(pinId);
+                    if (!pin) { visitingF.erase(pinId); return std::nullopt; }
+
+                    if (pin->direction == material::PinDirection::Input) {
+                        material::PinID src = evalInputLink(pinId);
+                        if (src != material::INVALID_PIN_ID) {
+                            auto v = evalFloat(src);
+                            visitingF.erase(pinId);
+                            return v;
+                        }
+                        // Default
+                        float v = 0.0f;
+                        if (std::holds_alternative<float>(pin->defaultValue)) v = std::get<float>(pin->defaultValue);
+                        else if (std::holds_alternative<glm::vec3>(pin->defaultValue)) v = std::get<glm::vec3>(pin->defaultValue).x;
+                        else if (std::holds_alternative<glm::vec4>(pin->defaultValue)) v = std::get<glm::vec4>(pin->defaultValue).x;
+                        visitingF.erase(pinId);
+                        return v;
+                    }
+
+                    const auto* node = graph.GetNode(pin->nodeId);
+                    if (!node) { visitingF.erase(pinId); return std::nullopt; }
+
+                    // Determine output index when needed
+                    auto outIndex = [&]() -> int {
+                        for (int i = 0; i < (int)node->outputPins.size(); ++i) {
+                            if (node->outputPins[i] == pinId) return i;
+                        }
+                        return -1;
+                    };
+
+                    std::optional<float> result;
+                    switch (node->type) {
+                        case material::NodeType::ConstFloat:
+                            if (std::holds_alternative<float>(node->parameter)) result = std::get<float>(node->parameter);
+                            break;
+                        case material::NodeType::Vec3ToFloat: {
+                            auto v3 = evalVec3(node->inputPins[0]);
+                            if (v3) result = v3->x;
+                            break;
+                        }
+                        case material::NodeType::SeparateVec3: {
+                            auto v3 = evalVec3(node->inputPins[0]);
+                            int idx = outIndex();
+                            if (v3 && idx >= 0 && idx < 3) {
+                                result = (idx == 0) ? v3->x : (idx == 1) ? v3->y : v3->z;
+                            }
+                            break;
+                        }
+                        case material::NodeType::Clamp: {
+                            auto v = evalFloat(node->inputPins[0]);
+                            auto mi = evalFloat(node->inputPins[1]);
+                            auto ma = evalFloat(node->inputPins[2]);
+                            if (v && mi && ma) result = std::clamp(*v, *mi, *ma);
+                            break;
+                        }
+                        case material::NodeType::OneMinus: {
+                            auto v = evalFloat(node->inputPins[0]);
+                            if (v) result = 1.0f - *v;
+                            break;
+                        }
+                        case material::NodeType::Abs: {
+                            auto v = evalFloat(node->inputPins[0]);
+                            if (v) result = std::fabs(*v);
+                            break;
+                        }
+                        case material::NodeType::Sin: {
+                            auto v = evalFloat(node->inputPins[0]);
+                            if (v) result = std::sin(*v);
+                            break;
+                        }
+                        case material::NodeType::Cos: {
+                            auto v = evalFloat(node->inputPins[0]);
+                            if (v) result = std::cos(*v);
+                            break;
+                        }
+                        case material::NodeType::Power: {
+                            auto a = evalFloat(node->inputPins[0]);
+                            auto b = evalFloat(node->inputPins[1]);
+                            if (a && b) result = std::pow(*a, *b);
+                            break;
+                        }
+                        case material::NodeType::Remap: {
+                            auto v = evalFloat(node->inputPins[0]);
+                            auto inMin = evalFloat(node->inputPins[1]);
+                            auto inMax = evalFloat(node->inputPins[2]);
+                            auto outMin = evalFloat(node->inputPins[3]);
+                            auto outMax = evalFloat(node->inputPins[4]);
+                            if (v && inMin && inMax && outMin && outMax) {
+                                float denom = std::max(*inMax - *inMin, 1e-6f);
+                                float t = std::clamp((*v - *inMin) / denom, 0.0f, 1.0f);
+                                result = *outMin + t * (*outMax - *outMin);
+                            }
+                            break;
+                        }
+                        case material::NodeType::Step: {
+                            auto edge = evalFloat(node->inputPins[0]);
+                            auto x = evalFloat(node->inputPins[1]);
+                            if (edge && x) result = (*x >= *edge) ? 1.0f : 0.0f;
+                            break;
+                        }
+                        case material::NodeType::Smoothstep: {
+                            auto e0 = evalFloat(node->inputPins[0]);
+                            auto e1 = evalFloat(node->inputPins[1]);
+                            auto x = evalFloat(node->inputPins[2]);
+                            if (e0 && e1 && x) {
+                                float t = std::clamp((*x - *e0) / std::max(*e1 - *e0, 1e-6f), 0.0f, 1.0f);
+                                result = t * t * (3.0f - 2.0f * t);
+                            }
+                            break;
+                        }
+                        case material::NodeType::Reroute: {
+                            auto v = evalFloat(node->inputPins[0]);
+                            if (v) result = *v;
+                            break;
+                        }
+                        default:
+                            break;
+                    }
+
+                    visitingF.erase(pinId);
+                    return result;
+                };
+
+                evalVec3 = [&](material::PinID pinId) -> std::optional<glm::vec3> {
+                    if (pinId == material::INVALID_PIN_ID) return std::nullopt;
+                    if (visitingV3.count(pinId)) return std::nullopt;
+                    visitingV3.insert(pinId);
+                    const auto* pin = graph.GetPin(pinId);
+                    if (!pin) { visitingV3.erase(pinId); return std::nullopt; }
+
+                    if (pin->direction == material::PinDirection::Input) {
+                        material::PinID src = evalInputLink(pinId);
+                        if (src != material::INVALID_PIN_ID) {
+                            auto v = evalVec3(src);
+                            visitingV3.erase(pinId);
+                            return v;
+                        }
+                        glm::vec3 v = glm::vec3(0.0f);
+                        if (std::holds_alternative<glm::vec3>(pin->defaultValue)) v = std::get<glm::vec3>(pin->defaultValue);
+                        else if (std::holds_alternative<glm::vec4>(pin->defaultValue)) v = glm::vec3(std::get<glm::vec4>(pin->defaultValue));
+                        else if (std::holds_alternative<float>(pin->defaultValue)) v = glm::vec3(std::get<float>(pin->defaultValue));
+                        visitingV3.erase(pinId);
+                        return v;
+                    }
+
+                    const auto* node = graph.GetNode(pin->nodeId);
+                    if (!node) { visitingV3.erase(pinId); return std::nullopt; }
+
+                    std::optional<glm::vec3> result;
+                    switch (node->type) {
+                        case material::NodeType::ConstVec3:
+                            if (std::holds_alternative<glm::vec3>(node->parameter)) result = std::get<glm::vec3>(node->parameter);
+                            break;
+                        case material::NodeType::ConstVec4:
+                            if (std::holds_alternative<glm::vec4>(node->parameter)) result = glm::vec3(std::get<glm::vec4>(node->parameter));
+                            break;
+                        case material::NodeType::FloatToVec3: {
+                            auto v = evalFloat(node->inputPins[0]);
+                            if (v) result = glm::vec3(*v);
+                            break;
+                        }
+                        case material::NodeType::Vec4ToVec3: {
+                            // Not directly evaluatable here; fall back to defaults
+                            break;
+                        }
+                        case material::NodeType::Add:
+                        case material::NodeType::Subtract:
+                        case material::NodeType::Multiply:
+                        case material::NodeType::Divide: {
+                            auto a = evalVec3(node->inputPins[0]);
+                            auto b = evalVec3(node->inputPins[1]);
+                            if (a && b) {
+                                if (node->type == material::NodeType::Add) result = *a + *b;
+                                else if (node->type == material::NodeType::Subtract) result = *a - *b;
+                                else if (node->type == material::NodeType::Multiply) result = *a * *b;
+                                else result = glm::vec3(
+                                    a->x / std::max(b->x, 1e-6f),
+                                    a->y / std::max(b->y, 1e-6f),
+                                    a->z / std::max(b->z, 1e-6f)
+                                );
+                            }
+                            break;
+                        }
+                        case material::NodeType::Lerp: {
+                            auto a = evalVec3(node->inputPins[0]);
+                            auto b = evalVec3(node->inputPins[1]);
+                            auto t = evalFloat(node->inputPins[2]);
+                            if (a && b && t) result = (*a) * (1.0f - *t) + (*b) * (*t);
+                            break;
+                        }
+                        case material::NodeType::CombineVec3: {
+                            auto r = evalFloat(node->inputPins[0]);
+                            auto g = evalFloat(node->inputPins[1]);
+                            auto b = evalFloat(node->inputPins[2]);
+                            if (r && g && b) result = glm::vec3(*r, *g, *b);
+                            break;
+                        }
+                        case material::NodeType::Reroute: {
+                            auto v = evalVec3(node->inputPins[0]);
+                            if (v) result = *v;
+                            break;
+                        }
+                        default:
+                            break;
+                    }
+
+                    visitingV3.erase(pinId);
+                    return result;
+                };
+
+                auto getFloat = [&](size_t pinIdx, float fallback) -> float {
+                    if (pinIdx >= volNode->inputPins.size()) return fallback;
+                    material::PinID pinId = volNode->inputPins[pinIdx];
+                    if (auto v = evalFloat(pinId)) return *v;
+                    return getFloatDefault(pinId, fallback);
+                };
+                auto getVec3 = [&](size_t pinIdx, glm::vec3 fallback) -> glm::vec3 {
+                    if (pinIdx >= volNode->inputPins.size()) return fallback;
+                    material::PinID pinId = volNode->inputPins[pinIdx];
+                    if (auto v = evalVec3(pinId)) return *v;
+                    return getVec3Default(pinId, fallback);
+                };
+
+                vol.scatterColor = getVec3(0, glm::vec3(0.8f));
+                vol.density = getFloat(1, 1.0f);
+                vol.anisotropy = getFloat(2, 0.0f);
+                vol.absorption = getVec3(3, glm::vec3(0.0f));
+                vol.emission = getVec3(4, glm::vec3(0.0f));
+                vol.emissionStrength = getFloat(5, 1.0f);
             } else {
                 vol.scatterColor = glm::vec3(renderer.baseColor);
                 vol.density = 1.0f;

@@ -154,7 +154,11 @@ bool FinalRender::Start(const FinalRenderConfig& config, const GPUCamera& camera
     }
     
     // Update tracer scene
-    if (m_Config.useRayTracing && m_Renderer->GetTracerRayKHR() && m_Renderer->GetTracerRayKHR()->IsSupported()) {
+    m_UsingRayTracing = (m_Config.useRayTracing &&
+                         m_Renderer->GetTracerRayKHR() &&
+                         m_Renderer->GetTracerRayKHR()->IsSupported());
+
+    if (m_UsingRayTracing) {
         m_Renderer->GetTracerRayKHR()->UpdateScene(triangles, materials, lights, volumes);
         m_Renderer->GetTracerRayKHR()->ResetAccumulation();
     } else if (m_Renderer->GetTracerCompute()) {
@@ -168,9 +172,16 @@ bool FinalRender::Start(const FinalRenderConfig& config, const GPUCamera& camera
     
     m_CurrentSample = 0;
     // Init tiling (dispatch one tile per frame to avoid GPU TDR on slow devices)
-    m_TileSize = 256;
-    m_TilesX = std::max(1u, (config.width + m_TileSize - 1) / m_TileSize);
-    m_TilesY = std::max(1u, (config.height + m_TileSize - 1) / m_TileSize);
+    // KHR ray tracing path is not tiled yet, so force a single tile (one sample per frame).
+    if (m_UsingRayTracing) {
+        m_TileSize = std::max(config.width, config.height);
+        m_TilesX = 1;
+        m_TilesY = 1;
+    } else {
+        m_TileSize = 256;
+        m_TilesX = std::max(1u, (config.width + m_TileSize - 1) / m_TileSize);
+        m_TilesY = std::max(1u, (config.height + m_TileSize - 1) / m_TileSize);
+    }
     m_CurrentTile = 0;
     m_StartTime = glfwGetTime();
     m_CancelRequested = false;
@@ -219,7 +230,7 @@ bool FinalRender::RenderSample() {
     
     // Create render settings for this sample (tile-based)
     RenderSettings settings;
-    settings.activeMode = m_Config.useRayTracing ? RenderMode::RayTraced : RenderMode::Traced;
+    settings.activeMode = m_UsingRayTracing ? RenderMode::RayTraced : RenderMode::Traced;
     settings.maxBounces = m_Config.maxBounces;
     settings.clampIndirect = 10.0f;
     settings.accumulatedSamples = m_CurrentSample;
@@ -228,32 +239,58 @@ bool FinalRender::RenderSample() {
     
     // Record command buffer
     VkCommandBuffer cmd = m_Renderer->GetDevice()->BeginSingleTimeCommands();
-    
-    // Compute current tile rect
-    const uint32_t totalTiles = std::max(1u, m_TilesX * m_TilesY);
-    const uint32_t tileIdx = std::min(m_CurrentTile, totalTiles - 1);
-    const uint32_t tileX = tileIdx % m_TilesX;
-    const uint32_t tileY = tileIdx / m_TilesX;
-    const uint32_t offsetX = tileX * m_TileSize;
-    const uint32_t offsetY = tileY * m_TileSize;
-    const uint32_t tileW = std::min(m_TileSize, m_Config.width - offsetX);
-    const uint32_t tileH = std::min(m_TileSize, m_Config.height - offsetY);
 
-    // Trace one tile of the current sample
-    if (m_Config.useRayTracing && m_Renderer->GetTracerRayKHR() && m_Renderer->GetTracerRayKHR()->IsSupported()) {
-        // Ray tracing path not yet tiled; fall back to full dispatch (unsupported on GT 730 anyway)
-        m_Renderer->GetTracerRayKHR()->Trace(cmd, m_Camera, settings, &m_AccumImage);
+    bool completedSampleThisCall = false;
+    if (m_UsingRayTracing && m_Renderer->GetTracerRayKHR() && m_Renderer->GetTracerRayKHR()->IsSupported()) {
+        // Ray tracing path: full dispatch each call (no tiling) -> one sample per call
+        m_Renderer->GetTracerRayKHR()->Trace(cmd, m_Camera, settings, &m_AccumImage /* used for sizing */);
+        completedSampleThisCall = true;
     } else if (m_Renderer->GetTracerCompute()) {
+        // Compute current tile rect
+        const uint32_t totalTiles = std::max(1u, m_TilesX * m_TilesY);
+        const uint32_t tileIdx = std::min(m_CurrentTile, totalTiles - 1);
+        const uint32_t tileX = tileIdx % m_TilesX;
+        const uint32_t tileY = tileIdx / m_TilesX;
+        const uint32_t offsetX = tileX * m_TileSize;
+        const uint32_t offsetY = tileY * m_TileSize;
+        const uint32_t tileW = std::min(m_TileSize, m_Config.width - offsetX);
+        const uint32_t tileH = std::min(m_TileSize, m_Config.height - offsetY);
+
+        // Trace one tile of the current sample
         m_Renderer->GetTracerCompute()->TraceRegion(cmd, m_Camera, settings, &m_AccumImage, offsetX, offsetY, tileW, tileH);
+
+        // Advance tile/sample
+        m_CurrentTile++;
+        if (m_CurrentTile >= totalTiles) {
+            m_CurrentTile = 0;
+            completedSampleThisCall = true;
+        }
     }
-    
+
     m_Renderer->GetDevice()->EndSingleTimeCommands(cmd);
 
-    // Advance tile/sample
-    m_CurrentTile++;
-    if (m_CurrentTile >= totalTiles) {
-        m_CurrentTile = 0;
+    if (completedSampleThisCall) {
         m_CurrentSample++;
+
+        // If we just finished the last sample, finalize immediately.
+        if (m_CurrentSample >= m_Config.samples) {
+            ApplyTonemap();
+            m_Status = FinalRenderStatus::Completed;
+
+            float elapsed = GetElapsedTime();
+            LUCENT_CORE_INFO("FinalRender: Completed in {:.2f}s ({:.2f}ms/sample)",
+                elapsed, elapsed * 1000.0f / m_Config.samples);
+
+            // Auto-save if path is set
+            if (!m_Config.outputPath.empty()) {
+                ExportImage(m_Config.outputPath);
+            }
+
+            return false;
+        }
+
+        // Update preview image for the editor (progressive feedback)
+        UpdatePreviewTonemap(/*finalPass=*/false);
     }
     
     // Call progress callback
@@ -314,6 +351,24 @@ bool FinalRender::CreateRenderResources() {
     if (!m_RenderImage.Init(device, renderDesc)) {
         return false;
     }
+
+    // Initialize output image to a valid sampled layout immediately (ImGui expects SHADER_READ_ONLY_OPTIMAL)
+    {
+        VkCommandBuffer cmd2 = device->BeginSingleTimeCommands();
+        m_RenderImage.TransitionLayout(cmd2, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+        VkClearColorValue clearColor = {{ 0.0f, 0.0f, 0.0f, 1.0f }};
+        VkImageSubresourceRange range{};
+        range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        range.baseMipLevel = 0;
+        range.levelCount = 1;
+        range.baseArrayLayer = 0;
+        range.layerCount = 1;
+        vkCmdClearColorImage(cmd2, m_RenderImage.GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &range);
+
+        m_RenderImage.TransitionLayout(cmd2, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        device->EndSingleTimeCommands(cmd2);
+    }
     
     // Allocate CPU buffer
     m_PixelBuffer.resize(m_Config.width * m_Config.height * 4);
@@ -328,31 +383,54 @@ void FinalRender::DestroyRenderResources() {
 }
 
 bool FinalRender::ApplyTonemap() {
-    // For simplicity, we'll read back the HDR image and tonemap on CPU
-    // A more efficient implementation would use a compute shader
-    
+    return UpdatePreviewTonemap(/*finalPass=*/true);
+}
+
+Image* FinalRender::GetAccumulationSource() {
+    if (!m_Renderer) return &m_AccumImage;
+    if (m_UsingRayTracing) {
+        if (auto* rt = m_Renderer->GetTracerRayKHR()) {
+            if (auto* img = rt->GetAccumulationImage(); img && img->GetHandle() != VK_NULL_HANDLE) {
+                return img;
+            }
+        }
+    }
+    return &m_AccumImage;
+}
+
+bool FinalRender::UpdatePreviewTonemap(bool finalPass) {
+    // For simplicity, read back the HDR accumulation and tonemap on CPU.
+    // This is used for both progressive preview updates and final output.
     Device* device = m_Renderer->GetDevice();
-    
+    Image* srcImage = GetAccumulationSource();
+    if (!srcImage || srcImage->GetHandle() == VK_NULL_HANDLE) {
+        return false;
+    }
+
     // Create staging buffer for readback
     VkDeviceSize imageSize = m_Config.width * m_Config.height * sizeof(float) * 4;
-    
+
     BufferDesc stagingDesc{};
     stagingDesc.size = imageSize;
     stagingDesc.usage = BufferUsage::Staging;
     stagingDesc.hostVisible = true;
-    stagingDesc.debugName = "FinalRenderStaging";
-    
+    stagingDesc.debugName = finalPass ? "FinalRenderStaging_Final" : "FinalRenderStaging_Preview";
+
     Buffer stagingBuffer;
     if (!stagingBuffer.Init(device, stagingDesc)) {
         return false;
     }
-    
+
     // Copy image to staging buffer
     VkCommandBuffer cmd = device->BeginSingleTimeCommands();
-    
-    // Transition accum image for transfer
-    m_AccumImage.TransitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    
+
+    // Transition accumulation image for transfer (and restore for continued tracing)
+    VkImageLayout oldLayout = srcImage->GetCurrentLayout();
+    VkImageLayout restoreLayout = (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED) ? VK_IMAGE_LAYOUT_GENERAL : oldLayout;
+    if (restoreLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        srcImage->TransitionLayout(cmd, restoreLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    }
+
     VkBufferImageCopy region{};
     region.bufferOffset = 0;
     region.bufferRowLength = 0;
@@ -363,12 +441,20 @@ bool FinalRender::ApplyTonemap() {
     region.imageSubresource.layerCount = 1;
     region.imageOffset = {0, 0, 0};
     region.imageExtent = {m_Config.width, m_Config.height, 1};
-    
-    vkCmdCopyImageToBuffer(cmd, m_AccumImage.GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            stagingBuffer.GetHandle(), 1, &region);
-    
+
+    vkCmdCopyImageToBuffer(cmd, srcImage->GetHandle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           stagingBuffer.GetHandle(), 1, &region);
+
+    // Always restore layout so the tracer images remain usable after the final render completes.
+    if (restoreLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        srcImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, restoreLayout);
+    } else {
+        // Sensible default for accumulation images
+        srcImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    }
+
     device->EndSingleTimeCommands(cmd);
-    
+
     // Read back and denoise/tonemap
     float* hdrData = static_cast<float*>(stagingBuffer.Map());
     float strength = std::clamp(m_Config.denoiseStrength, 0.0f, 1.0f);
@@ -387,7 +473,7 @@ bool FinalRender::ApplyTonemap() {
     } else {
         useDenoiser = false;
     }
-    
+
     for (uint32_t i = 0; i < m_Config.width * m_Config.height; i++) {
         float r = hdrData[i * 4 + 0];
         float g = hdrData[i * 4 + 1];
@@ -398,12 +484,12 @@ bool FinalRender::ApplyTonemap() {
             g = g * (1.0f - strength) + denoised[i * 4 + 1] * strength;
             b = b * (1.0f - strength) + denoised[i * 4 + 2] * strength;
         }
-        
+
         // Apply exposure
         r *= m_Config.exposure;
         g *= m_Config.exposure;
         b *= m_Config.exposure;
-        
+
         // Apply tonemapping
         switch (m_Config.tonemap) {
             case TonemapOperator::Reinhard:
@@ -411,7 +497,7 @@ bool FinalRender::ApplyTonemap() {
                 g = g / (1.0f + g);
                 b = b / (1.0f + b);
                 break;
-                
+
             case TonemapOperator::ACES: {
                 // ACES filmic tonemap
                 auto aces = [](float x) {
@@ -427,7 +513,7 @@ bool FinalRender::ApplyTonemap() {
                 b = aces(b);
                 break;
             }
-            
+
             case TonemapOperator::None:
             default:
                 r = std::clamp(r, 0.0f, 1.0f);
@@ -435,12 +521,12 @@ bool FinalRender::ApplyTonemap() {
                 b = std::clamp(b, 0.0f, 1.0f);
                 break;
         }
-        
+
         // Apply gamma
         r = std::pow(r, 1.0f / m_Config.gamma);
         g = std::pow(g, 1.0f / m_Config.gamma);
         b = std::pow(b, 1.0f / m_Config.gamma);
-        
+
         // Convert to 8-bit
         m_PixelBuffer[i * 4 + 0] = static_cast<uint8_t>(r * 255.0f);
         m_PixelBuffer[i * 4 + 1] = static_cast<uint8_t>(g * 255.0f);
@@ -448,64 +534,62 @@ bool FinalRender::ApplyTonemap() {
         float a = std::clamp(hdrData[i * 4 + 3], 0.0f, 1.0f);
         m_PixelBuffer[i * 4 + 3] = static_cast<uint8_t>(a * 255.0f);
     }
-    
+
     stagingBuffer.Unmap();
     stagingBuffer.Shutdown();
 
     // Upload tonemapped 8-bit RGBA to GPU output image for in-editor preview
-    {
-        VkDeviceSize ldrSize = static_cast<VkDeviceSize>(m_PixelBuffer.size());
+    VkDeviceSize ldrSize = static_cast<VkDeviceSize>(m_PixelBuffer.size());
 
-        BufferDesc uploadDesc{};
-        uploadDesc.size = static_cast<size_t>(ldrSize);
-        uploadDesc.usage = BufferUsage::Staging;
-        uploadDesc.hostVisible = true;
-        uploadDesc.debugName = "FinalRenderUpload";
+    BufferDesc uploadDesc{};
+    uploadDesc.size = static_cast<size_t>(ldrSize);
+    uploadDesc.usage = BufferUsage::Staging;
+    uploadDesc.hostVisible = true;
+    uploadDesc.debugName = finalPass ? "FinalRenderUpload_Final" : "FinalRenderUpload_Preview";
 
-        Buffer uploadBuffer;
-        if (!uploadBuffer.Init(device, uploadDesc)) {
-            LUCENT_CORE_ERROR("FinalRender: Failed to create upload buffer for preview");
-            return false;
-        }
-        uploadBuffer.Upload(m_PixelBuffer.data(), static_cast<size_t>(ldrSize));
-
-        VkCommandBuffer uploadCmd = device->BeginSingleTimeCommands();
-
-        // Transition output image for copy
-        VkImageLayout curLayout = m_RenderImage.GetCurrentLayout();
-        if (curLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
-            m_RenderImage.TransitionLayout(uploadCmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        } else if (curLayout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-            m_RenderImage.TransitionLayout(uploadCmd, curLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        }
-
-        VkBufferImageCopy copyRegion{};
-        copyRegion.bufferOffset = 0;
-        copyRegion.bufferRowLength = 0;
-        copyRegion.bufferImageHeight = 0;
-        copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        copyRegion.imageSubresource.mipLevel = 0;
-        copyRegion.imageSubresource.baseArrayLayer = 0;
-        copyRegion.imageSubresource.layerCount = 1;
-        copyRegion.imageOffset = {0, 0, 0};
-        copyRegion.imageExtent = {m_Config.width, m_Config.height, 1};
-
-        vkCmdCopyBufferToImage(
-            uploadCmd,
-            uploadBuffer.GetHandle(),
-            m_RenderImage.GetHandle(),
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            1,
-            &copyRegion
-        );
-
-        // Transition for sampling in ImGui
-        m_RenderImage.TransitionLayout(uploadCmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-
-        device->EndSingleTimeCommands(uploadCmd);
-        uploadBuffer.Shutdown();
+    Buffer uploadBuffer;
+    if (!uploadBuffer.Init(device, uploadDesc)) {
+        LUCENT_CORE_ERROR("FinalRender: Failed to create upload buffer for preview");
+        return false;
     }
-    
+    uploadBuffer.Upload(m_PixelBuffer.data(), static_cast<size_t>(ldrSize));
+
+    VkCommandBuffer uploadCmd = device->BeginSingleTimeCommands();
+
+    // Transition output image for copy
+    VkImageLayout curLayout = m_RenderImage.GetCurrentLayout();
+    if (curLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        m_RenderImage.TransitionLayout(uploadCmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    } else if (curLayout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        m_RenderImage.TransitionLayout(uploadCmd, curLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    }
+
+    VkBufferImageCopy copyRegion{};
+    copyRegion.bufferOffset = 0;
+    copyRegion.bufferRowLength = 0;
+    copyRegion.bufferImageHeight = 0;
+    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.imageSubresource.mipLevel = 0;
+    copyRegion.imageSubresource.baseArrayLayer = 0;
+    copyRegion.imageSubresource.layerCount = 1;
+    copyRegion.imageOffset = {0, 0, 0};
+    copyRegion.imageExtent = {m_Config.width, m_Config.height, 1};
+
+    vkCmdCopyBufferToImage(
+        uploadCmd,
+        uploadBuffer.GetHandle(),
+        m_RenderImage.GetHandle(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &copyRegion
+    );
+
+    // Transition for sampling in ImGui
+    m_RenderImage.TransitionLayout(uploadCmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    device->EndSingleTimeCommands(uploadCmd);
+    uploadBuffer.Shutdown();
+
     return true;
 }
 

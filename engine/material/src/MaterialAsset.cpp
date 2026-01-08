@@ -10,6 +10,26 @@
 
 namespace lucent::material {
 
+namespace {
+static std::string NormalizeMaterialPath(const std::string& inPath) {
+    if (inPath.empty()) return inPath;
+    try {
+        std::filesystem::path p(inPath);
+        // Make relative paths consistent (relative to current working directory).
+        // weakly_canonical tolerates non-existent paths (e.g. while typing).
+        p = std::filesystem::weakly_canonical(p);
+        p = p.lexically_normal();
+        // Use generic form to normalize slashes across platforms.
+        return p.generic_string();
+    } catch (...) {
+        // As a fallback, normalize slashes only.
+        std::string s = inPath;
+        std::replace(s.begin(), s.end(), '\\', '/');
+        return s;
+    }
+}
+} // namespace
+
 MaterialAsset::~MaterialAsset() {
     Shutdown();
 }
@@ -482,7 +502,7 @@ MaterialAsset* MaterialAssetManager::CreateMaterial(const std::string& name) {
     material->GetGraph().CreateDefault();
     
     // Generate unique file path and save immediately
-    std::string filePath = GenerateUniquePath(name);
+    std::string filePath = NormalizeMaterialPath(GenerateUniquePath(name));
     material->SetFilePath(filePath);
     
     // Compile the material
@@ -505,16 +525,17 @@ MaterialAsset* MaterialAssetManager::CreateMaterial(const std::string& name) {
 }
 
 MaterialAsset* MaterialAssetManager::LoadMaterial(const std::string& path) {
+    const std::string key = NormalizeMaterialPath(path);
     // Check if already loaded
-    auto it = m_Materials.find(path);
+    auto it = m_Materials.find(key);
     if (it != m_Materials.end()) {
         return it->second.get();
     }
     
     // Load from file
-    std::ifstream file(path);
+    std::ifstream file(key);
     if (!file.is_open()) {
-        LUCENT_CORE_ERROR("Failed to open material file: {}", path);
+        LUCENT_CORE_ERROR("Failed to open material file: {}", key);
         return nullptr;
     }
     
@@ -523,7 +544,7 @@ MaterialAsset* MaterialAssetManager::LoadMaterial(const std::string& path) {
         return nullptr;
     }
     
-    material->SetFilePath(path);
+    material->SetFilePath(key);
     material->SetRenderPass(m_RenderPass);
     
     // Parse .lmat file
@@ -736,17 +757,19 @@ MaterialAsset* MaterialAssetManager::LoadMaterial(const std::string& path) {
     material->Recompile();
     
     MaterialAsset* ptr = material.get();
-    m_Materials[path] = std::move(material);
+    m_Materials[key] = std::move(material);
     
     return ptr;
 }
 
 bool MaterialAssetManager::SaveMaterial(MaterialAsset* material, const std::string& path) {
     if (!material) return false;
+
+    const std::string key = NormalizeMaterialPath(path);
     
-    std::ofstream file(path);
+    std::ofstream file(key);
     if (!file.is_open()) {
-        LUCENT_CORE_ERROR("Failed to open file for writing: {}", path);
+        LUCENT_CORE_ERROR("Failed to open file for writing: {}", key);
         return false;
     }
     
@@ -815,19 +838,20 @@ bool MaterialAssetManager::SaveMaterial(MaterialAsset* material, const std::stri
     
     file.close();
     
-    material->SetFilePath(path);
+    material->SetFilePath(key);
     material->ClearDirty();
     
-    LUCENT_CORE_INFO("Material saved: {}", path);
+    LUCENT_CORE_INFO("Material saved: {}", key);
     return true;
 }
 
 MaterialAsset* MaterialAssetManager::GetMaterial(const std::string& path) {
-    auto it = m_Materials.find(path);
+    const std::string key = NormalizeMaterialPath(path);
+    auto it = m_Materials.find(key);
     if (it != m_Materials.end()) {
         return it->second.get();
     }
-    return LoadMaterial(path);
+    return LoadMaterial(key);
 }
 
 void MaterialAssetManager::RecompileAll() {

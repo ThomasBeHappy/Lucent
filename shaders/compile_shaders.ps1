@@ -50,5 +50,9 @@ if ($failed -gt 0) {
     Write-Host "Failed: $failed shaders" -ForegroundColor Red
     exit 1
 }
+
+# copy the compiled shaders to the output directory for the editor
+Copy-Item -Path $outputDir\* -Destination $scriptDir\..\build\debug\bin\Debug\shaders -Recurse -Force
+
 Write-Host "Done!" -ForegroundColor Green
 

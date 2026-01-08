@@ -80,14 +80,22 @@ struct RayPayload {
     vec3 emissive;
     float metallic;
     float roughness;
+    float hitT;
     // Volume payload (only valid for volume hits)
     bool volumeHit;
-    vec3 volumeColor;   // premultiplied
-    float volumeAlpha;
+    uint volumeIdx;
+    float volumeEnterT;
+    float volumeExitT;
     vec3 volumeExitPos;
 };
 
 layout(location = 0) rayPayloadEXT RayPayload payload;
+
+// Separate lightweight payload for shadow rays so we don't clobber the main payload.
+struct ShadowPayload {
+    float visibility; // 1 = visible, 0 = occluded
+};
+layout(location = 1) rayPayloadEXT ShadowPayload shadowPayload;
 
 const float PI = 3.14159265359;
 const float MAX_DIST = 10000.0;
@@ -178,17 +186,584 @@ vec3 getSkyColor(vec3 direction) {
 // IMPORTANT: for point/spot lights we must clamp tMax to the light distance,
 // otherwise geometry *behind the light* can incorrectly occlude it.
 float traceShadow(vec3 origin, vec3 direction, float tMax) {
-    // Use a simple payload for shadow - the miss shader will set it to 1.0
-    payload.radiance = vec3(0.0);  // Will be set to 1.0 on miss
+    shadowPayload.visibility = 0.0; // miss shader sets to 1.0
     
     traceRayEXT(topLevelAS,
                 gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
                 0x01, // ignore volumes for shadow rays (V1)
                 1, 2, 1,  // shadow ray type
                 origin, 0.001, direction, tMax,
-                0);
+                1);
     
-    return payload.radiance.x;
+    return shadowPayload.visibility;
+}
+
+// Volume buffer (matches C++ GPUVolume)
+struct GPUVolume {
+    mat4 transform;
+    vec3 scatterColor;
+    float density;
+    vec3 absorption;
+    float anisotropy;
+    vec3 emission;
+    float emissionStrength;
+    vec3 aabbMin;
+    float pad0;
+    vec3 aabbMax;
+    float pad1;
+};
+
+layout(scalar, set = 0, binding = 13) readonly buffer VolumeBuffer {
+    GPUVolume volumes[];
+};
+
+// Helpers for volumetrics
+float aabbExitDistance(vec3 p, vec3 d, vec3 bmin, vec3 bmax) {
+    vec3 invD = 1.0 / d;
+    vec3 t0v = (bmin - p) * invD;
+    vec3 t1v = (bmax - p) * invD;
+    vec3 tmin = min(t0v, t1v);
+    vec3 tmax = max(t0v, t1v);
+    float tNear = max(max(tmin.x, tmin.y), tmin.z);
+    float tFar  = min(min(tmax.x, tmax.y), tmax.z);
+    // If inside the box, tNear <= 0; the distance to exit is tFar.
+    return max(tFar, 0.0);
+}
+
+bool pointInsideAABB(vec3 p, vec3 bmin, vec3 bmax) {
+    return all(greaterThanEqual(p, bmin)) && all(lessThanEqual(p, bmax));
+}
+
+// ============================================================================
+// CYCLES-LIKE VOLUMETRIC INTEGRATION
+// ============================================================================
+// This implements single-scattering with:
+//   - Jittered sample positions (breaks banding, adds stochastic feel)
+//   - Proper light attenuation through medium (Tr_light)
+//   - Non-binary volumetric shadows (geometry + medium attenuation)
+//   - Soft sun sampling (consistent with surface path)
+//   - Reduced ambient term
+// ============================================================================
+
+// Trace a shadow ray and return visibility as continuous transmittance.
+// For geometry: binary (0 or 1). For medium: apply Beer-Lambert attenuation.
+// This is what Cycles does - shadows through fog are soft, not instant.
+float traceVolShadow(vec3 origin, vec3 dir, float tMax, vec3 sigma_t, vec3 aabbMin, vec3 aabbMax) {
+    // First check geometry occlusion (binary)
+    float geoVis = traceShadow(origin, dir, tMax);
+    if (geoVis <= 0.0) return 0.0;
+    
+    // Then apply medium attenuation along the shadow ray inside the volume
+    // Compute how far the shadow ray travels through the volume AABB
+    vec3 invD = 1.0 / dir;
+    vec3 t0v = (aabbMin - origin) * invD;
+    vec3 t1v = (aabbMax - origin) * invD;
+    vec3 tmin = min(t0v, t1v);
+    vec3 tmax = max(t0v, t1v);
+    float tNear = max(max(tmin.x, tmin.y), tmin.z);
+    float tFar  = min(min(tmax.x, tmax.y), tmax.z);
+    
+    // Clamp to valid range
+    tNear = max(tNear, 0.0);
+    tFar = min(tFar, tMax);
+    
+    if (tFar <= tNear) return geoVis; // Shadow ray doesn't pass through volume
+    
+    float dMedium = tFar - tNear;
+    vec3 Tr = exp(-sigma_t * dMedium);
+    float avgTr = (Tr.r + Tr.g + Tr.b) / 3.0;
+    
+    return geoVis * avgTr;
+}
+
+// ============================================================================
+// EQUIANGULAR SAMPLING
+// ============================================================================
+// For point/spot lights, standard distance sampling (exponential) is suboptimal
+// because light contribution varies strongly with distance (1/r²).
+// Equiangular sampling concentrates samples where the solid angle to the light
+// is most significant, dramatically improving convergence for local lights.
+//
+// Reference: Kulla & Fajardo, "Importance Sampling of Area Lights in Participating Media"
+// ============================================================================
+
+// Compute equiangular sample point along a ray segment for a point light.
+// Returns the sampled t value and its PDF.
+// 
+// rayOrigin: start of the segment in world space
+// rayDir: normalized ray direction
+// t0, t1: segment bounds (relative to rayOrigin)
+// lightPos: position of the point light
+// xi: uniform random number in [0, 1)
+// outPdf: the PDF of the sampled point
+float sampleEquiangular(vec3 rayOrigin, vec3 rayDir, float t0, float t1, vec3 lightPos, float xi, out float outPdf) {
+    // Vector from ray origin to light
+    vec3 delta = lightPos - rayOrigin;
+    
+    // Distance along ray to closest approach to light
+    float tD = dot(delta, rayDir);
+    
+    // Perpendicular distance from light to ray
+    vec3 closestPoint = rayOrigin + rayDir * tD;
+    float D = length(lightPos - closestPoint);
+    
+    // Handle degenerate case (light on ray)
+    if (D < 1e-6) {
+        // Light is on the ray - sample uniformly and use distance-based PDF
+        float t = mix(t0, t1, xi);
+        float dist = abs(t - tD);
+        outPdf = 1.0 / (t1 - t0);
+        return clamp(t, t0, t1);
+    }
+    
+    // Compute angles to segment endpoints
+    float thetaA = atan(t0 - tD, D);
+    float thetaB = atan(t1 - tD, D);
+    
+    // Handle case where segment doesn't span interesting range
+    if (abs(thetaB - thetaA) < 1e-6) {
+        float t = mix(t0, t1, xi);
+        outPdf = 1.0 / max(t1 - t0, 1e-6);
+        return clamp(t, t0, t1);
+    }
+    
+    // Sample uniformly in angle space
+    float theta = mix(thetaA, thetaB, xi);
+    
+    // Convert back to distance
+    float t = tD + D * tan(theta);
+    
+    // Compute PDF
+    // pdf(t) = D / ((thetaB - thetaA) * (D² + (t - tD)²))
+    float denom = D * D + (t - tD) * (t - tD);
+    outPdf = D / ((thetaB - thetaA) * denom);
+    
+    return clamp(t, t0, t1);
+}
+
+// Evaluate the PDF for a given sample point using equiangular distribution
+float pdfEquiangular(vec3 rayOrigin, vec3 rayDir, float t0, float t1, vec3 lightPos, float t) {
+    vec3 delta = lightPos - rayOrigin;
+    float tD = dot(delta, rayDir);
+    vec3 closestPoint = rayOrigin + rayDir * tD;
+    float D = length(lightPos - closestPoint);
+    
+    if (D < 1e-6) {
+        return 1.0 / max(t1 - t0, 1e-6);
+    }
+    
+    float thetaA = atan(t0 - tD, D);
+    float thetaB = atan(t1 - tD, D);
+    
+    if (abs(thetaB - thetaA) < 1e-6) {
+        return 1.0 / max(t1 - t0, 1e-6);
+    }
+    
+    float denom = D * D + (t - tD) * (t - tD);
+    return D / ((thetaB - thetaA) * denom);
+}
+
+// Combined volume direct lighting evaluation using equiangular sampling for point/spot lights.
+// This replaces the uniform stepping for local light evaluation with importance sampling.
+vec3 evaluateVolumeLightEquiangular(
+    in GPUVolume vol,
+    in vec3 rayOrigin,
+    in vec3 rayDir,
+    float t0,
+    float t1,
+    in vec3 sigma_s,
+    in vec3 sigma_t,
+    float g,
+    inout uint seed
+) {
+    vec3 accum = vec3(0.0);
+    float segLen = t1 - t0;
+    if (segLen <= 1e-5) return accum;
+    
+    float g2 = g * g;
+    
+    // Number of samples per light (can be tuned)
+    const int SAMPLES_PER_LIGHT = 4;
+    
+    uint numLights = lights.length();
+    for (uint li = 0u; li < numLights; ++li) {
+        GPULight light = lights[li];
+        
+        // Skip directional lights (handled separately with uniform sampling)
+        if (light.type == LIGHT_DIRECTIONAL) continue;
+        
+        vec3 lightPos = light.position;
+        vec3 Li = light.color * light.intensity;
+        
+        for (int s = 0; s < SAMPLES_PER_LIGHT; s++) {
+            float pdf;
+            float xi = randomFloat(seed);
+            float t = sampleEquiangular(rayOrigin, rayDir, t0, t1, lightPos, xi, pdf);
+            
+            vec3 samplePos = rayOrigin + rayDir * t;
+            
+            // Transmittance from ray origin to sample point
+            vec3 Tr_camera = exp(-sigma_t * (t - t0));
+            
+            // Direction and distance to light
+            vec3 toLight = lightPos - samplePos;
+            float dist = length(toLight);
+            if (dist < 1e-4) continue;
+            vec3 L = toLight / dist;
+            
+            // Light attenuation
+            float attenuation = 1.0;
+            if (light.range > 0.0) {
+                float x = clamp(1.0 - dist / light.range, 0.0, 1.0);
+                attenuation = x * x;
+            } else {
+                attenuation = 1.0 / (dist * dist + 1.0);
+            }
+            
+            // Spot cone
+            if (light.type == LIGHT_SPOT) {
+                float theta = dot(-L, normalize(light.direction));
+                float cosInner = cos(light.innerAngle);
+                float cosOuter = cos(light.outerAngle);
+                float denom = max(cosInner - cosOuter, 1e-4);
+                float spotFactor = clamp((theta - cosOuter) / denom, 0.0, 1.0);
+                attenuation *= spotFactor;
+            }
+            
+            // Area light cosine
+            if (light.type == LIGHT_AREA) {
+                float cosAngle = max(dot(-L, normalize(light.direction)), 0.0);
+                attenuation *= cosAngle;
+            }
+            
+            if (attenuation <= 0.0) continue;
+            
+            // Shadow test (non-binary through medium)
+            float vis = traceVolShadow(samplePos + L * 0.01, L, dist - 0.02, sigma_t, vol.aabbMin, vol.aabbMax);
+            if (vis <= 0.0) continue;
+            
+            // Transmittance from sample to light through medium
+            float dIn = pointInsideAABB(lightPos, vol.aabbMin, vol.aabbMax)
+                ? dist
+                : aabbExitDistance(samplePos, L, vol.aabbMin, vol.aabbMax);
+            vec3 Tr_light = exp(-sigma_t * dIn);
+            
+            // Phase function
+            float cosTheta = dot(rayDir, L);
+            float phase = (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5));
+            
+            // Contribution (divide by PDF and number of samples)
+            vec3 contrib = sigma_s * Li * phase * attenuation * vis * Tr_camera * Tr_light;
+            accum += contrib / (pdf * float(SAMPLES_PER_LIGHT));
+        }
+    }
+    
+    return accum;
+}
+
+// Multi-light single-scatter integration of a homogeneous medium.
+// Returns integrated in-scattered radiance (accum) and transmittance (trans) for the segment [t0, t1].
+// seed is used for stochastic jittering.
+void integrateHomogeneousVolume(in GPUVolume vol, in vec3 rayOrigin, in vec3 rayDir, float t0, float t1, inout uint seed, out vec3 accum, out vec3 trans) {
+    float segLen = max(t1 - t0, 0.0);
+    accum = vec3(0.0);
+    trans = vec3(1.0);
+    if (segLen <= 1e-5) return;
+
+    // Adaptive steps (HIGH QUALITY):
+    const float TARGET_STEP = 0.02;
+    int steps = int(clamp(segLen / TARGET_STEP, 128.0, 2048.0));
+    float stepSize = segLen / float(steps);
+
+    float g = clamp(vol.anisotropy, -0.99, 0.99);
+    float g2 = g * g;
+
+    // Medium coefficients (per-channel)
+    float density = max(vol.density, 0.0);
+    vec3 sigma_s = max(vol.scatterColor, vec3(0.0)) * density;
+    vec3 sigma_a = max(vol.absorption, vec3(0.0));
+    vec3 sigma_t = sigma_s + sigma_a + vec3(1e-6);
+
+    // Shadow sampling settings
+    const bool ENABLE_VOL_SHADOWS = true;
+    const float SHADOW_WORLD_STEP = 0.05;
+    int mainDirLightIndex = -1;
+    for (uint li = 0u; li < lights.length(); ++li) {
+        if (lights[li].type == LIGHT_DIRECTIONAL) { mainDirLightIndex = int(li); break; }
+    }
+    float mainDirVis = 1.0;
+    float shadowSince = 1e9;
+
+    // Per-pixel jitter offset for the entire ray (breaks coherent banding)
+    float jitterOffset = randomFloat(seed);
+
+    for (int i = 0; i < steps; i++) {
+        vec3 stepT = exp(-sigma_t * stepSize);
+
+        // JITTERED sample position (Cycles-like stochastic sampling)
+        // Instead of fixed midpoint (i + 0.5), use (i + jitter) for temporal noise
+        float t = t0 + (float(i) + jitterOffset) * stepSize;
+        vec3 samplePos = rayOrigin + rayDir * t;
+
+        // Update main directional light visibility (non-binary: includes medium attenuation)
+        shadowSince += stepSize;
+        if (ENABLE_VOL_SHADOWS && mainDirLightIndex >= 0 && (i == 0 || shadowSince >= SHADOW_WORLD_STEP)) {
+            GPULight sun = lights[uint(mainDirLightIndex)];
+            vec3 Lsun = normalize(sun.direction);
+            // Non-binary shadow: geometry + medium attenuation
+            mainDirVis = traceVolShadow(samplePos + Lsun * 0.01, Lsun, MAX_DIST, sigma_t, vol.aabbMin, vol.aabbMax);
+            shadowSince = 0.0;
+        }
+
+        vec3 scatter = vec3(0.0);
+
+        // Accumulate contributions from all lights (single scatter)
+        uint numLights = lights.length();
+        for (uint li = 0u; li < numLights; ++li) {
+            GPULight light = lights[li];
+
+            vec3 L = vec3(0.0);
+            vec3 Li = vec3(0.0);
+            float attenuation = 1.0;
+            vec3 TrLight = vec3(1.0);
+
+            // Only handle directional lights in the per-step loop.
+            // Point/spot/area lights are handled more efficiently with equiangular sampling below.
+            if (light.type == LIGHT_DIRECTIONAL) {
+                // Soft sun: sample direction within angular radius for consistency with surface path
+                float angularRadius = (light.areaWidth > 0.0) ? light.areaWidth : SUN_ANGULAR_RADIUS;
+                float cosMax = cos(angularRadius);
+                L = sampleCone(normalize(light.direction), cosMax, seed);
+                Li = light.color * light.intensity;
+                attenuation = 1.0;
+                if (ENABLE_VOL_SHADOWS && int(li) == mainDirLightIndex) {
+                    attenuation *= mainDirVis;
+                }
+
+                // Attenuate the incoming light as it travels through the medium toward the sample.
+                float dIn = aabbExitDistance(samplePos, -L, vol.aabbMin, vol.aabbMax);
+                TrLight = exp(-sigma_t * dIn);
+            } else {
+                // Skip point/spot/area lights here - they're handled by equiangular sampling
+                continue;
+            }
+
+            if (attenuation <= 0.0) continue;
+
+            // Phase function (Henyey-Greenstein)
+            float cosTheta = dot(rayDir, L);
+            float phase = (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5));
+            scatter += sigma_s * Li * phase * attenuation * TrLight;
+        }
+
+        // Reduced ambient (Cycles relies less on ambient hacks once lighting is correct)
+        scatter += sigma_s * vec3(0.01);
+        scatter += max(vol.emission, vec3(0.0)) * max(vol.emissionStrength, 0.0);
+
+        accum += trans * scatter * stepSize;
+        trans *= stepT;
+
+        float avgT = (trans.r + trans.g + trans.b) * (1.0 / 3.0);
+        if (avgT < 0.01) break;
+    }
+    
+    // ==========================================================================
+    // EQUIANGULAR SAMPLING for point/spot lights
+    // ==========================================================================
+    // The per-step evaluation above handles directional lights well (uniform sampling
+    // is efficient for infinite lights). But for point/spot lights, equiangular
+    // sampling concentrates samples near the light where contribution is highest.
+    // This is evaluated separately and added to the accumulation.
+    // ==========================================================================
+    vec3 equiangularContrib = evaluateVolumeLightEquiangular(vol, rayOrigin, rayDir, t0, t1, sigma_s, sigma_t, g, seed);
+    accum += equiangularContrib;
+}
+
+// ============================================================================
+// DELTA TRACKING (WOODCOCK TRACKING) - Cycles-like probabilistic sampling
+// ============================================================================
+// Instead of fixed-step ray marching, this samples free-flight distances
+// probabilistically using exponential distribution. This is what Cycles uses
+// for proper path-traced volumes.
+//
+// For homogeneous media (constant sigma_t), this reduces to sampling scattering
+// events along the ray and evaluating single-scatter contribution at each.
+// ============================================================================
+
+// Sample a scattering event using delta tracking and return contribution.
+// This is closer to how Cycles handles volumes - probabilistic rather than deterministic.
+// Returns: accumulated radiance from the volume segment
+// Modifies: rayOrigin/rayDir for path continuation if scattering occurred
+// Returns scatterOccurred=true if the path should continue with a new direction
+vec3 deltaTrackVolume(in GPUVolume vol, inout vec3 rayOrigin, inout vec3 rayDir, 
+                       float t0, float t1, inout uint seed, out bool scatterOccurred) {
+    scatterOccurred = false;
+    vec3 accum = vec3(0.0);
+    
+    float segLen = max(t1 - t0, 0.0);
+    if (segLen <= 1e-5) return accum;
+    
+    float g = clamp(vol.anisotropy, -0.99, 0.99);
+    float g2 = g * g;
+    
+    // Medium coefficients
+    float density = max(vol.density, 0.0);
+    vec3 sigma_s = max(vol.scatterColor, vec3(0.0)) * density;
+    vec3 sigma_a = max(vol.absorption, vec3(0.0));
+    vec3 sigma_t = sigma_s + sigma_a + vec3(1e-6);
+    
+    // For delta tracking, we need sigma_max (majorant) - for homogeneous media it's just sigma_t
+    float sigma_max = max(max(sigma_t.r, sigma_t.g), sigma_t.b);
+    if (sigma_max <= 1e-6) return accum; // Vacuum
+    
+    // Albedo (scattering probability at collision)
+    vec3 albedo = sigma_s / sigma_t;
+    float avgAlbedo = (albedo.r + albedo.g + albedo.b) / 3.0;
+    
+    vec3 throughput = vec3(1.0);
+    float t = t0;
+    
+    // Maximum number of null-collision iterations (safety limit)
+    const int MAX_ITERATIONS = 64;
+    
+    for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
+        // Sample free-flight distance using exponential distribution
+        float xi = max(randomFloat(seed), 1e-8);
+        float dt = -log(xi) / sigma_max;
+        t += dt;
+        
+        // Did we exit the volume?
+        if (t >= t1) {
+            // Transmitted through - apply remaining transmittance
+            // (For delta tracking in homogeneous media, throughput tracks this)
+            break;
+        }
+        
+        vec3 samplePos = rayOrigin + rayDir * t;
+        
+        // For homogeneous media: no null collisions, every hit is real
+        // (In heterogeneous media, we'd check sigma_t(samplePos) / sigma_max)
+        
+        // Real collision occurred! Evaluate single-scatter contribution
+        
+        // Shadow test for main directional light
+        float mainDirVis = 1.0;
+        int mainDirLightIndex = -1;
+        for (uint li = 0u; li < lights.length(); ++li) {
+            if (lights[li].type == LIGHT_DIRECTIONAL) { mainDirLightIndex = int(li); break; }
+        }
+        if (mainDirLightIndex >= 0) {
+            GPULight sun = lights[uint(mainDirLightIndex)];
+            vec3 Lsun = normalize(sun.direction);
+            mainDirVis = traceVolShadow(samplePos + Lsun * 0.01, Lsun, MAX_DIST, sigma_t, vol.aabbMin, vol.aabbMax);
+        }
+        
+        // Compute in-scattered radiance at this point
+        vec3 scatter = vec3(0.0);
+        uint numLights = lights.length();
+        for (uint li = 0u; li < numLights; ++li) {
+            GPULight light = lights[li];
+            
+            vec3 L = vec3(0.0);
+            vec3 Li = vec3(0.0);
+            float attenuation = 1.0;
+            vec3 TrLight = vec3(1.0);
+            
+            if (light.type == LIGHT_DIRECTIONAL) {
+                float angularRadius = (light.areaWidth > 0.0) ? light.areaWidth : SUN_ANGULAR_RADIUS;
+                float cosMax = cos(angularRadius);
+                L = sampleCone(normalize(light.direction), cosMax, seed);
+                Li = light.color * light.intensity;
+                if (int(li) == mainDirLightIndex) {
+                    attenuation *= mainDirVis;
+                }
+                float dIn = aabbExitDistance(samplePos, -L, vol.aabbMin, vol.aabbMax);
+                TrLight = exp(-sigma_t * dIn);
+            } else if (light.type == LIGHT_POINT || light.type == LIGHT_SPOT) {
+                vec3 toLight = light.position - samplePos;
+                float dist = length(toLight);
+                if (dist <= 1e-4) continue;
+                L = toLight / dist;
+                
+                if (light.range > 0.0) {
+                    float x = clamp(1.0 - dist / light.range, 0.0, 1.0);
+                    attenuation = x * x;
+                } else {
+                    attenuation = 1.0 / (dist * dist + 1.0);
+                }
+                
+                if (light.type == LIGHT_SPOT) {
+                    float theta = dot(-L, normalize(light.direction));
+                    float cosInner = cos(light.innerAngle);
+                    float cosOuter = cos(light.outerAngle);
+                    float denom = max(cosInner - cosOuter, 1e-4);
+                    float spotFactor = clamp((theta - cosOuter) / denom, 0.0, 1.0);
+                    attenuation *= spotFactor;
+                }
+                
+                Li = light.color * light.intensity;
+                float dIn = pointInsideAABB(light.position, vol.aabbMin, vol.aabbMax)
+                    ? dist
+                    : aabbExitDistance(samplePos, -L, vol.aabbMin, vol.aabbMax);
+                TrLight = exp(-sigma_t * dIn);
+            } else {
+                continue;
+            }
+            
+            if (attenuation <= 0.0) continue;
+            
+            float cosTheta = dot(rayDir, L);
+            float phase = (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5));
+            scatter += Li * phase * attenuation * TrLight;
+        }
+        
+        // Add emission
+        scatter += max(vol.emission, vec3(0.0)) * max(vol.emissionStrength, 0.0) / max(avgAlbedo, 0.1);
+        
+        // Contribution at this scattering event (weighted by scattering probability)
+        accum += throughput * albedo * scatter;
+        
+        // Russian roulette for path continuation within the volume
+        float survivalProb = avgAlbedo;
+        if (randomFloat(seed) > survivalProb) {
+            // Absorbed - path terminates
+            break;
+        }
+        
+        // Scatter: sample new direction from phase function
+        // For HG phase function, we can importance-sample the scattering angle
+        float phi = 2.0 * PI * randomFloat(seed);
+        float cosTheta;
+        if (abs(g) < 1e-3) {
+            // Isotropic
+            cosTheta = 1.0 - 2.0 * randomFloat(seed);
+        } else {
+            // HG importance sampling
+            float sqrTerm = (1.0 - g2) / (1.0 - g + 2.0 * g * randomFloat(seed));
+            cosTheta = (1.0 + g2 - sqrTerm * sqrTerm) / (2.0 * g);
+        }
+        float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+        
+        // Build local coordinate frame around rayDir
+        vec3 w = rayDir;
+        vec3 u = normalize(cross((abs(w.x) > 0.1 ? vec3(0,1,0) : vec3(1,0,0)), w));
+        vec3 v = cross(w, u);
+        
+        vec3 newDir = normalize(sinTheta * cos(phi) * u + sinTheta * sin(phi) * v + cosTheta * w);
+        
+        // Update ray for continuation
+        rayOrigin = samplePos;
+        rayDir = newDir;
+        scatterOccurred = true;
+        
+        // Update throughput (compensate for survival probability)
+        throughput /= survivalProb;
+        
+        // Only allow one scatter event per call (the main loop handles continuation)
+        break;
+    }
+    
+    return accum;
 }
 
 void main() {
@@ -230,26 +805,67 @@ void main() {
         payload.hit = false;
         payload.done = false;
         payload.volumeHit = false;
+        payload.hitT = 0.0;
         
-        // Trace ray
-        traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0x03, // surfaces + volumes
-                    0, 2, 0,  // primary ray type
+        // ---------------------------------------------------------------------
+        // Trace surfaces and volumes separately so volumes don't "skip" surfaces
+        // inside the medium (fixes instant cut-off when an object is inside fog).
+        // ---------------------------------------------------------------------
+        // Surface trace
+        traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0x01, // surfaces only
+                    0, 2, 0,
                     origin, 0.001, direction, 10000.0, 0);
-        
-        seed = payload.seed;
-        
-        if (!payload.hit) {
+
+        // Snapshot surface hit info (volume trace will overwrite payload)
+        bool surfHit = payload.hit;
+        float surfT = payload.hitT;
+        vec3 surfHitPos = payload.hitPos;
+        vec3 surfHitNormal = payload.hitNormal;
+        vec3 surfNextDir = payload.nextDir;
+        vec3 surfAlbedo = payload.albedo;
+        vec3 surfEmissive = payload.emissive;
+        float surfMetallic = payload.metallic;
+        float surfRoughness = payload.roughness;
+
+        // Volume trace (only if volumes exist)
+        bool volHit = false;
+        uint volIdx = 0u;
+        float volEnterT = 0.0;
+        float volExitT = 0.0;
+        vec3 volExitPos = vec3(0.0);
+        if (pc.volumeCount > 0u) {
+            payload.hit = false;
+            payload.done = false;
+            payload.volumeHit = false;
+            payload.volumeIdx = 0u;
+            payload.volumeEnterT = 0.0;
+            payload.volumeExitT = 0.0;
+
+            // IMPORTANT: when the camera/ray starts inside a volume, the entry intersection is at t=0.
+            // Using tMin=0.001 would miss that intersection and you'd see no fog while inside.
+            traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0x02, // volumes only
+                        0, 2, 0,
+                        origin, 0.0, direction, 10000.0, 0);
+
+            volHit = payload.volumeHit;
+            volIdx = payload.volumeIdx;
+            volEnterT = payload.volumeEnterT;
+            volExitT = payload.volumeExitT;
+            volExitPos = payload.volumeExitPos;
+        }
+
+        // Resolve miss when neither hit
+        if (!surfHit && !volHit) {
             // Miss - add sky contribution
             vec3 skyColor = getSkyColor(direction);
             if (pc.transparentBackground == 0u || bounce > 0u) {
                 radiance += throughput * skyColor;
             }
-            
-            // For sky hits on first bounce, use sky as albedo
+
             if (!capturedAOV) {
                 if (pc.transparentBackground == 0u) {
                     firstHitAlbedo = skyColor;
-                    firstHitNormal = -direction * 0.5 + 0.5;  // Remap to [0,1]
+                    firstHitNormal = -direction * 0.5 + 0.5;
                 } else {
                     firstHitAlbedo = vec3(0.0);
                     firstHitNormal = vec3(0.5);
@@ -258,28 +874,123 @@ void main() {
             break;
         }
 
-        // Volume hit: integrate + keep going along the same ray direction
-        if (payload.volumeHit) {
-            radiance += throughput * payload.volumeColor;
-            throughput *= (1.0 - payload.volumeAlpha);
+        // If we hit volume before the nearest surface (or there is no surface), handle volume scattering.
+        if (volHit && (!surfHit || volEnterT < surfT)) {
+            uint safeIdx = min(volIdx, uint(volumes.length()) - 1u);
+            GPUVolume vol = volumes[safeIdx];
 
-            if (!capturedAOV) {
-                firstHitAlbedo = payload.volumeColor;
-                firstHitNormal = vec3(0.5); // neutral
-                capturedAOV = true;
-            }
-            if (bounce == 0u) {
-                hitPrimary = true;
+            float tEnd = volExitT;
+            bool surfaceInsideVolume = false;
+            if (surfHit && surfT <= volExitT) {
+                tEnd = surfT;
+                surfaceInsideVolume = true;
             }
 
-            origin = payload.volumeExitPos + direction * 0.001;
-
-            // If fully absorbed, stop.
-            if (max(max(throughput.r, throughput.g), throughput.b) < 0.01) {
-                break;
+            // =================================================================
+            // MULTIPLE SCATTERING via Delta Tracking
+            // =================================================================
+            // Use delta tracking to probabilistically sample scattering events.
+            // If a scatter occurs, we redirect the ray and continue the path
+            // (allowing multiple bounces within the volume = multiple scattering).
+            // =================================================================
+            
+            vec3 volRayOrigin = origin + direction * volEnterT;
+            vec3 volRayDir = direction;
+            bool scatterOccurred = false;
+            
+            vec3 volRadiance = deltaTrackVolume(vol, volRayOrigin, volRayDir, 0.0, tEnd - volEnterT, seed, scatterOccurred);
+            radiance += throughput * volRadiance;
+            
+            if (scatterOccurred) {
+                // A scattering event occurred inside the volume!
+                // volRayOrigin and volRayDir have been updated to the new position/direction.
+                // This is MULTIPLE SCATTERING: the path continues from the scatter point.
+                
+                // Capture AOV for first scatter if this is the first hit
+                if (!capturedAOV) {
+                    firstHitAlbedo = vol.scatterColor;
+                    firstHitNormal = vec3(0.5); // Neutral normal for volume scatter
+                    capturedAOV = true;
+                }
+                if (bounce == 0u) {
+                    hitPrimary = true;
+                }
+                
+                // Update throughput based on scattering albedo
+                float density = max(vol.density, 0.0);
+                vec3 sigma_s = max(vol.scatterColor, vec3(0.0)) * density;
+                vec3 sigma_a = max(vol.absorption, vec3(0.0));
+                vec3 sigma_t = sigma_s + sigma_a + vec3(1e-6);
+                vec3 albedo = sigma_s / sigma_t;
+                throughput *= albedo;
+                
+                // Continue path from scatter point with new direction
+                origin = volRayOrigin + volRayDir * 0.001;
+                direction = volRayDir;
+                
+                // Russian roulette for volume bounces
+                if (bounce > 1u) {
+                    float p = max(throughput.x, max(throughput.y, throughput.z));
+                    if (randomFloat(seed) > p) {
+                        break;
+                    }
+                    throughput /= p;
+                }
+                
+                if (max(throughput.x, max(throughput.y, throughput.z)) < 0.001) {
+                    break;
+                }
+                continue; // Continue to next bounce (may hit volume again, or surface, or miss)
             }
-            continue;
+            
+            // No scatter occurred - the ray passed through (or was absorbed).
+            // Apply transmittance for the segment we traversed.
+            float density = max(vol.density, 0.0);
+            vec3 sigma_s = max(vol.scatterColor, vec3(0.0)) * density;
+            vec3 sigma_a = max(vol.absorption, vec3(0.0));
+            vec3 sigma_t = sigma_s + sigma_a + vec3(1e-6);
+            vec3 segmentTrans = exp(-sigma_t * (tEnd - volEnterT));
+            throughput *= segmentTrans;
+
+            // If we reached a surface inside the volume, continue shading that surface this bounce.
+            if (surfaceInsideVolume) {
+                // Restore surface payload-like values into payload for the existing shading code below.
+                payload.hit = true;
+                payload.volumeHit = false;
+                payload.hitPos = surfHitPos;
+                payload.hitNormal = surfHitNormal;
+                payload.nextDir = surfNextDir;
+                payload.albedo = surfAlbedo;
+                payload.emissive = surfEmissive;
+                payload.metallic = surfMetallic;
+                payload.roughness = surfRoughness;
+            } else {
+                // No surface inside this volume segment; continue past volume exit.
+                origin = origin + direction * tEnd + direction * 0.001;
+                if (max(throughput.x, max(throughput.y, throughput.z)) < 0.001) {
+                    break;
+                }
+                continue;
+            }
+        } else if (surfHit) {
+            // No volume in front; ensure payload holds the surface hit for shading
+            payload.hit = true;
+            payload.volumeHit = false;
+            payload.hitPos = surfHitPos;
+            payload.hitNormal = surfHitNormal;
+            payload.nextDir = surfNextDir;
+            payload.albedo = surfAlbedo;
+            payload.emissive = surfEmissive;
+            payload.metallic = surfMetallic;
+            payload.roughness = surfRoughness;
+        } else {
+            // Volume hit exists but is behind surface miss; should not happen, but treat as miss.
+            break;
         }
+        
+        seed = payload.seed;
+        
+        // From here on, payload represents a surface hit (either directly, or after integrating a volume segment).
         
         // Capture first-hit AOVs for denoiser
         if (!capturedAOV) {
@@ -307,10 +1018,10 @@ void main() {
             vec3 sampledPos = light.position;
             
             if (light.type == LIGHT_DIRECTIONAL) {
-                // Soft sun: use per-light softness or fallback to default
+                // Soft sun: sample direction within angular radius (consistent with volumetrics)
                 float angularRadius = (light.areaWidth > 0.0) ? light.areaWidth : SUN_ANGULAR_RADIUS;
                 float cosMax = cos(angularRadius);
-                lightDir = sampleCone(light.direction, cosMax, seed);
+                lightDir = sampleCone(normalize(light.direction), cosMax, seed);
             } else if (light.type == LIGHT_AREA) {
                 // Area light - sample a point on the surface
                 vec3 tangent = light.areaTangent;
