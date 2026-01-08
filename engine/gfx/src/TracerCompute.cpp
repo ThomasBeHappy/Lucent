@@ -128,7 +128,7 @@ bool TracerCompute::Init(VulkanContext* context, Device* device) {
     // Create descriptor pool
     VkDescriptorPoolSize poolSizes[] = {
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },  // accumImage + albedoImage + normalImage
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 }, // triangles + bvh + instances + materials + lights
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 }, // triangles + bvh + instances + materials + lights + volumes
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 }  // env map + marginal CDF + conditional CDF
     };
@@ -157,12 +157,13 @@ bool TracerCompute::Init(VulkanContext* context, Device* device) {
         { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // lights
         { 9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },   // envMap
         { 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },  // envMarginalCDF
-        { 11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }   // envConditionalCDF
+        { 11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },  // envConditionalCDF
+        { 12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }           // volumes
     };
     
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 12;
+    layoutInfo.bindingCount = 13;
     layoutInfo.pBindings = bindings;
     
     if (vkCreateDescriptorSetLayout(context->GetDevice(), &layoutInfo, nullptr, &m_DescriptorLayout) != VK_SUCCESS) {
@@ -198,6 +199,8 @@ void TracerCompute::Shutdown() {
     m_SceneGPU.bvhNodeBuffer.Shutdown();
     m_SceneGPU.instanceBuffer.Shutdown();
     m_SceneGPU.materialBuffer.Shutdown();
+    m_SceneGPU.lightBuffer.Shutdown();
+    m_SceneGPU.volumeBuffer.Shutdown();
     
     m_AccumulationImage.Shutdown();
     m_AlbedoImage.Shutdown();
@@ -383,6 +386,11 @@ void TracerCompute::UpdateDescriptors() {
     lightInfo.offset = 0;
     lightInfo.range = m_SceneGPU.lightBuffer.GetSize();
     
+    VkDescriptorBufferInfo volumeInfo{};
+    volumeInfo.buffer = m_SceneGPU.volumeBuffer.GetHandle();
+    volumeInfo.offset = 0;
+    volumeInfo.range = m_SceneGPU.volumeBuffer.GetSize();
+    
     // Environment map textures
     VkDescriptorImageInfo envMapInfo{};
     VkDescriptorImageInfo envMarginalInfo{};
@@ -410,7 +418,7 @@ void TracerCompute::UpdateDescriptors() {
         envConditionalInfo = envMapInfo;
     }
     
-    VkWriteDescriptorSet writes[12] = {};
+    VkWriteDescriptorSet writes[13] = {};
     
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = m_DescriptorSet;
@@ -475,31 +483,39 @@ void TracerCompute::UpdateDescriptors() {
     writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[8].pBufferInfo = &lightInfo;
     
+    // Volumes (binding 12)
+    writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[9].dstSet = m_DescriptorSet;
+    writes[9].dstBinding = 12;
+    writes[9].descriptorCount = 1;
+    writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[9].pBufferInfo = &volumeInfo;
+    
     // Environment map writes - only add if we have valid views
-    uint32_t writeCount = 9;
+    uint32_t writeCount = 10;
     if (m_EnvMap && m_EnvMap->IsLoaded()) {
-        writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[9].dstSet = m_DescriptorSet;
-        writes[9].dstBinding = 9;
-        writes[9].descriptorCount = 1;
-        writes[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[9].pImageInfo = &envMapInfo;
-        
         writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[10].dstSet = m_DescriptorSet;
-        writes[10].dstBinding = 10;
+        writes[10].dstBinding = 9;
         writes[10].descriptorCount = 1;
         writes[10].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[10].pImageInfo = &envMarginalInfo;
+        writes[10].pImageInfo = &envMapInfo;
         
         writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[11].dstSet = m_DescriptorSet;
-        writes[11].dstBinding = 11;
+        writes[11].dstBinding = 10;
         writes[11].descriptorCount = 1;
         writes[11].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[11].pImageInfo = &envConditionalInfo;
+        writes[11].pImageInfo = &envMarginalInfo;
         
-        writeCount = 12;
+        writes[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[12].dstSet = m_DescriptorSet;
+        writes[12].dstBinding = 11;
+        writes[12].descriptorCount = 1;
+        writes[12].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[12].pImageInfo = &envConditionalInfo;
+        
+        writeCount = 13;
     }
     
     vkUpdateDescriptorSets(device, writeCount, writes, 0, nullptr);
@@ -551,7 +567,8 @@ void TracerCompute::UpdateLights(const std::vector<GPULight>& inputLights) {
 
 void TracerCompute::UpdateScene(const std::vector<BVHBuilder::Triangle>& inputTriangles,
                                  const std::vector<GPUMaterial>& inputMaterials,
-                                 const std::vector<GPULight>& inputLights) {
+                                 const std::vector<GPULight>& inputLights,
+                                 const std::vector<GPUVolume>& inputVolumes) {
     std::vector<BVHBuilder::Triangle> triangles = inputTriangles;
     std::vector<GPUMaterial> materials = inputMaterials;
     
@@ -616,12 +633,14 @@ void TracerCompute::UpdateScene(const std::vector<BVHBuilder::Triangle>& inputTr
     size_t matSize = packedMaterials.size() * sizeof(glm::vec4);
     size_t instSize = sizeof(glm::mat4); // Dummy instance buffer
     size_t lightSize = std::max(inputLights.size(), size_t(1)) * sizeof(GPULight);
+    size_t volumeSize = std::max(inputVolumes.size(), size_t(1)) * sizeof(GPUVolume);
     
     m_SceneGPU.triangleBuffer.Shutdown();
     m_SceneGPU.bvhNodeBuffer.Shutdown();
     m_SceneGPU.instanceBuffer.Shutdown();
     m_SceneGPU.materialBuffer.Shutdown();
     m_SceneGPU.lightBuffer.Shutdown();
+    m_SceneGPU.volumeBuffer.Shutdown();
     
     BufferDesc triDesc{};
     triDesc.size = triSize;
@@ -658,6 +677,13 @@ void TracerCompute::UpdateScene(const std::vector<BVHBuilder::Triangle>& inputTr
     lightDesc.debugName = "TracerLights";
     m_SceneGPU.lightBuffer.Init(m_Device, lightDesc);
     
+    BufferDesc volumeDesc{};
+    volumeDesc.size = volumeSize;
+    volumeDesc.usage = BufferUsage::Storage;
+    volumeDesc.hostVisible = true;
+    volumeDesc.debugName = "TracerVolumes";
+    m_SceneGPU.volumeBuffer.Init(m_Device, volumeDesc);
+    
     // Upload data
     m_SceneGPU.triangleBuffer.Upload(packedTriangles.data(), triSize);
     m_SceneGPU.bvhNodeBuffer.Upload(packedNodes.data(), bvhSize);
@@ -683,6 +709,20 @@ void TracerCompute::UpdateScene(const std::vector<BVHBuilder::Triangle>& inputTr
         m_SceneGPU.lightCount = 1;
     }
     
+    // Upload volumes (or a dummy volume if empty)
+    if (!inputVolumes.empty()) {
+        m_SceneGPU.volumeBuffer.Upload(inputVolumes.data(), inputVolumes.size() * sizeof(GPUVolume));
+        m_SceneGPU.volumeCount = static_cast<uint32_t>(inputVolumes.size());
+    } else {
+        // Dummy volume (won't be used if volumeCount is 0)
+        GPUVolume dummyVolume{};
+        dummyVolume.transform = glm::mat4(1.0f);
+        dummyVolume.scatterColor = glm::vec3(0.0f);
+        dummyVolume.density = 0.0f;
+        m_SceneGPU.volumeBuffer.Upload(&dummyVolume, sizeof(GPUVolume));
+        m_SceneGPU.volumeCount = 0;
+    }
+    
     m_SceneGPU.triangleCount = static_cast<uint32_t>(triangles.size());
     m_SceneGPU.bvhNodeCount = static_cast<uint32_t>(nodes.size());
     m_SceneGPU.materialCount = static_cast<uint32_t>(materials.size());
@@ -692,8 +732,8 @@ void TracerCompute::UpdateScene(const std::vector<BVHBuilder::Triangle>& inputTr
     m_SceneDirty = false;
     m_DescriptorsDirty = true;  // Scene buffers changed, need to update descriptors
     
-    LUCENT_CORE_INFO("TracerCompute scene updated: {} triangles, {} BVH nodes, {} materials, {} lights",
-        m_SceneGPU.triangleCount, m_SceneGPU.bvhNodeCount, m_SceneGPU.materialCount, m_SceneGPU.lightCount);
+    LUCENT_CORE_INFO("TracerCompute scene updated: {} triangles, {} BVH nodes, {} materials, {} lights, {} volumes",
+        m_SceneGPU.triangleCount, m_SceneGPU.bvhNodeCount, m_SceneGPU.materialCount, m_SceneGPU.lightCount, m_SceneGPU.volumeCount);
 }
 
 void TracerCompute::Trace(VkCommandBuffer cmd, 
@@ -743,6 +783,7 @@ void TracerCompute::Trace(VkCommandBuffer cmd,
     pc.envIntensity = settings.envIntensity;
     pc.envRotation = settings.envRotation;
     pc.useEnvMap = (m_EnvMap && m_EnvMap->IsLoaded() && settings.useEnvMap) ? 1 : 0;
+    pc.volumeCount = m_SceneGPU.volumeCount;
     
     vkCmdPushConstants(cmd, m_PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 
         0, sizeof(TracerPushConstants), &pc);

@@ -17,6 +17,12 @@ struct MaterialPin;
 struct MaterialLink;
 class MaterialGraph;
 
+// Material domain: determines which output node drives compilation
+enum class MaterialDomain {
+    Surface,    // Uses PBROutput node
+    Volume      // Uses VolumetricOutput node
+};
+
 // Unique identifiers
 using NodeID = uint64_t;
 using PinID = uint64_t;
@@ -107,7 +113,8 @@ enum class NodeType {
     CombineVec4,    // Combine R, G, B, A into vec4
     
     // Output
-    PBROutput,      // Final PBR material output
+    PBROutput,          // Final PBR material output (surface domain)
+    VolumetricOutput,   // Final volumetric material output (volume domain)
 };
 
 // Get node category for UI
@@ -156,6 +163,7 @@ inline const char* GetNodeCategory(NodeType type) {
         case NodeType::CombineVec4:
             return "Convert";
         case NodeType::PBROutput:
+        case NodeType::VolumetricOutput:
             return "Output";
     }
     return "Other";
@@ -198,6 +206,7 @@ inline const char* GetNodeTypeName(NodeType type) {
         case NodeType::CombineVec3: return "Combine RGB";
         case NodeType::CombineVec4: return "Combine RGBA";
         case NodeType::PBROutput: return "PBR Output";
+        case NodeType::VolumetricOutput: return "Volume Output";
     }
     return "Unknown";
 }
@@ -291,9 +300,26 @@ public:
     const std::unordered_map<PinID, MaterialPin>& GetPins() const { return m_Pins; }
     const std::unordered_map<LinkID, MaterialLink>& GetLinks() const { return m_Links; }
     
-    // Get the output node (there should be exactly one)
+    // Get the output node (there should be exactly one per domain)
     NodeID GetOutputNodeId() const { return m_OutputNodeId; }
     void SetOutputNodeId(NodeID nodeId) { m_OutputNodeId = nodeId; }
+    
+    // Volumetric output node (separate from PBR output)
+    NodeID GetVolumeOutputNodeId() const { return m_VolumeOutputNodeId; }
+    void SetVolumeOutputNodeId(NodeID nodeId) { m_VolumeOutputNodeId = nodeId; }
+    
+    // Material domain (Surface or Volume)
+    MaterialDomain GetDomain() const { return m_Domain; }
+    void SetDomain(MaterialDomain domain) { m_Domain = domain; }
+    
+    // Check if a specific output node exists
+    bool HasPBROutput() const { return m_OutputNodeId != INVALID_NODE_ID; }
+    bool HasVolumeOutput() const { return m_VolumeOutputNodeId != INVALID_NODE_ID; }
+    
+    // Get active output node based on domain
+    NodeID GetActiveOutputNodeId() const {
+        return m_Domain == MaterialDomain::Volume ? m_VolumeOutputNodeId : m_OutputNodeId;
+    }
     
     // Compute a hash of the graph for caching
     uint64_t ComputeHash() const;
@@ -315,7 +341,9 @@ private:
     
     std::vector<TextureSlot> m_TextureSlots;
     
-    NodeID m_OutputNodeId = INVALID_NODE_ID;
+    NodeID m_OutputNodeId = INVALID_NODE_ID;         // PBR Output node
+    NodeID m_VolumeOutputNodeId = INVALID_NODE_ID;  // Volumetric Output node
+    MaterialDomain m_Domain = MaterialDomain::Surface;
     std::string m_Name = "New Material";
 };
 

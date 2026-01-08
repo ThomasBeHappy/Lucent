@@ -14,6 +14,7 @@ struct CompileResult {
     std::vector<uint32_t> fragmentShaderSPIRV;
     std::string errorMessage;
     uint64_t graphHash = 0;
+    MaterialDomain domain = MaterialDomain::Surface;
 };
 
 // Compiles a MaterialGraph to GLSL and SPIR-V
@@ -28,8 +29,14 @@ public:
     static const std::vector<uint32_t>& GetStandardVertexShaderSPIRV();
     
 private:
-    // Generate GLSL fragment shader from graph
+    // Generate GLSL fragment shader from graph (dispatches based on domain)
     std::string GenerateFragmentGLSL(const MaterialGraph& graph);
+    
+    // Generate GLSL for surface (PBR) materials
+    std::string GenerateSurfaceFragmentGLSL(const MaterialGraph& graph);
+    
+    // Generate GLSL for volume materials (raymarching)
+    std::string GenerateVolumeFragmentGLSL(const MaterialGraph& graph);
     
     // Compile GLSL to SPIR-V
     bool CompileGLSLToSPIRV(const std::string& glsl, std::vector<uint32_t>& spirv, std::string& errorMsg);

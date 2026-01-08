@@ -18,6 +18,11 @@ struct RayPayload {
     vec3 emissive;
     float metallic;
     float roughness;
+    // Volume payload (only valid for volume hits)
+    bool volumeHit;
+    vec3 volumeColor;   // premultiplied
+    float volumeAlpha;
+    vec3 volumeExitPos;
 };
 
 layout(location = 0) rayPayloadInEXT RayPayload payload;
@@ -86,6 +91,7 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
 }
 
 void main() {
+    payload.volumeHit = false;
     // Get triangle vertices using gl_PrimitiveID
     uint primIdx = gl_PrimitiveID;
     uint idx0 = primIdx * 3 + 0;

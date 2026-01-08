@@ -78,8 +78,9 @@ const std::vector<uint32_t>& MaterialCompiler::GetStandardVertexShaderSPIRV() {
 CompileResult MaterialCompiler::Compile(const MaterialGraph& graph) {
     CompileResult result;
     result.graphHash = graph.ComputeHash();
+    result.domain = graph.GetDomain();
     
-    // Generate GLSL
+    // Generate GLSL based on domain
     result.fragmentShaderGLSL = GenerateFragmentGLSL(graph);
     
     if (result.fragmentShaderGLSL.empty()) {
@@ -99,6 +100,14 @@ CompileResult MaterialCompiler::Compile(const MaterialGraph& graph) {
 }
 
 std::string MaterialCompiler::GenerateFragmentGLSL(const MaterialGraph& graph) {
+    // Dispatch based on material domain
+    if (graph.GetDomain() == MaterialDomain::Volume) {
+        return GenerateVolumeFragmentGLSL(graph);
+    }
+    return GenerateSurfaceFragmentGLSL(graph);
+}
+
+std::string MaterialCompiler::GenerateSurfaceFragmentGLSL(const MaterialGraph& graph) {
     std::ostringstream ss;
     
     // Header
@@ -337,6 +346,234 @@ float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
     return ss.str();
 }
 
+std::string MaterialCompiler::GenerateVolumeFragmentGLSL(const MaterialGraph& graph) {
+    std::ostringstream ss;
+    
+    // Header
+    ss << "#version 450\n\n";
+    
+    // Inputs from vertex shader
+    ss << "layout(location = 0) in vec3 inWorldPos;\n";
+    ss << "layout(location = 1) in vec3 inNormal;\n";
+    ss << "layout(location = 2) in vec2 inUV;\n";
+    ss << "layout(location = 3) in vec3 inTangent;\n";
+    ss << "layout(location = 4) in vec3 inBitangent;\n\n";
+    
+    // Output (premultiplied RGBA)
+    ss << "layout(location = 0) out vec4 outColor;\n\n";
+    
+    // Push constants
+    ss << "layout(push_constant) uniform PushConstants {\n";
+    ss << "    mat4 model;\n";
+    ss << "    mat4 viewProj;\n";
+    ss << "    vec4 baseColor;\n";
+    ss << "    vec4 materialParams;\n";
+    ss << "    vec4 emissive;\n";
+    ss << "    vec4 cameraPos;\n";
+    ss << "} pc;\n\n";
+    
+    // Texture samplers (same as surface for node reuse)
+    const auto& textureSlots = graph.GetTextureSlots();
+    bool hasTextureNodes = false;
+    for (const auto& [id, node] : graph.GetNodes()) {
+        if (node.type == NodeType::Texture2D || node.type == NodeType::NormalMap) {
+            hasTextureNodes = true;
+            break;
+        }
+    }
+    if (!textureSlots.empty()) {
+        ss << "layout(set = 0, binding = 0) uniform sampler2D textures[" << textureSlots.size() << "];\n\n";
+    } else if (hasTextureNodes) {
+        ss << "layout(set = 0, binding = 0) uniform sampler2D textures[1];\n\n";
+    }
+    
+    // Noise helpers (inject if needed)
+    bool needsNoise = false;
+    for (const auto& [id, node] : graph.GetNodes()) {
+        if (node.type == NodeType::Noise) {
+            needsNoise = true;
+            break;
+        }
+    }
+    if (needsNoise) {
+        ss << R"(
+// Noise helpers for volumes
+float hash13(vec3 p3) {
+    p3 = fract(p3 * 0.1031);
+    p3 += dot(p3, p3.zyx + 31.32);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+float valueNoise3(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    float n000 = hash13(i + vec3(0,0,0));
+    float n100 = hash13(i + vec3(1,0,0));
+    float n010 = hash13(i + vec3(0,1,0));
+    float n110 = hash13(i + vec3(1,1,0));
+    float n001 = hash13(i + vec3(0,0,1));
+    float n101 = hash13(i + vec3(1,0,1));
+    float n011 = hash13(i + vec3(0,1,1));
+    float n111 = hash13(i + vec3(1,1,1));
+    vec3 u = f * f * (3.0 - 2.0 * f);
+    float nx00 = mix(n000, n100, u.x);
+    float nx10 = mix(n010, n110, u.x);
+    float nx01 = mix(n001, n101, u.x);
+    float nx11 = mix(n011, n111, u.x);
+    float nxy0 = mix(nx00, nx10, u.y);
+    float nxy1 = mix(nx01, nx11, u.y);
+    return mix(nxy0, nxy1, u.z);
+}
+
+float fbm3(vec3 p, float octaves, float roughness) {
+    float sum = 0.0;
+    float amp = 0.5;
+    float freq = 1.0;
+    int iters = int(clamp(octaves, 1.0, 12.0));
+    for (int i = 0; i < iters; ++i) {
+        sum += amp * valueNoise3(p * freq);
+        freq *= 2.0;
+        amp *= clamp(roughness, 0.0, 1.0);
+    }
+    return sum;
+}
+)";
+    }
+    
+    // Ray-box intersection helper
+    ss << R"(
+// Ray-box intersection for unit cube [-0.5, 0.5]^3
+bool rayBoxIntersect(vec3 ro, vec3 rd, out float tNear, out float tFar) {
+    vec3 invDir = 1.0 / rd;
+    vec3 t0 = (-0.5 - ro) * invDir;
+    vec3 t1 = (0.5 - ro) * invDir;
+    vec3 tMin = min(t0, t1);
+    vec3 tMax = max(t0, t1);
+    tNear = max(max(tMin.x, tMin.y), tMin.z);
+    tFar = min(min(tMax.x, tMax.y), tMax.z);
+    return tNear <= tFar && tFar >= 0.0;
+}
+
+)";
+    
+    // Main function
+    ss << "void main() {\n";
+    
+    // Compute camera ray in world space
+    ss << "    vec3 camPos = pc.cameraPos.xyz;\n";
+    ss << "    vec3 rayDir = normalize(inWorldPos - camPos);\n\n";
+    
+    // Transform to local space
+    ss << "    mat4 invModel = inverse(pc.model);\n";
+    ss << "    vec3 localCamPos = (invModel * vec4(camPos, 1.0)).xyz;\n";
+    ss << "    vec3 localRayDir = normalize(mat3(invModel) * rayDir);\n\n";
+    
+    // Ray-box intersection
+    ss << "    float tNear, tFar;\n";
+    ss << "    if (!rayBoxIntersect(localCamPos, localRayDir, tNear, tFar)) {\n";
+    ss << "        discard;\n";
+    ss << "    }\n";
+    ss << "    tNear = max(tNear, 0.0);\n\n";
+    
+    // Topological sort nodes
+    std::vector<NodeID> sortedNodes = TopologicalSort(graph);
+    std::unordered_map<PinID, std::string> pinVarNames;
+    
+    // Generate code for non-output nodes
+    for (NodeID nodeId : sortedNodes) {
+        const MaterialNode* node = graph.GetNode(nodeId);
+        if (!node || node->type == NodeType::VolumetricOutput) continue;
+        ss << GenerateNodeCode(graph, *node, pinVarNames);
+    }
+    
+    // Get output values from Volume output node
+    const MaterialNode* outputNode = graph.GetNode(graph.GetVolumeOutputNodeId());
+    if (!outputNode || outputNode->type != NodeType::VolumetricOutput) {
+        LUCENT_CORE_ERROR("Material graph has no Volumetric output node");
+        return "";
+    }
+    
+    // Get pin values for volume parameters
+    std::string scatterColor = GetPinValue(graph, outputNode->inputPins[0], PinType::Vec3, pinVarNames);
+    std::string density = GetPinValue(graph, outputNode->inputPins[1], PinType::Float, pinVarNames);
+    std::string anisotropy = GetPinValue(graph, outputNode->inputPins[2], PinType::Float, pinVarNames);
+    std::string absorption = GetPinValue(graph, outputNode->inputPins[3], PinType::Vec3, pinVarNames);
+    std::string emission = GetPinValue(graph, outputNode->inputPins[4], PinType::Vec3, pinVarNames);
+    std::string emissionStrength = GetPinValue(graph, outputNode->inputPins[5], PinType::Float, pinVarNames);
+    
+    // Raymarch parameters
+    ss << "\n    // Volume parameters\n";
+    ss << "    vec3 volColor = " << scatterColor << ";\n";
+    ss << "    float volDensity = " << density << ";\n";
+    ss << "    float volAnisotropy = clamp(" << anisotropy << ", -0.99, 0.99);\n";
+    ss << "    vec3 volAbsorption = " << absorption << ";\n";
+    ss << "    vec3 volEmission = " << emission << " * " << emissionStrength << ";\n\n";
+    
+    // Raymarching
+    ss << R"(
+    // Raymarch through volume
+    const int MAX_STEPS = 64;
+    float stepSize = (tFar - tNear) / float(MAX_STEPS);
+    
+    vec3 accumColor = vec3(0.0);
+    float accumTransmittance = 1.0;
+    
+    // Simple directional light
+    vec3 lightDir = normalize(vec3(1.0, 1.0, 0.5));
+    vec3 lightColor = vec3(2.5);
+    
+    for (int i = 0; i < MAX_STEPS; ++i) {
+        float t = tNear + (float(i) + 0.5) * stepSize;
+        vec3 samplePos = localCamPos + localRayDir * t;
+        
+        // Skip if outside volume
+        if (any(lessThan(samplePos, vec3(-0.5))) || any(greaterThan(samplePos, vec3(0.5)))) {
+            continue;
+        }
+        
+        // Sample density (use UV-based position for node evaluation)
+        float sampleDensity = volDensity;
+        
+        // Extinction coefficient (absorption + scattering)
+        vec3 sigma_t = volAbsorption + volColor * sampleDensity;
+        
+        // Transmittance through this step (Beer-Lambert)
+        vec3 stepTransmittance = exp(-sigma_t * stepSize);
+        float avgTransmittance = (stepTransmittance.r + stepTransmittance.g + stepTransmittance.b) / 3.0;
+        
+        // Henyey-Greenstein phase function
+        float cosTheta = dot(-localRayDir, lightDir);
+        float g = volAnisotropy;
+        float g2 = g * g;
+        float phase = (1.0 - g2) / (4.0 * 3.14159 * pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5));
+        
+        // In-scattering (simplified single scatter)
+        vec3 scattering = volColor * sampleDensity * lightColor * phase;
+        
+        // Add emission
+        scattering += volEmission;
+        
+        // Integrate (premultiplied alpha)
+        vec3 S = scattering * stepSize;
+        accumColor += accumTransmittance * S;
+        accumTransmittance *= avgTransmittance;
+        
+        // Early termination if fully opaque
+        if (accumTransmittance < 0.01) break;
+    }
+    
+    // Final alpha from transmittance
+    float alpha = 1.0 - accumTransmittance;
+    
+    // Output premultiplied RGBA
+    outColor = vec4(accumColor, alpha);
+)";
+    
+    ss << "}\n";
+    
+    return ss.str();
+}
+
 bool MaterialCompiler::CompileGLSLToSPIRV(const std::string& glsl, std::vector<uint32_t>& spirv, std::string& errorMsg) {
     shaderc::Compiler compiler;
     shaderc::CompileOptions options;
@@ -399,8 +636,8 @@ std::vector<NodeID> MaterialCompiler::TopologicalSort(const MaterialGraph& graph
         return true;
     };
     
-    // Start from output node
-    visit(graph.GetOutputNodeId());
+    // Start from active output node (PBR or Volume based on domain)
+    visit(graph.GetActiveOutputNodeId());
     
     return result;
 }
@@ -727,6 +964,72 @@ std::string MaterialCompiler::GenerateNodeCode(const MaterialGraph& graph, const
         case NodeType::PBROutput:
             // Output node doesn't generate code, values are read directly
             break;
+            
+        case NodeType::VolumetricOutput:
+            // Output node doesn't generate code, values are read directly
+            break;
+            
+        case NodeType::Power: {
+            std::string base = GetPinValue(graph, node.inputPins[0], PinType::Float, pinVarNames);
+            std::string exp = GetPinValue(graph, node.inputPins[1], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "pow";
+            ss << "    float " << var << " = pow(" << base << ", " << exp << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+        
+        case NodeType::Abs: {
+            std::string val = GetPinValue(graph, node.inputPins[0], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "abs";
+            ss << "    float " << var << " = abs(" << val << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+        
+        case NodeType::Dot: {
+            std::string a = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
+            std::string b = GetPinValue(graph, node.inputPins[1], PinType::Vec3, pinVarNames);
+            std::string var = varPrefix + "dot";
+            ss << "    float " << var << " = dot(" << a << ", " << b << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+        
+        case NodeType::Normalize: {
+            std::string vec = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
+            std::string var = varPrefix + "norm";
+            ss << "    vec3 " << var << " = normalize(" << vec << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+        
+        case NodeType::Length: {
+            std::string vec = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
+            std::string var = varPrefix + "len";
+            ss << "    float " << var << " = length(" << vec << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+        
+        case NodeType::SeparateVec4: {
+            std::string vec = GetPinValue(graph, node.inputPins[0], PinType::Vec4, pinVarNames);
+            pinVarNames[node.outputPins[0]] = "(" + vec + ").x";
+            pinVarNames[node.outputPins[1]] = "(" + vec + ").y";
+            pinVarNames[node.outputPins[2]] = "(" + vec + ").z";
+            pinVarNames[node.outputPins[3]] = "(" + vec + ").w";
+            break;
+        }
+        
+        case NodeType::CombineVec4: {
+            std::string r = GetPinValue(graph, node.inputPins[0], PinType::Float, pinVarNames);
+            std::string g = GetPinValue(graph, node.inputPins[1], PinType::Float, pinVarNames);
+            std::string b = GetPinValue(graph, node.inputPins[2], PinType::Float, pinVarNames);
+            std::string a = GetPinValue(graph, node.inputPins[3], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "combine4";
+            ss << "    vec4 " << var << " = vec4(" << r << ", " << g << ", " << b << ", " << a << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
             
         default:
             break;

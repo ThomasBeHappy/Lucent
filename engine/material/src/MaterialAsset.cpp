@@ -326,9 +326,21 @@ bool MaterialAsset::CreatePipeline(const std::vector<uint32_t>& fragmentSpirv) {
         .SetVertexInput({meshBinding}, meshAttributes)
         .SetColorAttachmentFormat(VK_FORMAT_R16G16B16A16_SFLOAT)
         .SetDepthAttachmentFormat(VK_FORMAT_D32_SFLOAT)
-        .SetDepthStencil(true, true, VK_COMPARE_OP_LESS_OR_EQUAL)
-        .SetRasterizer(VK_POLYGON_MODE_FILL, VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
         .SetLayout(m_PipelineLayout);
+    
+    // Configure pipeline based on material domain
+    bool isVolume = (m_Graph.GetDomain() == MaterialDomain::Volume);
+    if (isVolume) {
+        // Volume materials: depth test ON, depth write OFF, blending ON (premultiplied alpha)
+        builder.SetDepthStencil(true, false, VK_COMPARE_OP_LESS_OR_EQUAL);
+        builder.SetColorBlendAttachment(true, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+        // Disable backface culling for volumes (we want to see them from inside too)
+        builder.SetRasterizer(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    } else {
+        // Surface materials: normal opaque pipeline
+        builder.SetDepthStencil(true, true, VK_COMPARE_OP_LESS_OR_EQUAL);
+        builder.SetRasterizer(VK_POLYGON_MODE_FILL, VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    }
     
     // Set render pass for legacy mode (Vulkan 1.1/1.2)
     if (m_RenderPass != VK_NULL_HANDLE) {
@@ -535,6 +547,27 @@ MaterialAsset* MaterialAssetManager::LoadMaterial(const std::string& path) {
         graph.SetName(line.substr(6));
     }
     
+    // Optional domain selection (V2+). Default is Surface.
+    // Format: "DOMAIN: Surface" or "DOMAIN: Volume"
+    {
+        std::streampos afterNamePos = file.tellg();
+        std::string tmp;
+        while (std::getline(file, tmp)) {
+            if (tmp.empty()) continue;
+            if (tmp.rfind("DOMAIN:", 0) == 0) {
+                std::string dom = tmp.substr(std::string("DOMAIN:").size());
+                while (!dom.empty() && (dom[0] == ' ' || dom[0] == '\t')) dom.erase(dom.begin());
+                if (dom == "Volume") graph.SetDomain(MaterialDomain::Volume);
+                else graph.SetDomain(MaterialDomain::Surface);
+            } else {
+                // Not a domain line; rewind so normal parsing sees it.
+                file.clear();
+                file.seekg(afterNamePos);
+            }
+            break;
+        }
+    }
+    
     struct PendingLinkV2 {
         uint64_t startNodeId = 0;
         int startOutIndex = -1;
@@ -604,6 +637,9 @@ MaterialAsset* MaterialAssetManager::LoadMaterial(const std::string& path) {
             if (fileNodeId != 0) nodeIdMap[fileNodeId] = newId;
             if (nodeType == NodeType::PBROutput) {
                 graph.SetOutputNodeId(newId);
+            }
+            if (nodeType == NodeType::VolumetricOutput) {
+                graph.SetVolumeOutputNodeId(newId);
             }
             
             if (auto* n = graph.GetNode(newId)) {
@@ -718,7 +754,8 @@ bool MaterialAssetManager::SaveMaterial(MaterialAsset* material, const std::stri
     
     // Write header
     file << "LUCENT_MATERIAL_V2\n";
-    file << "NAME: " << graph.GetName() << "\n\n";
+    file << "NAME: " << graph.GetName() << "\n";
+    file << "DOMAIN: " << (graph.GetDomain() == MaterialDomain::Volume ? "Volume" : "Surface") << "\n\n";
     
     // Write nodes
     for (const auto& [id, node] : graph.GetNodes()) {

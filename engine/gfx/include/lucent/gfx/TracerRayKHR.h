@@ -67,6 +67,10 @@ struct RTPushConstants {
     float envIntensity;
     float envRotation;
     uint32_t useEnvMap;
+    uint32_t volumeCount;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
 };
 
 // Vulkan KHR ray tracing based path tracer
@@ -84,7 +88,8 @@ public:
     // Update scene - builds/updates acceleration structures
     void UpdateScene(const std::vector<BVHBuilder::Triangle>& triangles,
                      const std::vector<GPUMaterial>& materials,
-                     const std::vector<GPULight>& lights = {});
+                     const std::vector<GPULight>& lights = {},
+                     const std::vector<GPUVolume>& volumes = {});
     
     // Set environment map for IBL
     void SetEnvironmentMap(EnvironmentMap* envMap);
@@ -118,6 +123,7 @@ private:
     bool CreateAccumulationImage(uint32_t width, uint32_t height);
     
     bool BuildBLAS(const std::vector<BVHBuilder::Triangle>& triangles);
+    bool BuildVolumeBLAS(const std::vector<GPUVolume>& volumes);
     bool BuildTLAS();
     
 private:
@@ -139,7 +145,11 @@ private:
     
     // Acceleration structures
     BLAS m_BLAS;
+    BLAS m_VolumeBLAS;
     TLAS m_TLAS;
+
+    // Volume AABB source buffer for procedural BLAS
+    Buffer m_VolumeAABBBuffer;
     
     // Scene data
     Buffer m_PositionBuffer;        // Positions only for BLAS geometry
@@ -148,8 +158,10 @@ private:
     Buffer m_PrimitiveMaterialBuffer;
     Buffer m_MaterialBuffer;
     Buffer m_LightBuffer;
+    Buffer m_VolumeBuffer;
     uint32_t m_TriangleCount = 0;
     uint32_t m_LightCount = 0;
+    uint32_t m_VolumeCount = 0;
     
     // Environment map
     EnvironmentMap* m_EnvMap = nullptr;
@@ -167,6 +179,8 @@ private:
     VkShaderModule m_ClosestHitShader = VK_NULL_HANDLE;
     VkShaderModule m_ShadowMissShader = VK_NULL_HANDLE;
     VkShaderModule m_ShadowClosestHitShader = VK_NULL_HANDLE;
+    VkShaderModule m_VolumeIntersectionShader = VK_NULL_HANDLE;
+    VkShaderModule m_VolumeClosestHitShader = VK_NULL_HANDLE;
     
     // Shader binding table
     Buffer m_SBTBuffer;

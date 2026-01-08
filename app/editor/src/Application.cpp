@@ -5,6 +5,7 @@
 #include "lucent/assets/MeshRegistry.h"
 #include "lucent/scene/Components.h"
 #include "lucent/material/MaterialAsset.h"
+#include "lucent/material/MaterialIR.h"
 #include <GLFW/glfw3.h>
 #include <cmath>
 
@@ -251,14 +252,36 @@ void Application::RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj) {
     // Get camera position for specular calculations
     glm::vec3 camPos = m_EditorCamera.GetPosition();
     
-    // Track currently bound pipeline for batching
-    VkPipeline currentPipeline = VK_NULL_HANDLE;
-    VkPipelineLayout currentLayout = VK_NULL_HANDLE;
+    // Push constants structure (shared between both passes)
+    struct PushConstants {
+        glm::mat4 model;
+        glm::mat4 viewProj;
+        glm::vec4 baseColor;       // RGB + alpha
+        glm::vec4 materialParams;  // metallic, roughness, emissiveIntensity, shadowBias
+        glm::vec4 emissive;        // RGB + shadowEnabled
+        glm::vec4 cameraPos;       // Camera world position
+        glm::mat4 lightViewProj;   // Light space matrix for shadows
+    };
     
-    // Iterate all entities with MeshRendererComponent and TransformComponent
-    auto view = m_Scene.GetView<scene::MeshRendererComponent, scene::TransformComponent>();
-    view.Each([&](scene::Entity entity, scene::MeshRendererComponent& renderer, scene::TransformComponent& transform) {
+    // Helper lambda to render an entity
+    auto renderEntity = [&](scene::Entity entity, scene::MeshRendererComponent& renderer, 
+                            scene::TransformComponent& transform, VkPipeline& currentPipeline, 
+                            VkPipelineLayout& currentLayout, bool volumePass) {
         if (!renderer.visible) return;
+        
+        // Check if this is a volume material
+        bool isVolumeMaterial = false;
+        material::MaterialAsset* mat = nullptr;
+        if (renderer.UsesMaterialAsset()) {
+            mat = material::MaterialAssetManager::Get().GetMaterial(renderer.materialPath);
+            if (mat && mat->IsValid()) {
+                isVolumeMaterial = mat->IsVolumeMaterial();
+            }
+        }
+        
+        // Skip based on pass
+        if (volumePass && !isVolumeMaterial) return;
+        if (!volumePass && isVolumeMaterial) return;
         
         assets::Mesh* mesh = nullptr;
         
@@ -294,13 +317,10 @@ void Application::RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj) {
         bool usesMaterialPipeline = false;
         
         // Check if entity has a material asset assigned
-        if (renderer.UsesMaterialAsset()) {
-            auto* mat = material::MaterialAssetManager::Get().GetMaterial(renderer.materialPath);
-            if (mat && mat->IsValid() && mat->GetPipeline()) {
-                pipeline = mat->GetPipeline();
-                layout = mat->GetPipelineLayout();
-                usesMaterialPipeline = true;
-            }
+        if (mat && mat->GetPipeline()) {
+            pipeline = mat->GetPipeline();
+            layout = mat->GetPipelineLayout();
+            usesMaterialPipeline = true;
         }
         
         // Bind pipeline if changed
@@ -313,7 +333,6 @@ void Application::RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj) {
         // Bind descriptor set(s)
         if (usesMaterialPipeline) {
             // Bind material texture set at set 0
-            auto* mat = material::MaterialAssetManager::Get().GetMaterial(renderer.materialPath);
             if (mat && mat->HasDescriptorSet()) {
                 VkDescriptorSet matSet = mat->GetDescriptorSet();
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
@@ -326,16 +345,7 @@ void Application::RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj) {
         }
         
         // Push constants with full material data
-        struct PushConstants {
-            glm::mat4 model;
-            glm::mat4 viewProj;
-            glm::vec4 baseColor;       // RGB + alpha
-            glm::vec4 materialParams;  // metallic, roughness, emissiveIntensity, shadowBias
-            glm::vec4 emissive;        // RGB + shadowEnabled
-            glm::vec4 cameraPos;       // Camera world position
-            glm::mat4 lightViewProj;   // Light space matrix for shadows
-        } pc;
-        
+        PushConstants pc;
         pc.model = transform.GetLocalMatrix();
         pc.viewProj = viewProj;
         pc.baseColor = glm::vec4(renderer.baseColor, 1.0f);
@@ -349,6 +359,21 @@ void Application::RenderMeshes(VkCommandBuffer cmd, const glm::mat4& viewProj) {
         
         mesh->Bind(cmd);
         mesh->Draw(cmd);
+    };
+    
+    // Track currently bound pipeline for batching
+    VkPipeline currentPipeline = VK_NULL_HANDLE;
+    VkPipelineLayout currentLayout = VK_NULL_HANDLE;
+    
+    // PASS 1: Render opaque (surface) materials first
+    auto view = m_Scene.GetView<scene::MeshRendererComponent, scene::TransformComponent>();
+    view.Each([&](scene::Entity entity, scene::MeshRendererComponent& renderer, scene::TransformComponent& transform) {
+        renderEntity(entity, renderer, transform, currentPipeline, currentLayout, /*volumePass=*/false);
+    });
+    
+    // PASS 2: Render volume materials (after opaque, for correct alpha blending)
+    view.Each([&](scene::Entity entity, scene::MeshRendererComponent& renderer, scene::TransformComponent& transform) {
+        renderEntity(entity, renderer, transform, currentPipeline, currentLayout, /*volumePass=*/true);
     });
 }
 
@@ -1070,6 +1095,7 @@ void Application::UpdateTracerScene() {
     std::vector<gfx::BVHBuilder::Triangle> triangles;
     std::vector<gfx::GPUMaterial> materials;
     std::vector<gfx::GPULight> lights;
+    std::vector<gfx::GPUVolume> volumes;
     
     // Collect lights from scene
     auto lightView = m_Scene.GetView<scene::LightComponent, scene::TransformComponent>();
@@ -1153,16 +1179,103 @@ void Application::UpdateTracerScene() {
         
         glm::mat4 modelMatrix = transform.GetLocalMatrix();
         glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(modelMatrix)));
+
+        // Resolve material asset (if any) once per entity
+        material::MaterialAsset* matAsset = nullptr;
+        if (renderer.UsesMaterialAsset()) {
+            matAsset = material::MaterialAssetManager::Get().GetMaterial(renderer.materialPath);
+        }
+
+        // If this mesh uses a volume material, add a volume instance and SKIP surface triangles
+        if (matAsset && matAsset->IsValid() && matAsset->IsVolumeMaterial()) {
+            gfx::GPUVolume vol{};
+            vol.transform = glm::inverse(modelMatrix);
+            
+            // Pull default values from the VolumetricOutput node input pin defaults (V1)
+            const auto& graph = matAsset->GetGraph();
+            const auto* volNode = graph.GetNode(graph.GetVolumeOutputNodeId());
+            if (volNode && volNode->type == material::NodeType::VolumetricOutput) {
+                auto getFloatDefault = [&](size_t pinIdx, float fallback) -> float {
+                    if (pinIdx >= volNode->inputPins.size()) return fallback;
+                    const auto* pin = graph.GetPin(volNode->inputPins[pinIdx]);
+                    if (!pin) return fallback;
+                    if (std::holds_alternative<float>(pin->defaultValue)) return std::get<float>(pin->defaultValue);
+                    return fallback;
+                };
+                auto getVec3Default = [&](size_t pinIdx, glm::vec3 fallback) -> glm::vec3 {
+                    if (pinIdx >= volNode->inputPins.size()) return fallback;
+                    const auto* pin = graph.GetPin(volNode->inputPins[pinIdx]);
+                    if (!pin) return fallback;
+                    if (std::holds_alternative<glm::vec3>(pin->defaultValue)) return std::get<glm::vec3>(pin->defaultValue);
+                    return fallback;
+                };
+                
+                vol.scatterColor = getVec3Default(0, glm::vec3(0.8f));
+                vol.density = getFloatDefault(1, 1.0f);
+                vol.anisotropy = getFloatDefault(2, 0.0f);
+                vol.absorption = getVec3Default(3, glm::vec3(0.0f));
+                vol.emission = getVec3Default(4, glm::vec3(0.0f));
+                vol.emissionStrength = getFloatDefault(5, 1.0f);
+            } else {
+                vol.scatterColor = glm::vec3(renderer.baseColor);
+                vol.density = 1.0f;
+                vol.anisotropy = 0.0f;
+                vol.absorption = glm::vec3(0.0f);
+                vol.emission = glm::vec3(renderer.emissive);
+                vol.emissionStrength = renderer.emissiveIntensity;
+            }
+            
+            // Compute world-space AABB from mesh vertices (V1)
+            glm::vec3 aabbMin(FLT_MAX);
+            glm::vec3 aabbMax(-FLT_MAX);
+            for (const auto& vtx : vertices) {
+                glm::vec3 wp = glm::vec3(modelMatrix * glm::vec4(vtx.position, 1.0f));
+                aabbMin = glm::min(aabbMin, wp);
+                aabbMax = glm::max(aabbMax, wp);
+            }
+            vol.aabbMin = aabbMin;
+            vol.aabbMax = aabbMax;
+            
+            volumes.push_back(vol);
+            return; // IMPORTANT: don't also add surface triangles/material for volume containers
+        }
         
         // Add material for this mesh
         uint32_t matId = static_cast<uint32_t>(materials.size());
         gfx::GPUMaterial mat{};
-        mat.baseColor = glm::vec4(renderer.baseColor, 1.0f);
-        mat.emissive = glm::vec4(renderer.emissive, renderer.emissiveIntensity);
-        mat.metallic = renderer.metallic;
-        mat.roughness = renderer.roughness;
-        mat.ior = 1.5f;
-        mat.flags = 0;
+
+        // Traced material pipeline:
+        // If the entity uses a MaterialAsset, compile it to IR and evaluate constant channels for V1.
+        if (matAsset && matAsset->IsValid()) {
+            material::MaterialIR ir{};
+            std::string irErr;
+            if (material::MaterialIRCompiler::Compile(matAsset->GetGraph(), ir, irErr) && ir.IsValid()) {
+                auto data = ir.EvaluateConstant();
+                mat.baseColor = data.baseColor;
+                mat.emissive = data.emissive;
+                mat.metallic = data.metallic;
+                mat.roughness = data.roughness;
+                mat.ior = data.ior;
+                mat.flags = data.flags;
+            } else {
+                // Fallback to component values
+                mat.baseColor = glm::vec4(renderer.baseColor, 1.0f);
+                mat.emissive = glm::vec4(renderer.emissive, renderer.emissiveIntensity);
+                mat.metallic = renderer.metallic;
+                mat.roughness = renderer.roughness;
+                mat.ior = 1.5f;
+                mat.flags = 0;
+            }
+        } else {
+            // No material asset: use component values
+            mat.baseColor = glm::vec4(renderer.baseColor, 1.0f);
+            mat.emissive = glm::vec4(renderer.emissive, renderer.emissiveIntensity);
+            mat.metallic = renderer.metallic;
+            mat.roughness = renderer.roughness;
+            mat.ior = 1.5f;
+            mat.flags = 0;
+        }
+
         materials.push_back(mat);
         
         // Add triangles using the Vertex struct
@@ -1197,11 +1310,11 @@ void Application::UpdateTracerScene() {
     gfx::RenderMode mode = m_Renderer.GetRenderMode();
     if (mode == gfx::RenderMode::RayTraced) {
         if (gfx::TracerRayKHR* rt = m_Renderer.GetTracerRayKHR(); rt && rt->IsSupported()) {
-            rt->UpdateScene(triangles, materials, lights);
+            rt->UpdateScene(triangles, materials, lights, volumes);
         }
     } else {
         if (gfx::TracerCompute* compute = m_Renderer.GetTracerCompute()) {
-            compute->UpdateScene(triangles, materials, lights);
+            compute->UpdateScene(triangles, materials, lights, volumes);
         }
     }
     

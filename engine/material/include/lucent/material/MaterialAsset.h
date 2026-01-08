@@ -42,6 +42,10 @@ public:
     // Check if the material is valid (compiled successfully)
     bool IsValid() const { return m_Valid; }
     
+    // Get the material domain (Surface or Volume)
+    MaterialDomain GetDomain() const { return m_Graph.GetDomain(); }
+    bool IsVolumeMaterial() const { return m_Graph.GetDomain() == MaterialDomain::Volume; }
+    
     // Get compile error message
     const std::string& GetCompileError() const { return m_CompileError; }
     

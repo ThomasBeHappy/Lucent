@@ -59,6 +59,10 @@ layout(push_constant) uniform PushConstants {
     float envIntensity;
     float envRotation;
     uint useEnvMap;
+    uint volumeCount;
+    uint pad0;
+    uint pad1;
+    uint pad2;
 } pc;
 
 // Ray payload: carries radiance, throughput, hit info for multi-bounce
@@ -76,6 +80,11 @@ struct RayPayload {
     vec3 emissive;
     float metallic;
     float roughness;
+    // Volume payload (only valid for volume hits)
+    bool volumeHit;
+    vec3 volumeColor;   // premultiplied
+    float volumeAlpha;
+    vec3 volumeExitPos;
 };
 
 layout(location = 0) rayPayloadEXT RayPayload payload;
@@ -174,7 +183,7 @@ float traceShadow(vec3 origin, vec3 direction, float tMax) {
     
     traceRayEXT(topLevelAS,
                 gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-                0xFF,
+                0x01, // ignore volumes for shadow rays (V1)
                 1, 2, 1,  // shadow ray type
                 origin, 0.001, direction, tMax,
                 0);
@@ -219,9 +228,10 @@ void main() {
         payload.seed = seed;
         payload.hit = false;
         payload.done = false;
+        payload.volumeHit = false;
         
         // Trace ray
-        traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF,
+        traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0x03, // surfaces + volumes
                     0, 2, 0,  // primary ray type
                     origin, 0.001, direction, 10000.0, 0);
         
@@ -238,6 +248,26 @@ void main() {
                 firstHitNormal = -direction * 0.5 + 0.5;  // Remap to [0,1]
             }
             break;
+        }
+
+        // Volume hit: integrate + keep going along the same ray direction
+        if (payload.volumeHit) {
+            radiance += throughput * payload.volumeColor;
+            throughput *= (1.0 - payload.volumeAlpha);
+
+            if (!capturedAOV) {
+                firstHitAlbedo = payload.volumeColor;
+                firstHitNormal = vec3(0.5); // neutral
+                capturedAOV = true;
+            }
+
+            origin = payload.volumeExitPos + direction * 0.001;
+
+            // If fully absorbed, stop.
+            if (max(max(throughput.r, throughput.g), throughput.b) < 0.01) {
+                break;
+            }
+            continue;
         }
         
         // Capture first-hit AOVs for denoiser

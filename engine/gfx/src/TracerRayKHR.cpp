@@ -34,8 +34,8 @@ bool TracerRayKHR::Init(VulkanContext* context, Device* device) {
     VkDescriptorPoolSize poolSizes[] = {
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },  // accumImage + albedoImage + normalImage
-        // vertices, indices, materials, primitiveMaterialIds, lights
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 },
+        // vertices, indices, materials, primitiveMaterialIds, lights, volumes
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 }  // env map + marginal CDF + conditional CDF
     };
@@ -65,12 +65,14 @@ bool TracerRayKHR::Init(VulkanContext* context, Device* device) {
         { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr },  // lights
         { 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR, nullptr },  // envMap
         { 11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR, nullptr },  // envMarginalCDF
-        { 12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR, nullptr }   // envConditionalCDF
+        { 12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR, nullptr },  // envConditionalCDF
+        // volumes: used by raygen (AOV defaults) + volume closest-hit integration
+        { 13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_INTERSECTION_BIT_KHR, nullptr }
     };
     
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 13;
+    layoutInfo.bindingCount = 14;
     layoutInfo.pBindings = bindings;
     
     if (vkCreateDescriptorSetLayout(context->GetDevice(), &layoutInfo, nullptr, &m_DescriptorLayout) != VK_SUCCESS) {
@@ -101,6 +103,12 @@ void TracerRayKHR::Shutdown() {
         vkDestroyAccelerationStructureKHR(device, m_BLAS.handle, nullptr);
     }
     m_BLAS.buffer.Shutdown();
+
+    if (m_VolumeBLAS.handle != VK_NULL_HANDLE && vkDestroyAccelerationStructureKHR) {
+        vkDestroyAccelerationStructureKHR(device, m_VolumeBLAS.handle, nullptr);
+    }
+    m_VolumeBLAS.buffer.Shutdown();
+    m_VolumeAABBBuffer.Shutdown();
     
     if (m_TLAS.handle != VK_NULL_HANDLE && vkDestroyAccelerationStructureKHR) {
         vkDestroyAccelerationStructureKHR(device, m_TLAS.handle, nullptr);
@@ -114,6 +122,8 @@ void TracerRayKHR::Shutdown() {
     m_IndexBuffer.Shutdown();
     m_PrimitiveMaterialBuffer.Shutdown();
     m_MaterialBuffer.Shutdown();
+    m_LightBuffer.Shutdown();
+    m_VolumeBuffer.Shutdown();
     m_SBTBuffer.Shutdown();
     m_CameraBuffer.Shutdown();
     
@@ -150,6 +160,14 @@ void TracerRayKHR::Shutdown() {
     if (m_ShadowClosestHitShader != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, m_ShadowClosestHitShader, nullptr);
         m_ShadowClosestHitShader = VK_NULL_HANDLE;
+    }
+    if (m_VolumeIntersectionShader != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, m_VolumeIntersectionShader, nullptr);
+        m_VolumeIntersectionShader = VK_NULL_HANDLE;
+    }
+    if (m_VolumeClosestHitShader != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, m_VolumeClosestHitShader, nullptr);
+        m_VolumeClosestHitShader = VK_NULL_HANDLE;
     }
     
     // Destroy descriptor resources
@@ -203,8 +221,11 @@ bool TracerRayKHR::CreateRayTracingPipeline() {
     m_ClosestHitShader = PipelineBuilder::LoadShaderModule(device, "shaders/rt_closesthit.rchit.spv");
     m_ShadowMissShader = PipelineBuilder::LoadShaderModule(device, "shaders/rt_shadow_miss.rmiss.spv");
     m_ShadowClosestHitShader = PipelineBuilder::LoadShaderModule(device, "shaders/rt_shadow.rchit.spv");
+    m_VolumeIntersectionShader = PipelineBuilder::LoadShaderModule(device, "shaders/rt_volume.rint.spv");
+    m_VolumeClosestHitShader = PipelineBuilder::LoadShaderModule(device, "shaders/rt_volume.rchit.spv");
     
-    if (!m_RaygenShader || !m_MissShader || !m_ClosestHitShader || !m_ShadowMissShader || !m_ShadowClosestHitShader) {
+    if (!m_RaygenShader || !m_MissShader || !m_ClosestHitShader || !m_ShadowMissShader || !m_ShadowClosestHitShader ||
+        !m_VolumeIntersectionShader || !m_VolumeClosestHitShader) {
         LUCENT_CORE_ERROR("TracerRayKHR: Failed to load ray tracing shaders");
         return false;
     }
@@ -228,7 +249,7 @@ bool TracerRayKHR::CreateRayTracingPipeline() {
     }
     
     // Shader stages
-    VkPipelineShaderStageCreateInfo stages[5] = {};
+    VkPipelineShaderStageCreateInfo stages[7] = {};
     
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
@@ -254,9 +275,21 @@ bool TracerRayKHR::CreateRayTracingPipeline() {
     stages[4].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
     stages[4].module = m_ShadowClosestHitShader;
     stages[4].pName = "main";
+
+    // Volume intersection
+    stages[5].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[5].stage = VK_SHADER_STAGE_INTERSECTION_BIT_KHR;
+    stages[5].module = m_VolumeIntersectionShader;
+    stages[5].pName = "main";
+
+    // Volume closest hit
+    stages[6].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[6].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+    stages[6].module = m_VolumeClosestHitShader;
+    stages[6].pName = "main";
     
     // Shader groups
-    VkRayTracingShaderGroupCreateInfoKHR groups[5] = {};
+    VkRayTracingShaderGroupCreateInfoKHR groups[6] = {};
     
     // Raygen group
     groups[0].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
@@ -297,13 +330,21 @@ bool TracerRayKHR::CreateRayTracingPipeline() {
     groups[4].closestHitShader = 4;
     groups[4].anyHitShader = VK_SHADER_UNUSED_KHR;
     groups[4].intersectionShader = VK_SHADER_UNUSED_KHR;
+
+    // Volume procedural hit group (primary rays only)
+    groups[5].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+    groups[5].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR;
+    groups[5].generalShader = VK_SHADER_UNUSED_KHR;
+    groups[5].closestHitShader = 6;
+    groups[5].anyHitShader = VK_SHADER_UNUSED_KHR;
+    groups[5].intersectionShader = 5;
     
     // Create ray tracing pipeline
     VkRayTracingPipelineCreateInfoKHR pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
-    pipelineInfo.stageCount = 5;
+    pipelineInfo.stageCount = 7;
     pipelineInfo.pStages = stages;
-    pipelineInfo.groupCount = 5;
+    pipelineInfo.groupCount = 6;
     pipelineInfo.pGroups = groups;
     // Need recursion for shadow rays from closest-hit
     uint32_t maxDepth = m_Context->GetDeviceFeatures().maxRayRecursionDepth;
@@ -329,8 +370,8 @@ bool TracerRayKHR::CreateShaderBindingTable() {
     uint32_t handleAlignment = features.shaderGroupBaseAlignment;
     uint32_t alignedHandleSize = (handleSize + handleAlignment - 1) & ~(handleAlignment - 1);
     
-    // raygen (1) + miss (2 ray types) + hit (2 ray types)
-    uint32_t groupCount = 5;
+    // raygen (1) + miss (2 ray types) + hit (3 hit groups: triangle, shadow, volume)
+    uint32_t groupCount = 6;
     uint32_t sbtSize = groupCount * alignedHandleSize;
     
     // Get shader group handles
@@ -376,7 +417,7 @@ bool TracerRayKHR::CreateShaderBindingTable() {
     
     m_HitRegion.deviceAddress = sbtAddress + 3 * alignedHandleSize;
     m_HitRegion.stride = alignedHandleSize;
-    m_HitRegion.size = 2 * alignedHandleSize;
+    m_HitRegion.size = 3 * alignedHandleSize;
     
     m_CallableRegion = {};
     
@@ -660,22 +701,38 @@ bool TracerRayKHR::BuildTLAS() {
     VkDevice device = m_Context->GetDevice();
     
     // Create instance data
-    VkAccelerationStructureInstanceKHR instance{};
+    std::vector<VkAccelerationStructureInstanceKHR> instances;
+    instances.reserve(2);
     
-    // Identity transform
-    instance.transform.matrix[0][0] = 1.0f;
-    instance.transform.matrix[1][1] = 1.0f;
-    instance.transform.matrix[2][2] = 1.0f;
+    // Instance 0: triangle BLAS (surface)
+    VkAccelerationStructureInstanceKHR triInstance{};
+    triInstance.transform.matrix[0][0] = 1.0f;
+    triInstance.transform.matrix[1][1] = 1.0f;
+    triInstance.transform.matrix[2][2] = 1.0f;
+    triInstance.instanceCustomIndex = 0;
+    triInstance.mask = 0x01; // surface mask
+    triInstance.instanceShaderBindingTableRecordOffset = 0; // hit group base for triangles
+    triInstance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    triInstance.accelerationStructureReference = m_BLAS.deviceAddress;
+    instances.push_back(triInstance);
     
-    instance.instanceCustomIndex = 0;
-    instance.mask = 0xFF;
-    instance.instanceShaderBindingTableRecordOffset = 0;
-    instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-    instance.accelerationStructureReference = m_BLAS.deviceAddress;
+    // Instance 1 (optional): volume BLAS (procedural AABBs)
+    if (m_VolumeBLAS.handle != VK_NULL_HANDLE && m_VolumeBLAS.deviceAddress != 0 && m_VolumeCount > 0) {
+        VkAccelerationStructureInstanceKHR volInstance{};
+        volInstance.transform.matrix[0][0] = 1.0f;
+        volInstance.transform.matrix[1][1] = 1.0f;
+        volInstance.transform.matrix[2][2] = 1.0f;
+        volInstance.instanceCustomIndex = 0;
+        volInstance.mask = 0x02; // volume mask
+        volInstance.instanceShaderBindingTableRecordOffset = 1; // selects the volume hit group (see raygen stride=2)
+        volInstance.flags = 0;
+        volInstance.accelerationStructureReference = m_VolumeBLAS.deviceAddress;
+        instances.push_back(volInstance);
+    }
     
     // Create instance buffer
     BufferDesc instDesc{};
-    instDesc.size = sizeof(VkAccelerationStructureInstanceKHR);
+    instDesc.size = sizeof(VkAccelerationStructureInstanceKHR) * instances.size();
     instDesc.usage = BufferUsage::AccelerationStructure;
     instDesc.hostVisible = true;
     instDesc.deviceAddress = true;
@@ -686,7 +743,7 @@ bool TracerRayKHR::BuildTLAS() {
         LUCENT_CORE_ERROR("TracerRayKHR: Failed to create instance buffer");
         return false;
     }
-    m_TLAS.instanceBuffer.Upload(&instance, sizeof(instance));
+    m_TLAS.instanceBuffer.Upload(instances.data(), instDesc.size);
     
     // Geometry description
     VkAccelerationStructureGeometryKHR geometry{};
@@ -706,7 +763,7 @@ bool TracerRayKHR::BuildTLAS() {
     buildInfo.pGeometries = &geometry;
     
     // Get build sizes
-    uint32_t instanceCount = 1;
+    uint32_t instanceCount = static_cast<uint32_t>(instances.size());
     VkAccelerationStructureBuildSizesInfoKHR sizeInfo{};
     sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
     vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
@@ -747,7 +804,7 @@ bool TracerRayKHR::BuildTLAS() {
     addressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
     addressInfo.accelerationStructure = m_TLAS.handle;
     m_TLAS.deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(device, &addressInfo);
-    m_TLAS.instanceCount = 1;
+    m_TLAS.instanceCount = instanceCount;
     
     // Create scratch buffer
     BufferDesc scratchDesc{};
@@ -769,7 +826,7 @@ bool TracerRayKHR::BuildTLAS() {
     buildInfo.scratchData.deviceAddress = scratchBuffer.GetDeviceAddress();
     
     VkAccelerationStructureBuildRangeInfoKHR rangeInfo{};
-    rangeInfo.primitiveCount = 1;
+    rangeInfo.primitiveCount = instanceCount;
     rangeInfo.primitiveOffset = 0;
     rangeInfo.firstVertex = 0;
     rangeInfo.transformOffset = 0;
@@ -786,14 +843,158 @@ bool TracerRayKHR::BuildTLAS() {
     return true;
 }
 
+bool TracerRayKHR::BuildVolumeBLAS(const std::vector<GPUVolume>& volumes) {
+    // Build a procedural BLAS consisting of AABBs, one per volume.
+    if (volumes.empty()) {
+        // Destroy any existing volume BLAS
+        VkDevice device = m_Context->GetDevice();
+        if (m_VolumeBLAS.handle != VK_NULL_HANDLE && vkDestroyAccelerationStructureKHR) {
+            vkDestroyAccelerationStructureKHR(device, m_VolumeBLAS.handle, nullptr);
+            m_VolumeBLAS.handle = VK_NULL_HANDLE;
+        }
+        m_VolumeBLAS.buffer.Shutdown();
+        m_VolumeAABBBuffer.Shutdown();
+        m_VolumeBLAS.deviceAddress = 0;
+        return true;
+    }
+    
+    // Wait for GPU to finish using old buffers before rebuilding
+    m_Context->WaitIdle();
+    
+    VkDevice device = m_Context->GetDevice();
+    
+    // Pack AABBs from volume data (world-space AABB, since tracer triangles are world-space)
+    std::vector<VkAabbPositionsKHR> aabbs;
+    aabbs.reserve(volumes.size());
+    for (const auto& v : volumes) {
+        VkAabbPositionsKHR aabb{};
+        aabb.minX = v.aabbMin.x; aabb.minY = v.aabbMin.y; aabb.minZ = v.aabbMin.z;
+        aabb.maxX = v.aabbMax.x; aabb.maxY = v.aabbMax.y; aabb.maxZ = v.aabbMax.z;
+        aabbs.push_back(aabb);
+    }
+    
+    // Upload AABB buffer (device address required for AS build)
+    m_VolumeAABBBuffer.Shutdown();
+    BufferDesc aabbDesc{};
+    aabbDesc.size = aabbs.size() * sizeof(VkAabbPositionsKHR);
+    aabbDesc.usage = BufferUsage::AccelerationStructure;
+    aabbDesc.hostVisible = true;
+    aabbDesc.deviceAddress = true;
+    aabbDesc.debugName = "VolumeAABBs";
+    if (!m_VolumeAABBBuffer.Init(m_Device, aabbDesc)) {
+        LUCENT_CORE_ERROR("TracerRayKHR: Failed to create volume AABB buffer");
+        return false;
+    }
+    m_VolumeAABBBuffer.Upload(aabbs.data(), aabbDesc.size);
+    
+    // Geometry: AABBs
+    VkAccelerationStructureGeometryKHR geometry{};
+    geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    geometry.geometryType = VK_GEOMETRY_TYPE_AABBS_KHR;
+    geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    geometry.geometry.aabbs.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR;
+    geometry.geometry.aabbs.data.deviceAddress = m_VolumeAABBBuffer.GetDeviceAddress();
+    geometry.geometry.aabbs.stride = sizeof(VkAabbPositionsKHR);
+    
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+    buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    buildInfo.geometryCount = 1;
+    buildInfo.pGeometries = &geometry;
+    
+    const uint32_t primitiveCount = static_cast<uint32_t>(aabbs.size());
+    VkAccelerationStructureBuildSizesInfoKHR sizeInfo{};
+    sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                                             &buildInfo, &primitiveCount, &sizeInfo);
+    
+    // Create AS buffer
+    m_VolumeBLAS.buffer.Shutdown();
+    BufferDesc asDesc{};
+    asDesc.size = sizeInfo.accelerationStructureSize;
+    asDesc.usage = BufferUsage::AccelerationStructure;
+    asDesc.hostVisible = false;
+    asDesc.deviceAddress = true;
+    asDesc.debugName = "VolumeBLAS";
+    if (!m_VolumeBLAS.buffer.Init(m_Device, asDesc)) {
+        LUCENT_CORE_ERROR("TracerRayKHR: Failed to create volume BLAS buffer");
+        return false;
+    }
+    
+    // Create AS
+    VkAccelerationStructureCreateInfoKHR createInfo{};
+    createInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+    createInfo.buffer = m_VolumeBLAS.buffer.GetHandle();
+    createInfo.size = sizeInfo.accelerationStructureSize;
+    createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    
+    if (m_VolumeBLAS.handle != VK_NULL_HANDLE) {
+        vkDestroyAccelerationStructureKHR(device, m_VolumeBLAS.handle, nullptr);
+        m_VolumeBLAS.handle = VK_NULL_HANDLE;
+    }
+    
+    if (vkCreateAccelerationStructureKHR(device, &createInfo, nullptr, &m_VolumeBLAS.handle) != VK_SUCCESS) {
+        LUCENT_CORE_ERROR("TracerRayKHR: Failed to create volume BLAS");
+        return false;
+    }
+    
+    // Scratch buffer
+    BufferDesc scratchDesc{};
+    scratchDesc.size = sizeInfo.buildScratchSize;
+    scratchDesc.usage = BufferUsage::Storage;
+    scratchDesc.hostVisible = false;
+    scratchDesc.deviceAddress = true;
+    scratchDesc.debugName = "VolumeBLASScratch";
+    
+    Buffer scratch;
+    if (!scratch.Init(m_Device, scratchDesc)) {
+        LUCENT_CORE_ERROR("TracerRayKHR: Failed to create volume BLAS scratch buffer");
+        return false;
+    }
+    
+    buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    buildInfo.dstAccelerationStructure = m_VolumeBLAS.handle;
+    buildInfo.scratchData.deviceAddress = scratch.GetDeviceAddress();
+    
+    VkAccelerationStructureBuildRangeInfoKHR range{};
+    range.primitiveCount = primitiveCount;
+    range.primitiveOffset = 0;
+    range.firstVertex = 0;
+    range.transformOffset = 0;
+    const VkAccelerationStructureBuildRangeInfoKHR* pRange = &range;
+    
+    VkCommandBuffer cmd = m_Device->BeginSingleTimeCommands();
+    vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, &pRange);
+    m_Device->EndSingleTimeCommands(cmd);
+    
+    scratch.Shutdown();
+    
+    VkAccelerationStructureDeviceAddressInfoKHR addrInfo{};
+    addrInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+    addrInfo.accelerationStructure = m_VolumeBLAS.handle;
+    m_VolumeBLAS.deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(device, &addrInfo);
+    m_VolumeBLAS.triangleCount = primitiveCount;
+    
+    LUCENT_CORE_INFO("TracerRayKHR: Volume BLAS built: {} AABBs", primitiveCount);
+    return true;
+}
+
 void TracerRayKHR::UpdateScene(const std::vector<BVHBuilder::Triangle>& triangles,
                                 const std::vector<GPUMaterial>& materials,
-                                const std::vector<GPULight>& lights) {
+                                const std::vector<GPULight>& lights,
+                                const std::vector<GPUVolume>& volumes) {
     if (!m_Supported || triangles.empty()) return;
     
     // Build acceleration structures
     if (!BuildBLAS(triangles)) {
         LUCENT_CORE_ERROR("TracerRayKHR: Failed to build BLAS");
+        return;
+    }
+
+    // Build procedural volume BLAS (optional)
+    if (!BuildVolumeBLAS(volumes)) {
+        LUCENT_CORE_ERROR("TracerRayKHR: Failed to build volume BLAS");
         return;
     }
     
@@ -849,6 +1050,30 @@ void TracerRayKHR::UpdateScene(const std::vector<BVHBuilder::Triangle>& triangle
         }
     }
     
+    // Upload volume data
+    m_VolumeBuffer.Shutdown();
+    size_t volumeSize = std::max(volumes.size(), size_t(1)) * sizeof(GPUVolume);
+    BufferDesc volumeDesc{};
+    volumeDesc.size = volumeSize;
+    volumeDesc.usage = BufferUsage::Storage;
+    volumeDesc.hostVisible = true;
+    volumeDesc.debugName = "RTVolumes";
+    
+    if (m_VolumeBuffer.Init(m_Device, volumeDesc)) {
+        if (!volumes.empty()) {
+            m_VolumeBuffer.Upload(volumes.data(), volumes.size() * sizeof(GPUVolume));
+            m_VolumeCount = static_cast<uint32_t>(volumes.size());
+        } else {
+            // Dummy volume
+            GPUVolume dummyVolume{};
+            dummyVolume.transform = glm::mat4(1.0f);
+            dummyVolume.scatterColor = glm::vec3(0.0f);
+            dummyVolume.density = 0.0f;
+            m_VolumeBuffer.Upload(&dummyVolume, sizeof(GPUVolume));
+            m_VolumeCount = 0;
+        }
+    }
+    
     m_DescriptorsDirty = true;
     
     // Create pipeline and SBT if not done yet
@@ -859,7 +1084,7 @@ void TracerRayKHR::UpdateScene(const std::vector<BVHBuilder::Triangle>& triangle
     }
     
     m_Ready = true;
-    LUCENT_CORE_INFO("TracerRayKHR: Scene updated with {} lights", m_LightCount);
+    LUCENT_CORE_INFO("TracerRayKHR: Scene updated with {} lights, {} volumes", m_LightCount, m_VolumeCount);
 }
 
 void TracerRayKHR::UpdateLights(const std::vector<GPULight>& lights) {
@@ -968,6 +1193,11 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
         lightInfo.offset = 0;
         lightInfo.range = m_LightBuffer.GetSize();
 
+        VkDescriptorBufferInfo volumeInfo{};
+        volumeInfo.buffer = m_VolumeBuffer.GetHandle();
+        volumeInfo.offset = 0;
+        volumeInfo.range = m_VolumeBuffer.GetSize();
+
         // Environment map textures
         VkDescriptorImageInfo envMapInfo{};
         VkDescriptorImageInfo envMarginalInfo{};
@@ -987,7 +1217,7 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
             envConditionalInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
 
-        VkWriteDescriptorSet writes[13] = {};
+        VkWriteDescriptorSet writes[14] = {};
 
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].pNext = &asWrite;
@@ -1059,32 +1289,39 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
         writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[9].pBufferInfo = &lightInfo;
 
-        uint32_t writeCount = 10;
+        writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[10].dstSet = m_DescriptorSet;
+        writes[10].dstBinding = 13;
+        writes[10].descriptorCount = 1;
+        writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[10].pBufferInfo = &volumeInfo;
+
+        uint32_t writeCount = 11;
         
         // Environment map writes - only add if we have valid views
         if (m_EnvMap && m_EnvMap->IsLoaded()) {
-            writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[10].dstSet = m_DescriptorSet;
-            writes[10].dstBinding = 10;
-            writes[10].descriptorCount = 1;
-            writes[10].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes[10].pImageInfo = &envMapInfo;
-            
             writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[11].dstSet = m_DescriptorSet;
-            writes[11].dstBinding = 11;
+            writes[11].dstBinding = 10;
             writes[11].descriptorCount = 1;
             writes[11].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes[11].pImageInfo = &envMarginalInfo;
+            writes[11].pImageInfo = &envMapInfo;
             
             writes[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[12].dstSet = m_DescriptorSet;
-            writes[12].dstBinding = 12;
+            writes[12].dstBinding = 11;
             writes[12].descriptorCount = 1;
             writes[12].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes[12].pImageInfo = &envConditionalInfo;
+            writes[12].pImageInfo = &envMarginalInfo;
             
-            writeCount = 13;
+            writes[13].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[13].dstSet = m_DescriptorSet;
+            writes[13].dstBinding = 12;
+            writes[13].descriptorCount = 1;
+            writes[13].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[13].pImageInfo = &envConditionalInfo;
+            
+            writeCount = 14;
         }
 
         vkUpdateDescriptorSets(device, writeCount, writes, 0, nullptr);
@@ -1106,6 +1343,7 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
     pc.envIntensity = settings.envIntensity;
     pc.envRotation = settings.envRotation;
     pc.useEnvMap = (m_EnvMap && m_EnvMap->IsLoaded() && settings.useEnvMap) ? 1 : 0;
+    pc.volumeCount = m_VolumeCount;
     
     vkCmdPushConstants(cmd, m_PipelineLayout, 
                         VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR,

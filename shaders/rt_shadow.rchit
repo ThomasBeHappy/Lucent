@@ -16,6 +16,11 @@ struct RayPayload {
     vec3 emissive;
     float metallic;
     float roughness;
+    // Volume payload (only valid for volume hits)
+    bool volumeHit;
+    vec3 volumeColor;   // premultiplied
+    float volumeAlpha;
+    vec3 volumeExitPos;
 };
 
 layout(location = 0) rayPayloadInEXT RayPayload payload;
@@ -23,5 +28,6 @@ layout(location = 0) rayPayloadInEXT RayPayload payload;
 void main() {
     // Shadow ray hit - light is occluded
     payload.radiance = vec3(0.0);
+    payload.volumeHit = false;
 }
 

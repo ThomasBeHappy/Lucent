@@ -13,6 +13,8 @@ void MaterialGraph::Clear() {
     m_Links.clear();
     m_TextureSlots.clear();
     m_OutputNodeId = INVALID_NODE_ID;
+    m_VolumeOutputNodeId = INVALID_NODE_ID;
+    m_Domain = MaterialDomain::Surface;
     m_NextId = 1;
 }
 
@@ -61,6 +63,16 @@ void MaterialGraph::CreateDefault() {
 }
 
 NodeID MaterialGraph::CreateNode(NodeType type, const glm::vec2& position) {
+    // Prevent duplicate output nodes
+    if (type == NodeType::PBROutput && m_OutputNodeId != INVALID_NODE_ID) {
+        LUCENT_CORE_WARN("Cannot create duplicate PBR Output node");
+        return INVALID_NODE_ID;
+    }
+    if (type == NodeType::VolumetricOutput && m_VolumeOutputNodeId != INVALID_NODE_ID) {
+        LUCENT_CORE_WARN("Cannot create duplicate Volumetric Output node");
+        return INVALID_NODE_ID;
+    }
+    
     NodeID id = AllocateId();
     
     MaterialNode node;
@@ -107,6 +119,17 @@ NodeID MaterialGraph::CreateNode(NodeType type, const glm::vec2& position) {
     
     m_Nodes[id] = node;
     SetupNodePins(m_Nodes[id]);
+    
+    // Track output nodes
+    if (type == NodeType::PBROutput) {
+        m_OutputNodeId = id;
+    } else if (type == NodeType::VolumetricOutput) {
+        m_VolumeOutputNodeId = id;
+        // If this is the first output node, switch to volume domain
+        if (m_OutputNodeId == INVALID_NODE_ID) {
+            m_Domain = MaterialDomain::Volume;
+        }
+    }
     
     return id;
 }
@@ -300,6 +323,16 @@ void MaterialGraph::SetupNodePins(MaterialNode& node) {
             addInput("Emissive", PinType::Vec3, glm::vec3(0.0f));
             addInput("Alpha", PinType::Float, 1.0f);
             break;
+            
+        // Volumetric Output (Blender-like ports)
+        case NodeType::VolumetricOutput:
+            addInput("Color", PinType::Vec3, glm::vec3(0.8f, 0.8f, 0.8f));      // Scattering color
+            addInput("Density", PinType::Float, 1.0f);                           // Volume density
+            addInput("Anisotropy", PinType::Float, 0.0f);                        // Phase function g (-1 to 1)
+            addInput("Absorption", PinType::Vec3, glm::vec3(0.0f));              // Absorption color
+            addInput("Emission", PinType::Vec3, glm::vec3(0.0f));                // Volume emission
+            addInput("Emission Strength", PinType::Float, 1.0f);                 // Emission multiplier
+            break;
     }
 }
 
@@ -307,9 +340,13 @@ void MaterialGraph::DeleteNode(NodeID nodeId) {
     auto it = m_Nodes.find(nodeId);
     if (it == m_Nodes.end()) return;
     
-    // Don't allow deleting the output node
+    // Don't allow deleting output nodes
     if (nodeId == m_OutputNodeId) {
-        LUCENT_CORE_WARN("Cannot delete the output node");
+        LUCENT_CORE_WARN("Cannot delete the PBR Output node");
+        return;
+    }
+    if (nodeId == m_VolumeOutputNodeId) {
+        LUCENT_CORE_WARN("Cannot delete the Volumetric Output node");
         return;
     }
     

@@ -49,6 +49,21 @@ struct GPUMaterial {
     uint32_t flags;            // Various material flags
 };
 
+// Volume instance for GPU (includes world-space bounds for V1)
+struct GPUVolume {
+    glm::mat4 transform;       // World to local space (inverse model) - optional, V1 may use world AABB
+    glm::vec3 scatterColor;    // Scattering color
+    float density;             // Volume density
+    glm::vec3 absorption;      // Absorption coefficient
+    float anisotropy;          // Phase function anisotropy (-1 to 1)
+    glm::vec3 emission;        // Volume emission color
+    float emissionStrength;    // Emission multiplier
+    glm::vec3 aabbMin;         // World-space bounds (V1)
+    float pad0;
+    glm::vec3 aabbMax;         // World-space bounds (V1)
+    float pad1;
+};
+
 // Camera for GPU
 struct GPUCamera {
     glm::mat4 invView;
@@ -100,6 +115,10 @@ struct TracerPushConstants {
     float envIntensity;
     float envRotation;
     uint32_t useEnvMap;
+    uint32_t volumeCount;  // Number of volume instances
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
 };
 
 // Scene data for GPU
@@ -110,6 +129,7 @@ struct SceneGPU {
     Buffer instanceBuffer;
     Buffer materialBuffer;
     Buffer lightBuffer;
+    Buffer volumeBuffer;  // Volume instances
     
     // Counts
     uint32_t triangleCount = 0;
@@ -117,6 +137,7 @@ struct SceneGPU {
     uint32_t instanceCount = 0;
     uint32_t materialCount = 0;
     uint32_t lightCount = 0;
+    uint32_t volumeCount = 0;
     
     bool valid = false;
 };
@@ -157,7 +178,8 @@ public:
     // Update scene with pre-built triangle data
     void UpdateScene(const std::vector<BVHBuilder::Triangle>& triangles,
                      const std::vector<GPUMaterial>& materials,
-                     const std::vector<GPULight>& lights = {});
+                     const std::vector<GPULight>& lights = {},
+                     const std::vector<GPUVolume>& volumes = {});
     
     // Set environment map for IBL
     void SetEnvironmentMap(EnvironmentMap* envMap);

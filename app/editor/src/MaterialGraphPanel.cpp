@@ -499,6 +499,47 @@ void MaterialGraphPanel::DrawToolbar() {
             ImGui::SameLine();
             ImGui::TextColored(ThemeWarning(), "(unsaved)");
         }
+        
+        // Domain selector (Surface vs Volume)
+        material::MaterialGraph& graph = m_Material->GetGraph();
+        bool hasPBR = graph.HasPBROutput();
+        bool hasVolume = graph.HasVolumeOutput();
+        
+        if (hasPBR || hasVolume) {
+            ImGui::SameLine();
+            ImGui::Spacing();
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            ImGui::Text("Domain:");
+            ImGui::SameLine();
+            
+            material::MaterialDomain currentDomain = graph.GetDomain();
+            
+            // Radio buttons for domain selection
+            if (hasPBR) {
+                bool isSurface = (currentDomain == material::MaterialDomain::Surface);
+                if (ImGui::RadioButton("Surface", isSurface)) {
+                    graph.SetDomain(material::MaterialDomain::Surface);
+                    m_Material->MarkDirty();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Uses PBR Output node for surface materials");
+                }
+            }
+            
+            if (hasVolume) {
+                if (hasPBR) ImGui::SameLine();
+                bool isVolume = (currentDomain == material::MaterialDomain::Volume);
+                if (ImGui::RadioButton("Volume", isVolume)) {
+                    graph.SetDomain(material::MaterialDomain::Volume);
+                    m_Material->MarkDirty();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Uses Volume Output node for volumetric materials");
+                }
+            }
+        }
     } else {
         ImGui::Text("No material selected");
         ImGui::SameLine();
@@ -1136,6 +1177,35 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
             }
             break;
         }
+        case material::NodeType::VolumetricOutput: {
+            // Visual indicator for volume output
+            ImGui::TextDisabled("Volumetric Domain");
+            
+            // Show domain status
+            bool volIsActive = (graph.GetDomain() == material::MaterialDomain::Volume);
+            if (volIsActive) {
+                ImGui::TextColored(ThemeSuccess(), "[ACTIVE]");
+            } else {
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(inactive)");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Switch to Volume domain in toolbar to use this output");
+                }
+            }
+            break;
+        }
+        case material::NodeType::PBROutput: {
+            // Visual indicator for PBR output
+            bool pbrIsActive = (graph.GetDomain() == material::MaterialDomain::Surface);
+            if (pbrIsActive) {
+                ImGui::TextColored(ThemeSuccess(), "[ACTIVE]");
+            } else if (graph.HasVolumeOutput()) {
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(inactive)");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Switch to Surface domain in toolbar to use this output");
+                }
+            }
+            break;
+        }
         default:
             break;
     }
@@ -1309,6 +1379,21 @@ void MaterialGraphPanel::DrawNodeCreationMenu() {
         addNodeMenuItem("Separate RGBA", material::NodeType::SeparateVec4);
         addNodeMenuItem("Combine RGB", material::NodeType::CombineVec3);
         addNodeMenuItem("Combine RGBA", material::NodeType::CombineVec4);
+        ImGui::EndMenu();
+    }
+    
+    if (ImGui::BeginMenu("Output")) {
+        // Only show options for outputs that don't exist yet
+        if (!m_Material->GetGraph().HasPBROutput()) {
+            addNodeMenuItem("PBR Output", material::NodeType::PBROutput);
+        } else {
+            ImGui::TextDisabled("PBR Output (exists)");
+        }
+        if (!m_Material->GetGraph().HasVolumeOutput()) {
+            addNodeMenuItem("Volume Output", material::NodeType::VolumetricOutput);
+        } else {
+            ImGui::TextDisabled("Volume Output (exists)");
+        }
         ImGui::EndMenu();
     }
 }
