@@ -1096,6 +1096,9 @@ void Application::RenderFrame() {
         // Transition swapchain to present (only needed for Vulkan 1.3 path)
         m_Renderer.TransitionSwapchainToPresent(cmd);
     }
+
+    // Render ImGui platform windows after the main swapchain pass.
+    m_EditorUI.RenderPlatformWindows();
     
     m_Renderer.EndFrame();
 

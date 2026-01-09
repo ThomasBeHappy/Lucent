@@ -183,6 +183,9 @@ bool EditorUI::Init(GLFWwindow* window, gfx::VulkanContext* context, gfx::Device
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    io.ConfigViewportsNoAutoMerge = true;
+    io.ConfigViewportsNoTaskBarIcon = true;
     
     // Disable the ID conflict popup in debug builds (we log instead)
     // This is available in ImGui 1.91+
@@ -215,10 +218,10 @@ bool EditorUI::Init(GLFWwindow* window, gfx::VulkanContext* context, gfx::Device
     VkFormat swapchainFormat = renderer->GetSwapchain()->GetFormat();
     
     if (useDynamicRendering) {
-    initInfo.UseDynamicRendering = true;
-    initInfo.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    initInfo.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
-    initInfo.PipelineRenderingCreateInfo.pColorAttachmentFormats = &swapchainFormat;
+        initInfo.UseDynamicRendering = true;
+        initInfo.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+        initInfo.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
+        initInfo.PipelineRenderingCreateInfo.pColorAttachmentFormats = &swapchainFormat;
     } else {
         initInfo.UseDynamicRendering = false;
         initInfo.RenderPass = renderer->GetSwapchainRenderPass();
@@ -326,17 +329,17 @@ void EditorUI::SetupStyle() {
     const ImVec4 text_normal  = ImVec4(0.78f, 0.78f, 0.80f, 1.0f);
     const ImVec4 text_dim     = ImVec4(0.50f, 0.50f, 0.55f, 1.0f);
     
-    // Accent color - Subtle blue (used across selection, highlights, and UI affordances)
-    const ImVec4 accent       = ImVec4(0.31f, 0.64f, 0.98f, 1.0f);     // ~#4FA3FA
-    const ImVec4 accent_hover = ImVec4(0.39f, 0.71f, 1.00f, 1.0f);
-    const ImVec4 accent_dim   = ImVec4(0.22f, 0.46f, 0.74f, 1.0f);
+    // Accent color - Vibrant blue with gentle hover
+    const ImVec4 accent       = ImVec4(0.30f, 0.62f, 0.98f, 1.0f);     // ~#4D9EFF
+    const ImVec4 accent_hover = ImVec4(0.40f, 0.70f, 1.00f, 1.0f);
+    const ImVec4 accent_dim   = ImVec4(0.22f, 0.45f, 0.74f, 1.0f);
     
     // Secondary accent - Warm amber for warnings/attention
     const ImVec4 highlight    = ThemeWarning();     // ~#F2B247
     
     // Backgrounds
     colors[ImGuiCol_WindowBg]             = bg_main;
-    colors[ImGuiCol_ChildBg]              = WithAlpha(bg_dark, 0.55f);
+    colors[ImGuiCol_ChildBg]              = WithAlpha(bg_dark, 0.70f);
     colors[ImGuiCol_PopupBg]              = WithAlpha(bg_light, 0.98f);
     colors[ImGuiCol_Border]               = WithAlpha(border, 0.75f);
     colors[ImGuiCol_BorderShadow]         = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -351,18 +354,18 @@ void EditorUI::SetupStyle() {
     colors[ImGuiCol_HeaderActive]         = WithAlpha(accent, 0.26f);
     
     // Buttons
-    colors[ImGuiCol_Button]               = bg_lighter;
-    colors[ImGuiCol_ButtonHovered]        = WithAlpha(accent, 0.22f);
-    colors[ImGuiCol_ButtonActive]         = WithAlpha(accent, 0.32f);
+    colors[ImGuiCol_Button]               = WithAlpha(bg_lighter, 0.92f);
+    colors[ImGuiCol_ButtonHovered]        = WithAlpha(accent, 0.24f);
+    colors[ImGuiCol_ButtonActive]         = WithAlpha(accent, 0.36f);
     
     // Frame backgrounds (input fields, checkboxes)
-    colors[ImGuiCol_FrameBg]              = bg_dark;
-    colors[ImGuiCol_FrameBgHovered]       = bg_light;
-    colors[ImGuiCol_FrameBgActive]        = WithAlpha(accent, 0.14f);
+    colors[ImGuiCol_FrameBg]              = WithAlpha(bg_dark, 0.92f);
+    colors[ImGuiCol_FrameBgHovered]       = WithAlpha(bg_light, 0.92f);
+    colors[ImGuiCol_FrameBgActive]        = WithAlpha(accent, 0.16f);
     
     // Tabs
     colors[ImGuiCol_Tab]                  = bg_light;
-    colors[ImGuiCol_TabHovered]           = WithAlpha(accent, 0.28f);
+    colors[ImGuiCol_TabHovered]           = WithAlpha(accent, 0.32f);
     colors[ImGuiCol_TabActive]            = bg_lighter;
     colors[ImGuiCol_TabUnfocused]         = bg_dark;
     colors[ImGuiCol_TabUnfocusedActive]   = bg_light;
@@ -400,7 +403,7 @@ void EditorUI::SetupStyle() {
     colors[ImGuiCol_DockingEmptyBg]       = bg_main;
     
     // Menu bar
-    colors[ImGuiCol_MenuBarBg]            = bg_main;
+    colors[ImGuiCol_MenuBarBg]            = WithAlpha(bg_main, 0.95f);
     
     // Tables
     colors[ImGuiCol_TableHeaderBg]        = bg_lighter;
@@ -434,29 +437,29 @@ void EditorUI::SetupStyle() {
     // ========================================================================
     
     // Rounding - subtle (modern flat, not boxy)
-    style.WindowRounding    = 4.0f;
-    style.ChildRounding     = 4.0f;
-    style.FrameRounding     = 3.0f;
-    style.PopupRounding     = 4.0f;
-    style.ScrollbarRounding = 6.0f;
-    style.GrabRounding      = 3.0f;
-    style.TabRounding       = 3.0f;
+    style.WindowRounding    = 6.0f;
+    style.ChildRounding     = 6.0f;
+    style.FrameRounding     = 6.0f;
+    style.PopupRounding     = 6.0f;
+    style.ScrollbarRounding = 8.0f;
+    style.GrabRounding      = 6.0f;
+    style.TabRounding       = 6.0f;
     
     // Padding and spacing - slightly tighter (editor-friendly)
-    style.WindowPadding     = ImVec2(10, 10);
-    style.FramePadding      = ImVec2(8, 5);
-    style.CellPadding       = ImVec2(8, 4);
-    style.ItemSpacing       = ImVec2(8, 6);
-    style.ItemInnerSpacing  = ImVec2(6, 4);
+    style.WindowPadding     = ImVec2(12, 12);
+    style.FramePadding      = ImVec2(10, 6);
+    style.CellPadding       = ImVec2(10, 6);
+    style.ItemSpacing       = ImVec2(10, 8);
+    style.ItemInnerSpacing  = ImVec2(8, 6);
     style.TouchExtraPadding = ImVec2(0, 0);
     style.IndentSpacing     = 20.0f;
     style.ScrollbarSize     = 12.0f;
     style.GrabMinSize       = 12.0f;
     
     // Borders
-    style.WindowBorderSize  = 0.0f;
+    style.WindowBorderSize  = 1.0f;
     style.ChildBorderSize   = 0.0f;
-    style.PopupBorderSize   = 0.0f;
+    style.PopupBorderSize   = 1.0f;
     style.FrameBorderSize   = 1.0f;
     style.TabBorderSize     = 0.0f;
     
@@ -474,8 +477,13 @@ void EditorUI::SetupStyle() {
     style.AntiAliasedFill   = true;
     
     // Misc
-    style.WindowMinSize     = ImVec2(100, 100);
+    style.WindowMinSize     = ImVec2(120, 120);
     style.DisplaySafeAreaPadding = ImVec2(3, 3);
+
+    if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+        style.WindowRounding = 6.0f;
+        style.Colors[ImGuiCol_WindowBg].w = 1.0f;
+    }
 }
 
 void EditorUI::BeginFrame() {
@@ -508,17 +516,18 @@ void EditorUI::BeginFrame() {
 
 void EditorUI::EndFrame() {
     ImGui::Render();
-    
-    // Handle multi-viewport if enabled
+}
+
+void EditorUI::Render(VkCommandBuffer cmd) {
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
+}
+
+void EditorUI::RenderPlatformWindows() {
     ImGuiIO& io = ImGui::GetIO();
     if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
         ImGui::UpdatePlatformWindows();
         ImGui::RenderPlatformWindowsDefault();
     }
-}
-
-void EditorUI::Render(VkCommandBuffer cmd) {
-    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
 }
 
 void EditorUI::SetViewportTexture(VkImageView view, VkSampler sampler) {
@@ -2184,8 +2193,20 @@ void EditorUI::DrawContentBrowserPanel() {
     }
     
     // Toolbar
+    const float toolbarHeight = 54.0f;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 10.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 8.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, WithAlpha(ImGui::GetStyle().Colors[ImGuiCol_FrameBg], 0.65f));
+    ImGui::BeginChild("##ContentBrowserToolbar", ImVec2(0.0f, toolbarHeight), true,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     static char searchBuffer[256] = "";
-    ImGui::SetNextItemWidth(200);
+    ImGui::AlignTextToFramePadding();
+    if (m_IconFontLoaded) {
+        ImGui::TextUnformatted(LUCENT_ICON_SEARCH);
+        ImGui::SameLine();
+    }
+    ImGui::SetNextItemWidth(240);
     if (ImGui::InputTextWithHint("##search", "Search assets...", searchBuffer, sizeof(searchBuffer))) {
         m_ContentBrowserSearch = searchBuffer;
     }
@@ -2228,15 +2249,20 @@ void EditorUI::DrawContentBrowserPanel() {
     }
     
     ImGui::SameLine();
-    if (ImGui::Button("Reveal")) {
+    if (ImGui::Button(m_IconFontLoaded ? (LUCENT_ICON_OPEN " Reveal") : "Reveal")) {
         // Open in Windows Explorer
         ShellExecuteW(NULL, L"explore", m_ContentBrowserPath.wstring().c_str(), NULL, NULL, SW_SHOWNORMAL);
     }
-    
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(3);
+
     ImGui::Separator();
     
     // Breadcrumb navigation
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, WithAlpha(ThemeAccent(), 0.15f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, WithAlpha(ThemeAccent(), 0.25f));
     
     // Build path segments
     std::vector<std::filesystem::path> segments;
@@ -2249,7 +2275,7 @@ void EditorUI::DrawContentBrowserPanel() {
     }
     std::reverse(segments.begin(), segments.end());
     
-    if (ImGui::Button("Assets")) {
+    if (ImGui::Button(m_IconFontLoaded ? (LUCENT_ICON_FOLDER " Assets") : "Assets")) {
         m_ContentBrowserPath = assetsPath;
     }
     
@@ -2266,7 +2292,7 @@ void EditorUI::DrawContentBrowserPanel() {
         }
     }
     
-    ImGui::PopStyleColor();
+    ImGui::PopStyleColor(3);
     
     // Back button
     ImGui::SameLine();
@@ -2280,14 +2306,20 @@ void EditorUI::DrawContentBrowserPanel() {
     ImGui::Spacing();
     
     // Asset grid
-    float padding = 12.0f;
-    float thumbnailSize = 80.0f;
-    float cellSize = thumbnailSize + padding * 2;
+    float padding = 14.0f;
+    float thumbnailSize = 78.0f;
+    float cardWidth = thumbnailSize + 30.0f;
+    float cardHeight = thumbnailSize + 46.0f;
+    float cellSize = cardWidth + padding;
     float panelWidth = ImGui::GetContentRegionAvail().x;
     int columns = static_cast<int>(panelWidth / cellSize);
     if (columns < 1) columns = 1;
     
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(padding, padding));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0, 0, 0, 0));
     
     int itemIndex = 0;
     
@@ -2316,35 +2348,70 @@ void EditorUI::DrawContentBrowserPanel() {
             
             ImVec4 color;
             const char* icon;
+            const char* shortLabel;
             
             if (isDirectory) {
                 color = ThemeWarning();
-                icon = "[DIR]";
+                icon = m_IconFontLoaded ? LUCENT_ICON_FOLDER : "DIR";
+                shortLabel = "Folder";
             } else if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".hdr") {
                 color = ThemeAccent();
-                icon = "[TEX]";
+                icon = m_IconFontLoaded ? LUCENT_ICON_IMAGE : "TEX";
+                shortLabel = "Texture";
             } else if (ext == ".obj" || ext == ".fbx" || ext == ".gltf" || ext == ".glb") {
                 color = ThemeSuccess();
-                icon = "[OBJ]";
+                icon = m_IconFontLoaded ? LUCENT_ICON_CUBE : "OBJ";
+                shortLabel = "Model";
             } else if (ext == ".lucent") {
                 color = ThemeAccent();
-                icon = "[SCN]";
+                icon = m_IconFontLoaded ? LUCENT_ICON_FILE : "SCN";
+                shortLabel = "Scene";
             } else if (ext == ".mat") {
                 color = ImVec4(0.72f, 0.52f, 0.95f, 1.0f);
-                icon = "[MAT]";
+                icon = m_IconFontLoaded ? LUCENT_ICON_EDIT : "MAT";
+                shortLabel = "Material";
             } else {
                 color = WithAlpha(ThemeMutedText(), 1.0f);
-                icon = "[???]";
+                icon = m_IconFontLoaded ? LUCENT_ICON_FILE : "FILE";
+                shortLabel = "File";
             }
             
             ImGui::BeginGroup();
-            
-            // Thumbnail button
-            ImGui::PushStyleColor(ImGuiCol_Button, WithAlpha(MulRGB(color, 0.18f), 0.55f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, WithAlpha(MulRGB(color, 0.24f), 0.70f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, WithAlpha(MulRGB(color, 0.30f), 0.85f));
-            
-            if (ImGui::Button("##thumb", ImVec2(thumbnailSize, thumbnailSize))) {
+            ImGui::InvisibleButton("##asset_card", ImVec2(cardWidth, cardHeight));
+            const bool hovered = ImGui::IsItemHovered();
+            const bool clicked = ImGui::IsItemClicked();
+            const ImVec2 cardMin = ImGui::GetItemRectMin();
+            const ImVec2 cardMax = ImGui::GetItemRectMax();
+            ImDrawList* drawList = ImGui::GetWindowDrawList();
+            const float rounding = 12.0f;
+
+            const ImVec4 cardBg = hovered ? WithAlpha(MulRGB(color, 0.16f), 0.95f) : WithAlpha(MulRGB(color, 0.12f), 0.85f);
+            drawList->AddRectFilled(cardMin, cardMax, ImGui::ColorConvertFloat4ToU32(cardBg), rounding);
+            drawList->AddRect(cardMin, cardMax, ImGui::ColorConvertFloat4ToU32(WithAlpha(color, 0.55f)), rounding, 0, 1.0f);
+
+            ImVec2 iconCenter(cardMin.x + cardWidth * 0.5f, cardMin.y + thumbnailSize * 0.5f + 6.0f);
+            float iconRadius = thumbnailSize * 0.30f;
+            drawList->AddCircleFilled(iconCenter, iconRadius, ImGui::ColorConvertFloat4ToU32(WithAlpha(color, 0.65f)));
+
+            ImVec2 iconSize = ImGui::CalcTextSize(icon);
+            ImVec2 iconPos(iconCenter.x - iconSize.x * 0.5f, iconCenter.y - iconSize.y * 0.5f);
+            drawList->AddText(iconPos, ImGui::ColorConvertFloat4ToU32(ImVec4(1, 1, 1, 0.92f)), icon);
+
+            ImVec2 labelSize = ImGui::CalcTextSize(shortLabel);
+            ImVec2 labelPos(cardMin.x + (cardWidth - labelSize.x) * 0.5f, cardMin.y + thumbnailSize + 8.0f);
+            drawList->AddText(labelPos, ImGui::ColorConvertFloat4ToU32(WithAlpha(ThemeMutedText(), 0.95f)), shortLabel);
+
+            const char* displayName = name.c_str();
+            std::string clipped;
+            if (name.length() > 14) {
+                clipped = name.substr(0, 12) + "...";
+                displayName = clipped.c_str();
+            }
+            ImVec2 nameSize = ImGui::CalcTextSize(displayName);
+            ImVec2 namePos(cardMin.x + (cardWidth - nameSize.x) * 0.5f, cardMin.y + thumbnailSize + 24.0f);
+            drawList->AddText(namePos, ImGui::ColorConvertFloat4ToU32(WithAlpha(ImGui::GetStyle().Colors[ImGuiCol_Text], 0.95f)), displayName);
+
+            if (clicked) {
                 if (isDirectory) {
                     m_ContentBrowserPath = entry.path();
                 }
@@ -2382,9 +2449,7 @@ void EditorUI::DrawContentBrowserPanel() {
                     }
                 }
             }
-            
-            ImGui::PopStyleColor(3);
-            
+
             // Right-click context menu
             if (ImGui::BeginPopupContextItem()) {
                 if (ImGui::MenuItem("Open")) {
@@ -2408,22 +2473,6 @@ void EditorUI::DrawContentBrowserPanel() {
                 }
                 ImGui::EndPopup();
             }
-            
-            // Type icon
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() - thumbnailSize - 5);
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + thumbnailSize / 2 - 15);
-            ImGui::TextColored(color, "%s", icon);
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + thumbnailSize / 2 + 10);
-            
-            // File name (truncated)
-            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + thumbnailSize);
-            if (name.length() > 12) {
-                ImGui::TextWrapped("%s...", name.substr(0, 9).c_str());
-            } else {
-                ImGui::TextWrapped("%s", name.c_str());
-            }
-            ImGui::PopTextWrapPos();
-            
             ImGui::EndGroup();
             
             // Tooltip with full name
@@ -2448,7 +2497,7 @@ void EditorUI::DrawContentBrowserPanel() {
                 ImGui::SameLine();
             }
             
-        ImGui::PopID();
+            ImGui::PopID();
             itemIndex++;
         }
     }
@@ -2459,7 +2508,8 @@ void EditorUI::DrawContentBrowserPanel() {
         ImGui::TextDisabled("Drag files here or click Import");
     }
     
-    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar(2);
     
     ImGui::End();
 }
