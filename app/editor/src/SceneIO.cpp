@@ -43,6 +43,9 @@ bool SaveScene(scene::Scene* scene, const std::string& filepath) {
     // Header (V2 supports editable meshes)
     file << "LUCENT_SCENE_V2\n";
     file << "SCENE_NAME: " << scene->GetName() << "\n";
+    if (!scene->GetEnvironmentMapPath().empty()) {
+        file << "ENVIRONMENT_HDRI: " << scene->GetEnvironmentMapPath() << "\n";
+    }
     file << "\n";
     
     // Entities
@@ -182,6 +185,8 @@ bool LoadScene(scene::Scene* scene, const std::string& filepath) {
     if (line.substr(0, 12) == "SCENE_NAME: ") {
         scene->SetName(line.substr(12));
     }
+
+    scene->SetEnvironmentMapPath("");
     
     scene::Entity currentEntity;
     
@@ -193,7 +198,14 @@ bool LoadScene(scene::Scene* scene, const std::string& filepath) {
         
         if (line.empty()) continue;
         
-        if (line == "ENTITY_BEGIN") {
+        if (line.rfind("ENVIRONMENT_HDRI:", 0) == 0) {
+            std::string path = line.substr(17);
+            if (!path.empty() && path.front() == ' ') {
+                path.erase(path.begin());
+            }
+            scene->SetEnvironmentMapPath(path);
+        }
+        else if (line == "ENTITY_BEGIN") {
             currentEntity = scene::Entity(); // Will be created when we read NAME
         }
         else if (line == "ENTITY_END") {
@@ -608,4 +620,3 @@ int ImportModel(scene::Scene* scene, gfx::Device* device, const std::string& fil
 
 } // namespace SceneIO
 } // namespace lucent
-

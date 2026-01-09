@@ -2,6 +2,7 @@
 
 #include "lucent/scene/Entity.h"
 #include "lucent/scene/Components.h"
+#include <string>
 #include <vector>
 #include <unordered_map>
 #include <typeindex>
@@ -176,6 +177,9 @@ public:
     
     const std::vector<EntityID>& GetEntities() const { return m_Entities; }
     size_t GetEntityCount() const { return m_Entities.size(); }
+
+    const std::string& GetEnvironmentMapPath() const { return m_EnvironmentMapPath; }
+    void SetEnvironmentMapPath(const std::string& path) { m_EnvironmentMapPath = path; }
     
     // Clear all entities
     void Clear();
@@ -217,6 +221,8 @@ private:
     std::string m_Name;
     std::vector<EntityID> m_Entities;
     std::unordered_map<std::type_index, std::unique_ptr<IComponentArray>> m_ComponentArrays;
+
+    std::string m_EnvironmentMapPath;
     EntityID m_NextEntityID = 0;
 };
 
@@ -248,4 +254,3 @@ void Entity::RemoveComponent() {
 }
 
 } // namespace lucent::scene
-

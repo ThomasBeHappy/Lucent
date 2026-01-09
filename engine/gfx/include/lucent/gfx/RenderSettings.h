@@ -2,6 +2,7 @@
 
 #include "lucent/gfx/RenderCapabilities.h"
 #include <cstdint>
+#include <string>
 
 namespace lucent::gfx {
 
@@ -73,6 +74,8 @@ struct RenderSettings {
     float envIntensity = 1.0f;          // Environment map intensity multiplier
     float envRotation = 0.0f;           // Environment rotation around Y (radians)
     bool useEnvMap = true;              // Use environment map for background/lighting
+    std::string envMapPath;             // HDRI path for the environment map
+    uint32_t envMapHandle = UINT32_MAX; // Handle into environment map registry
     
     // === Film / Color ===
     float exposure = 1.0f;
