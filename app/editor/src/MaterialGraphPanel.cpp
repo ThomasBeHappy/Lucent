@@ -39,6 +39,34 @@ static ImVec4 ThemeSuccess() { return ImVec4(0.33f, 0.78f, 0.47f, 1.0f); }
 static ImVec4 ThemeWarning() { return ImVec4(0.95f, 0.70f, 0.28f, 1.0f); }
 static ImVec4 ThemeError() { return ImVec4(0.92f, 0.34f, 0.34f, 1.0f); }
 
+// Noise node parameter (optional, V2): "NOISE2:<type>;<scale>,<detail>,<roughness>,<distortion>"
+// - type: 0=FBM, 1=Value, 2=Ridged, 3=Turbulence
+static bool ParseNoise2Param(const material::PinValue& param, int& outType, glm::vec4& outParams) {
+    outType = 0;
+    outParams = glm::vec4(5.0f, 4.0f, 0.5f, 0.0f);
+    if (std::holds_alternative<glm::vec4>(param)) {
+        outParams = std::get<glm::vec4>(param);
+        return true;
+    }
+    if (!std::holds_alternative<std::string>(param)) return false;
+    const std::string& s = std::get<std::string>(param);
+    if (s.rfind("NOISE2:", 0) != 0) return false;
+    int t = 0;
+    float x = 5.0f, y = 4.0f, z = 0.5f, w = 0.0f;
+    if (sscanf_s(s.c_str(), "NOISE2:%d;%f,%f,%f,%f", &t, &x, &y, &z, &w) == 5) {
+        outType = t;
+        outParams = glm::vec4(x, y, z, w);
+        return true;
+    }
+    return false;
+}
+
+static std::string MakeNoise2Param(int type, const glm::vec4& p) {
+    char buf[128]{};
+    sprintf_s(buf, "NOISE2:%d;%g,%g,%g,%g", type, p.x, p.y, p.z, p.w);
+    return std::string(buf);
+}
+
 } // namespace
 
 MaterialGraphPanel::~MaterialGraphPanel() {
@@ -976,13 +1004,16 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
             break;
         }
         case material::NodeType::Noise: {
-            glm::vec4 p = std::holds_alternative<glm::vec4>(node.parameter)
-                ? std::get<glm::vec4>(node.parameter)
-                : glm::vec4(5.0f, 4.0f, 0.5f, 0.0f);
+            int noiseType = 0;
+            glm::vec4 p(5.0f, 4.0f, 0.5f, 0.0f);
+            ParseNoise2Param(node.parameter, noiseType, p);
 
             // p.x = scale, p.y = detail, p.z = roughness, p.w = distortion
             ImGui::SetNextItemWidth(170.0f);
             bool changed = false;
+            const char* typeItems[] = { "FBM", "Value", "Ridged", "Turbulence" };
+            noiseType = std::clamp(noiseType, 0, (int)(sizeof(typeItems) / sizeof(typeItems[0])) - 1);
+            changed |= ImGui::Combo("Type##noise", &noiseType, typeItems, (int)(sizeof(typeItems) / sizeof(typeItems[0])));
             changed |= ImGui::DragFloat("Scale##noise", &p.x, 0.1f, 0.0f, 100.0f, "%.2f");
             changed |= ImGui::DragFloat("Detail##noise", &p.y, 0.1f, 1.0f, 12.0f, "%.1f");
             changed |= ImGui::SliderFloat("Roughness##noise", &p.z, 0.0f, 1.0f, "%.2f");
@@ -990,7 +1021,8 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
 
             if (changed) {
                 auto* mutableNode = const_cast<material::MaterialNode*>(&node);
-                mutableNode->parameter = p;
+                // Store as string so we can persist the selected type.
+                mutableNode->parameter = MakeNoise2Param(noiseType, p);
 
                 // IMPORTANT: the material compiler uses the Noise node *input pin defaults*
                 // for Scale/Detail/Roughness/Distortion when those inputs are unconnected.

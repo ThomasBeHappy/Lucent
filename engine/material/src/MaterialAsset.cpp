@@ -672,9 +672,18 @@ MaterialAsset* MaterialAssetManager::LoadMaterial(const std::string& path) {
                 
                 // Noise uses pin defaults if unconnected; keep them in sync with stored parameter.
                 if (n->type == NodeType::Noise) {
-                    glm::vec4 p = std::holds_alternative<glm::vec4>(n->parameter)
-                        ? std::get<glm::vec4>(n->parameter)
-                        : glm::vec4(5.0f, 4.0f, 0.5f, 0.0f);
+                    // Support legacy vec4 param and newer NOISE2 string param.
+                    glm::vec4 p = glm::vec4(5.0f, 4.0f, 0.5f, 0.0f);
+                    if (std::holds_alternative<glm::vec4>(n->parameter)) {
+                        p = std::get<glm::vec4>(n->parameter);
+                    } else if (std::holds_alternative<std::string>(n->parameter)) {
+                        const std::string& s = std::get<std::string>(n->parameter);
+                        int t = 0; float x = 5.0f, y = 4.0f, z = 0.5f, w = 0.0f;
+                        if (s.rfind("NOISE2:", 0) == 0 &&
+                            sscanf_s(s.c_str(), "NOISE2:%d;%f,%f,%f,%f", &t, &x, &y, &z, &w) == 5) {
+                            p = glm::vec4(x, y, z, w);
+                        }
+                    }
                     if (n->inputPins.size() >= 5) {
                         if (auto* scalePin = graph.GetPin(n->inputPins[1])) scalePin->defaultValue = p.x;
                         if (auto* detailPin = graph.GetPin(n->inputPins[2])) detailPin->defaultValue = p.y;

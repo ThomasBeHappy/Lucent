@@ -8,6 +8,20 @@
 
 namespace lucent::material {
 
+// Noise node parameter (optional, V2): "NOISE2:<type>;<scale>,<detail>,<roughness>,<distortion>"
+// - type: 0=FBM, 1=Value, 2=Ridged, 3=Turbulence
+static bool ParseNoise2Param(const std::string& s, int& outType, glm::vec4& outParams) {
+    if (s.rfind("NOISE2:", 0) != 0) return false;
+    int t = 0;
+    float x = 5.0f, y = 4.0f, z = 0.5f, w = 0.0f;
+    if (sscanf_s(s.c_str(), "NOISE2:%d;%f,%f,%f,%f", &t, &x, &y, &z, &w) == 5) {
+        outType = t;
+        outParams = glm::vec4(x, y, z, w);
+        return true;
+    }
+    return false;
+}
+
 // Standard vertex shader source (same interface as mesh.vert)
 static const char* s_StandardVertexShaderGLSL = R"(
 #version 450
@@ -163,7 +177,7 @@ std::string MaterialCompiler::GenerateSurfaceFragmentGLSL(const MaterialGraph& g
     if (needsNoise) {
         ss << R"(
 // -----------------------------------------------------------------------------
-// Noise helpers (value noise + fbm)
+// Noise helpers (value noise + fbm variants)
 // -----------------------------------------------------------------------------
 float hash11(float p) {
     p = fract(p * 0.1031);
@@ -223,6 +237,37 @@ float fbm3(vec3 p, float octaves, float roughness) {
     int iters = int(clamp(octaves, 1.0, 12.0));
     for (int i = 0; i < iters; ++i) {
         sum += amp * valueNoise3(p * freq);
+        freq *= 2.0;
+        amp *= clamp(roughness, 0.0, 1.0);
+    }
+    return sum;
+}
+
+float ridgedFbm3(vec3 p, float octaves, float roughness) {
+    float sum = 0.0;
+    float amp = 0.5;
+    float freq = 1.0;
+    int iters = int(clamp(octaves, 1.0, 12.0));
+    for (int i = 0; i < iters; ++i) {
+        float n = valueNoise3(p * freq);
+        // Make ridges: map [0..1] -> [-1..1], abs, then invert.
+        float r = 1.0 - abs(n * 2.0 - 1.0);
+        sum += amp * r;
+        freq *= 2.0;
+        amp *= clamp(roughness, 0.0, 1.0);
+    }
+    return sum;
+}
+
+float turbulence3(vec3 p, float octaves, float roughness) {
+    float sum = 0.0;
+    float amp = 0.5;
+    float freq = 1.0;
+    int iters = int(clamp(octaves, 1.0, 12.0));
+    for (int i = 0; i < iters; ++i) {
+        float n = valueNoise3(p * freq);
+        // Absolute noise around 0: map [0..1] -> [-1..1] then abs.
+        sum += amp * abs(n * 2.0 - 1.0);
         freq *= 2.0;
         amp *= clamp(roughness, 0.0, 1.0);
     }
@@ -742,30 +787,59 @@ std::string MaterialCompiler::GenerateNodeCode(const MaterialGraph& graph, const
         }
 
         case NodeType::Noise: {
+            // Parameter (optional) controls the *defaults* when pins are unconnected.
+            // Also supports a noise "type" selection via NOISE2 string.
+            int noiseType = 0; // 0=FBM, 1=Value, 2=Ridged, 3=Turbulence
+            glm::vec4 p = glm::vec4(5.0f, 4.0f, 0.5f, 0.0f); // scale, detail, roughness, distortion
+            if (std::holds_alternative<glm::vec4>(node.parameter)) {
+                p = std::get<glm::vec4>(node.parameter);
+            } else if (std::holds_alternative<std::string>(node.parameter)) {
+                (void)ParseNoise2Param(std::get<std::string>(node.parameter), noiseType, p);
+            }
+
             // Inputs
             // If the coordinate is left unconnected, default to UVs so the node "just works".
             // (Default vec3(0) would sample the same point and produce a flat color.)
-            std::string vecIn;
-            if (graph.FindLinkByEndPin(node.inputPins[0]) != INVALID_LINK_ID) {
-                vecIn = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
-            } else {
-                vecIn = "vec3(inUV, 0.0)";
-            }
-            std::string scale = GetPinValue(graph, node.inputPins[1], PinType::Float, pinVarNames);
-            std::string detail = GetPinValue(graph, node.inputPins[2], PinType::Float, pinVarNames);
-            std::string rough = GetPinValue(graph, node.inputPins[3], PinType::Float, pinVarNames);
-            std::string distort = GetPinValue(graph, node.inputPins[4], PinType::Float, pinVarNames);
+            auto isConnected = [&](size_t inputIndex) -> bool {
+                return graph.FindLinkByEndPin(node.inputPins[inputIndex]) != INVALID_LINK_ID;
+            };
 
-            // Parameter fallback if unconnected
-            glm::vec4 p = std::holds_alternative<glm::vec4>(node.parameter) ? std::get<glm::vec4>(node.parameter) : glm::vec4(5.0f, 4.0f, 0.5f, 0.0f);
-            // Use parameters only if inputs left unconnected (handled by defaults), so nothing else here.
+            std::string vecIn = isConnected(0)
+                ? GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames)
+                : "vec3(inUV, 0.0)";
+            std::string scale = isConnected(1)
+                ? GetPinValue(graph, node.inputPins[1], PinType::Float, pinVarNames)
+                : std::to_string(p.x);
+            std::string detail = isConnected(2)
+                ? GetPinValue(graph, node.inputPins[2], PinType::Float, pinVarNames)
+                : std::to_string(p.y);
+            std::string rough = isConnected(3)
+                ? GetPinValue(graph, node.inputPins[3], PinType::Float, pinVarNames)
+                : std::to_string(p.z);
+            std::string distort = isConnected(4)
+                ? GetPinValue(graph, node.inputPins[4], PinType::Float, pinVarNames)
+                : std::to_string(p.w);
 
             std::string pVar = varPrefix + "p";
             std::string nVar = varPrefix + "n";
             ss << "    vec3 " << pVar << " = (" << vecIn << ") * " << scale << ";\n";
             // Distortion: offset by another noise lookup
             ss << "    if (" << distort << " > 0.0) { " << pVar << " += " << distort << " * vec3(valueNoise3(" << pVar << " + vec3(31.7)), valueNoise3(" << pVar << " + vec3(17.3)), valueNoise3(" << pVar << " + vec3(9.2))); }\n";
-            ss << "    float " << nVar << " = fbm3(" << pVar << ", " << detail << ", " << rough << ");\n";
+            switch (noiseType) {
+                default:
+                case 0: // FBM
+                    ss << "    float " << nVar << " = fbm3(" << pVar << ", " << detail << ", " << rough << ");\n";
+                    break;
+                case 1: // Value
+                    ss << "    float " << nVar << " = valueNoise3(" << pVar << ");\n";
+                    break;
+                case 2: // Ridged
+                    ss << "    float " << nVar << " = ridgedFbm3(" << pVar << ", " << detail << ", " << rough << ");\n";
+                    break;
+                case 3: // Turbulence
+                    ss << "    float " << nVar << " = turbulence3(" << pVar << ", " << detail << ", " << rough << ");\n";
+                    break;
+            }
 
             pinVarNames[node.outputPins[0]] = nVar;
             pinVarNames[node.outputPins[1]] = "vec3(" + nVar + ")";
