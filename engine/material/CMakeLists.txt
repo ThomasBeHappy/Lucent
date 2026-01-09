@@ -3,6 +3,7 @@ add_library(engine_material STATIC
     src/MaterialCompiler.cpp
     src/MaterialAsset.cpp
     src/MaterialIR.cpp
+    src/MaterialGraphEval.cpp
 )
 
 add_library(Lucent::Material ALIAS engine_material)

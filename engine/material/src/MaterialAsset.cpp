@@ -101,6 +101,8 @@ bool MaterialAsset::Recompile() {
     if (!m_Device) {
         m_CompileError = "No device";
         m_Valid = false;
+        // Avoid auto-compile retry loops when compilation is impossible.
+        m_Dirty = false;
         return false;
     }
     
@@ -110,6 +112,8 @@ bool MaterialAsset::Recompile() {
     if (!result.success) {
         m_CompileError = result.errorMessage;
         m_Valid = false;
+        // We attempted a compile; don't keep re-triggering until the user changes something again.
+        m_Dirty = false;
         LUCENT_CORE_ERROR("Material compile failed: {}", m_CompileError);
         return false;
     }
@@ -141,6 +145,8 @@ void MaterialAsset::RequestRecompileAsync() {
     if (!m_Device) {
         m_CompileError = "No device";
         m_Valid = false;
+        // Avoid auto-compile retry loops when compilation is impossible.
+        m_Dirty = false;
         return;
     }
     
@@ -181,11 +187,14 @@ void MaterialAsset::PumpAsyncRecompile() {
     } catch (const std::exception& e) {
         m_CompileError = std::string("Async compile exception: ") + e.what();
         m_Valid = false;
+        // Treat as a completed attempt; only retry on further edits.
+        m_Dirty = false;
         m_AsyncCompiling.store(false);
         return;
     } catch (...) {
         m_CompileError = "Async compile exception: unknown";
         m_Valid = false;
+        m_Dirty = false;
         m_AsyncCompiling.store(false);
         return;
     }
@@ -195,6 +204,8 @@ void MaterialAsset::PumpAsyncRecompile() {
         // Keep old pipeline alive; just report error.
         m_CompileError = result.errorMessage;
         m_Valid = false;
+        // We attempted a compile; don't keep re-triggering until the user changes something again.
+        m_Dirty = false;
     } else {
         // If unchanged, still clear dirty (important for params that previously didn't affect hash)
         if (result.graphHash == m_GraphHash && m_Pipeline != VK_NULL_HANDLE) {
@@ -207,6 +218,8 @@ void MaterialAsset::PumpAsyncRecompile() {
             if (!CreatePipeline(result.fragmentShaderSPIRV)) {
                 m_CompileError = "Failed to create pipeline";
                 m_Valid = false;
+                // Compilation succeeded but pipeline creation failed; don't spam retries.
+                m_Dirty = false;
             } else {
                 m_Valid = true;
                 m_CompileError.clear();

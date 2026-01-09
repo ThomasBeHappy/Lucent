@@ -404,8 +404,13 @@ vec4 ramp_eval(float t, vec4 c0, float t0, vec4 c1, float t1) {
             ss << "out " << GetGLSLTypeName(out.type) << " " << out.name;
         }
         ss << ") {\n";
-        ss << "#line 1\n";
+        // Use a per-node source string number so shader compile errors can be mapped back to this node.
+        // shaderc typically reports errors as: "<source>:<line>:<col>: ..."
+        int srcId = (int)(id % 2147483647ULL);
+        if (srcId <= 0) srcId = 1;
+        ss << "#line 1 " << srcId << "\n";
         ss << body << "\n";
+        ss << "#line 1 0\n";
         ss << "}\n\n";
     }
     

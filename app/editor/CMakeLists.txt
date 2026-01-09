@@ -14,8 +14,14 @@ add_executable(editor
     src/EditorSettings.cpp
     src/MaterialGraphPanel.cpp
     src/UndoStack.cpp
+    third_party/ImGuiColorTextEdit/TextEditor.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/editor.rc
 )
+
+# Third-party: ImGuiColorTextEdit triggers some warnings; our build treats warnings as errors.
+if(MSVC)
+    set_source_files_properties(third_party/ImGuiColorTextEdit/TextEditor.cpp PROPERTIES COMPILE_FLAGS "/wd4189")
+endif()
 
 # Fix sporadic MSVC PDB contention (C1041) during parallel builds.
 if(MSVC)
@@ -30,6 +36,7 @@ endif()
 target_include_directories(editor
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ImGuiColorTextEdit
 )
 
 find_package(imguizmo CONFIG REQUIRED)

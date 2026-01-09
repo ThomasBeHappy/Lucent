@@ -5,6 +5,7 @@
 #include "lucent/assets/MeshRegistry.h"
 #include "lucent/scene/Components.h"
 #include "lucent/material/MaterialAsset.h"
+#include "lucent/material/MaterialGraphEval.h"
 #include "lucent/material/MaterialIR.h"
 #include <GLFW/glfw3.h>
 #include <algorithm>
@@ -1776,26 +1777,38 @@ void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& t
         gfx::GPUMaterial mat{};
 
         // Traced material pipeline:
-        // If the entity uses a MaterialAsset, compile it to IR and evaluate constant channels for V1.
+        // If the entity uses a MaterialAsset, evaluate constant channels for the tracer backends (V1).
         if (matAsset && matAsset->IsValid()) {
-            material::MaterialIR ir{};
-            std::string irErr;
-            if (material::MaterialIRCompiler::Compile(matAsset->GetGraph(), ir, irErr) && ir.IsValid()) {
-                auto data = ir.EvaluateConstant();
-                mat.baseColor = data.baseColor;
-                mat.emissive = data.emissive;
-                mat.metallic = data.metallic;
-                mat.roughness = data.roughness;
-                mat.ior = data.ior;
-                mat.flags = data.flags;
+            material::TracerMaterialConstants baked{};
+            std::string bakeErr;
+            if (material::EvaluateTracerConstants(matAsset->GetGraph(), baked, bakeErr)) {
+                mat.baseColor = baked.baseColor;
+                mat.emissive = baked.emissive;
+                mat.metallic = baked.metallic;
+                mat.roughness = baked.roughness;
+                mat.ior = baked.ior;
+                mat.flags = baked.flags;
             } else {
-                // Fallback to component values
-                mat.baseColor = glm::vec4(renderer.baseColor, 1.0f);
-                mat.emissive = glm::vec4(renderer.emissive, renderer.emissiveIntensity);
-                mat.metallic = renderer.metallic;
-                mat.roughness = renderer.roughness;
-                mat.ior = 1.5f;
-                mat.flags = 0;
+                // If evaluation fails (unsupported nodes), fallback to IR constant evaluation,
+                // then to component values.
+                material::MaterialIR ir{};
+                std::string irErr;
+                if (material::MaterialIRCompiler::Compile(matAsset->GetGraph(), ir, irErr) && ir.IsValid()) {
+                    auto data = ir.EvaluateConstant();
+                    mat.baseColor = data.baseColor;
+                    mat.emissive = data.emissive;
+                    mat.metallic = data.metallic;
+                    mat.roughness = data.roughness;
+                    mat.ior = data.ior;
+                    mat.flags = data.flags;
+                } else {
+                    mat.baseColor = glm::vec4(renderer.baseColor, 1.0f);
+                    mat.emissive = glm::vec4(renderer.emissive, renderer.emissiveIntensity);
+                    mat.metallic = renderer.metallic;
+                    mat.roughness = renderer.roughness;
+                    mat.ior = 1.5f;
+                    mat.flags = 0;
+                }
             }
         } else {
             // No material asset: use component values

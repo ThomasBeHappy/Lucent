@@ -3,6 +3,7 @@
 #include "EditorIcons.h"
 #include "lucent/material/MaterialAsset.h"
 #include "lucent/core/Log.h"
+#include "TextEditor.h"
 #include <imgui-node-editor/imgui_node_editor.h>
 #include <imgui_impl_vulkan.h>
 #include <array>
@@ -78,17 +79,15 @@ struct CustomCodeEditorState {
     std::string completionToInsert;
     bool openFullEditor = false;
     std::string stagedText; // edited in modal; only applied on Apply
+    bool requestFocusEditor = false;
+    char findBuf[128] = {0};
+    int findIndex = 0;
+    std::unique_ptr<TextEditor> editor;
+    bool editorInitialized = false;
 };
 
 static bool IsIdentChar(char c) {
     return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
-}
-
-static std::string GetTokenPrefix(const std::string& s, int cursorPos) {
-    int i = std::clamp(cursorPos, 0, (int)s.size());
-    int start = i;
-    while (start > 0 && IsIdentChar(s[start - 1])) --start;
-    return s.substr(start, i - start);
 }
 
 static void BuildCustomCodeCompletions(const std::string& code, std::vector<std::string>& out) {
@@ -140,154 +139,61 @@ static void BuildCustomCodeCompletions(const std::string& code, std::vector<std:
     out.erase(std::unique(out.begin(), out.end()), out.end());
 }
 
-// Very lightweight GLSL-ish syntax highlight (preview only).
-enum class CC_TokKind : uint8_t { Normal, Keyword, Type, Number, String, Comment, Identifier };
+struct CC_Error {
+    int line = 1;
+    int col = 1;
+    std::string message;
+};
 
-static bool IsDigit(char c) { return c >= '0' && c <= '9'; }
-
-static bool IsIdentStart(char c) {
-    return std::isalpha(static_cast<unsigned char>(c)) || c == '_';
+static int CustomCodeSourceId(uint64_t nodeId) {
+    int srcId = (int)(nodeId % 2147483647ULL);
+    if (srcId <= 0) srcId = 1;
+    return srcId;
 }
 
-static ImU32 CC_Color(CC_TokKind k) {
-    switch (k) {
-        case CC_TokKind::Keyword: return IM_COL32(198, 120, 221, 255);   // purple
-        case CC_TokKind::Type: return IM_COL32(97, 175, 239, 255);      // blue
-        case CC_TokKind::Number: return IM_COL32(209, 154, 102, 255);   // orange
-        case CC_TokKind::String: return IM_COL32(152, 195, 121, 255);   // green
-        case CC_TokKind::Comment: return IM_COL32(92, 99, 112, 255);    // gray
-        case CC_TokKind::Identifier: return IM_COL32(224, 224, 224, 255);
-        default: return IM_COL32(224, 224, 224, 255);
-    }
-}
-
-static bool IsInWordSet(const std::string& w, const std::unordered_map<std::string, bool>& set) {
-    return set.find(w) != set.end();
-}
-
-static void DrawCustomCodeHighlightedPreview(const std::string& code) {
-    // Word sets
-    static const std::unordered_map<std::string, bool> kKeywords = {
-        {"if",true},{"else",true},{"for",true},{"while",true},{"return",true},{"break",true},{"continue",true},
-        {"in",true},{"out",true},{"uniform",true},
-    };
-    static const std::unordered_map<std::string, bool> kTypes = {
-        {"float",true},{"vec2",true},{"vec3",true},{"vec4",true},{"mat3",true},{"mat4",true},{"int",true},{"bool",true},
-    };
-
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 start = ImGui::GetCursorScreenPos();
-    ImFont* font = ImGui::GetFont();
-    const float fontSize = ImGui::GetFontSize();
-    const float lineH = ImGui::GetTextLineHeightWithSpacing();
-
-    std::istringstream ss(code);
+static std::vector<CC_Error> ParseShaderErrorsForSource(const std::string& err, int sourceId) {
+    // shaderc typical: "ERROR: <source>:<line>:<col>: <msg>" or "<source>:<line>:<col>: <msg>"
+    std::vector<CC_Error> out;
+    std::istringstream ss(err);
     std::string line;
-    int lineIdx = 0;
     while (std::getline(ss, line)) {
-        ImVec2 pos(start.x, start.y + lineIdx * lineH);
-
-        // Tokenize line
-        size_t i = 0;
-        while (i < line.size()) {
-            // Comment
-            if (i + 1 < line.size() && line[i] == '/' && line[i + 1] == '/') {
-                const std::string tok = line.substr(i);
-                dl->AddText(font, fontSize, pos, CC_Color(CC_TokKind::Comment), tok.c_str());
-                pos.x += ImGui::CalcTextSize(tok.c_str()).x;
-                break;
-            }
-
-            // String
-            if (line[i] == '"') {
-                size_t j = i + 1;
-                while (j < line.size()) {
-                    if (line[j] == '"' && line[j - 1] != '\\') { ++j; break; }
-                    ++j;
-                }
-                const std::string tok = line.substr(i, j - i);
-                dl->AddText(font, fontSize, pos, CC_Color(CC_TokKind::String), tok.c_str());
-                pos.x += ImGui::CalcTextSize(tok.c_str()).x;
-                i = j;
-                continue;
-            }
-
-            // Whitespace
-            if (std::isspace(static_cast<unsigned char>(line[i]))) {
-                size_t j = i;
-                while (j < line.size() && std::isspace(static_cast<unsigned char>(line[j]))) ++j;
-                const std::string tok = line.substr(i, j - i);
-                dl->AddText(font, fontSize, pos, CC_Color(CC_TokKind::Normal), tok.c_str());
-                pos.x += ImGui::CalcTextSize(tok.c_str()).x;
-                i = j;
-                continue;
-            }
-
-            // Number
-            if (IsDigit(line[i]) || (line[i] == '.' && i + 1 < line.size() && IsDigit(line[i + 1]))) {
-                size_t j = i + 1;
-                while (j < line.size() && (IsDigit(line[j]) || line[j] == '.' || line[j] == 'f')) ++j;
-                const std::string tok = line.substr(i, j - i);
-                dl->AddText(font, fontSize, pos, CC_Color(CC_TokKind::Number), tok.c_str());
-                pos.x += ImGui::CalcTextSize(tok.c_str()).x;
-                i = j;
-                continue;
-            }
-
-            // Identifier/keyword/type
-            if (IsIdentStart(line[i])) {
-                size_t j = i + 1;
-                while (j < line.size() && IsIdentChar(line[j])) ++j;
-                const std::string tok = line.substr(i, j - i);
-                CC_TokKind kind = CC_TokKind::Identifier;
-                if (IsInWordSet(tok, kKeywords)) kind = CC_TokKind::Keyword;
-                else if (IsInWordSet(tok, kTypes)) kind = CC_TokKind::Type;
-                dl->AddText(font, fontSize, pos, CC_Color(kind), tok.c_str());
-                pos.x += ImGui::CalcTextSize(tok.c_str()).x;
-                i = j;
-                continue;
-            }
-
-            // Single char fallback
-            char c[2]{ line[i], '\0' };
-            dl->AddText(font, fontSize, pos, CC_Color(CC_TokKind::Normal), c);
-            pos.x += ImGui::CalcTextSize(c).x;
-            ++i;
+        int s = -1, l = -1, c = -1;
+        const char* p = line.c_str();
+        // Try with prefix "ERROR: "
+        if (sscanf_s(p, "ERROR: %d:%d:%d:", &s, &l, &c) < 3) {
+            if (sscanf_s(p, "%d:%d:%d:", &s, &l, &c) < 3) continue;
         }
-
-        ++lineIdx;
+        if (s != sourceId || l <= 0) continue;
+        // Extract message after the third ':'
+        int colonCount = 0;
+        size_t idx = 0;
+        for (; idx < line.size(); ++idx) {
+            if (line[idx] == ':') {
+                ++colonCount;
+                if (colonCount == 3) { ++idx; break; }
+            }
+        }
+        while (idx < line.size() && std::isspace((unsigned char)line[idx])) ++idx;
+        CC_Error e;
+        e.line = l;
+        e.col = std::max(1, c);
+        e.message = (idx < line.size()) ? line.substr(idx) : std::string();
+        out.push_back(std::move(e));
     }
-
-    // Reserve space so the child scrolls
-    ImGui::Dummy(ImVec2(0.0f, std::max(1, lineIdx) * lineH));
+    return out;
 }
 
-static int CustomCodeInputCallback(ImGuiInputTextCallbackData* data) {
-    auto* state = static_cast<CustomCodeEditorState*>(data->UserData);
-    if (!state) return 0;
-
-    if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
-        // Standard ImGui pattern for std::string buffers.
-        // data->BufTextLen is the new length (excluding null terminator).
-        state->stagedText.resize((size_t)data->BufTextLen);
-        data->Buf = state->stagedText.data();
-    }
-
-    if (data->EventFlag == ImGuiInputTextFlags_CallbackAlways) {
-        state->cursorPos = data->CursorPos;
-        // Insert pending completion (if any) at cursor.
-        if (!state->completionToInsert.empty()) {
-            data->InsertChars(data->CursorPos, state->completionToInsert.c_str());
-            data->CursorPos += (int)state->completionToInsert.size();
-            data->SelectionStart = data->SelectionEnd = data->CursorPos;
-            state->completionToInsert.clear();
-        }
-    } else if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
-        // Keep staged buffer in sync while editing.
-        state->stagedText.assign(data->Buf, data->BufTextLen);
-        state->cursorPos = data->CursorPos;
-    }
-    return 0;
+static std::string GetTokenPrefixForEditor(const TextEditor& editor) {
+    auto pos = editor.GetCursorPosition(); // line/column
+    const int line = std::max(0, pos.mLine);
+    const int col = std::max(0, pos.mColumn);
+    auto lines = editor.GetTextLines();
+    if (line < 0 || line >= (int)lines.size()) return {};
+    const std::string& s = lines[line];
+    const int i = std::min(col, (int)s.size());
+    int start = i;
+    while (start > 0 && IsIdentChar(s[start - 1])) --start;
+    return s.substr(start, i - start);
 }
 
 } // namespace
@@ -1291,6 +1197,7 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
             if (st.openFullEditor) {
                 // Refresh staged text from current stored text when opening
                 st.stagedText = st.text;
+                st.editorInitialized = false; // reload text into TextEditor on open
                 ImGui::OpenPopup("Custom Code Editor");
                 st.openFullEditor = false;
             }
@@ -1305,27 +1212,47 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
                 ImGui::Separator();
                 ImGui::TextDisabled("Autocomplete: Ctrl+Space");
 
-                // Split: editable text on left, highlighted preview on right.
-                ImGui::Columns(2, "##cc_cols", true);
-                ImGui::SetColumnWidth(0, 380.0f);
+                const int srcId = CustomCodeSourceId(node.id);
+                const std::string compileErr = m_Material ? m_Material->GetCompileError() : std::string();
+                const std::vector<CC_Error> errsVec = ParseShaderErrorsForSource(compileErr, srcId);
+                TextEditor::ErrorMarkers markers;
+                for (const auto& e : errsVec) {
+                    // ImGuiColorTextEdit uses 1-based line numbers for markers.
+                    if (markers.find(e.line) == markers.end()) {
+                        markers[e.line] = e.message;
+                    }
+                }
 
-                ImGui::TextDisabled("Editor");
-                ImGuiInputTextFlags flags = ImGuiInputTextFlags_AllowTabInput |
-                                            ImGuiInputTextFlags_CallbackAlways |
-                                            ImGuiInputTextFlags_CallbackEdit |
-                                            ImGuiInputTextFlags_CallbackResize;
+                // Initialize editor instance once per node.
+                if (!st.editor) {
+                    st.editor = std::make_unique<TextEditor>();
+                    st.editorInitialized = false;
+                }
+                if (!st.editorInitialized) {
+                    st.editor->SetLanguageDefinition(TextEditor::LanguageDefinition::GLSL());
+                    st.editor->SetPalette(TextEditor::GetDarkPalette());
+                    st.editor->SetText(st.stagedText);
+                    st.editor->SetShowWhitespaces(false);
+                    st.editorInitialized = true;
+                }
 
-                ImGui::InputTextMultiline("##customcode_full",
-                    st.stagedText.data(),
-                    st.stagedText.capacity() + 1,
-                    ImVec2(-1, 380),
-                    flags,
-                    CustomCodeInputCallback,
-                    &st
-                );
+                // Keep error markers updated each frame
+                st.editor->SetErrorMarkers(markers);
+
+                // Find bar + quick actions
+                ImGui::SetNextItemWidth(-1);
+                ImGui::InputTextWithHint("##cc_find", "Find (plain text)", st.findBuf, sizeof(st.findBuf));
+                ImGui::SameLine();
+                if (ImGui::Button("Undo") && st.editor->CanUndo()) st.editor->Undo();
+                ImGui::SameLine();
+                if (ImGui::Button("Redo") && st.editor->CanRedo()) st.editor->Redo();
+
+                // Render the editor
+                st.editor->Render("##cc_texteditor", ImVec2(-1, 380), true);
 
                 // Trigger completion (inside modal editor)
-                if (ImGui::IsItemActive() && ImGui::IsKeyPressed(ImGuiKey_Space) && ImGui::GetIO().KeyCtrl) {
+                // TextEditor handles its own input; we just watch global key state while modal is open.
+                if (ImGui::IsKeyPressed(ImGuiKey_Space) && ImGui::GetIO().KeyCtrl) {
                     st.openCompletion = true;
                 }
 
@@ -1335,9 +1262,9 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
                     st.completionIndex = 0;
                 }
                 if (ImGui::BeginPopup("##CustomCodeCompletion")) {
-                    const std::string prefix = GetTokenPrefix(st.stagedText, st.cursorPos);
+                    const std::string prefix = st.editor ? GetTokenPrefixForEditor(*st.editor) : std::string();
                     std::vector<std::string> items;
-                    BuildCustomCodeCompletions(st.stagedText, items);
+                    BuildCustomCodeCompletions(st.editor ? st.editor->GetText() : st.stagedText, items);
                     std::vector<const std::string*> filtered;
                     filtered.reserve(items.size());
                     for (const auto& it : items) {
@@ -1382,18 +1309,25 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
                     ImGui::EndPopup();
                 }
 
-                ImGui::NextColumn();
-                ImGui::TextDisabled("Preview (syntax highlighting)");
-                ImGui::BeginChild("##cc_preview", ImVec2(-1, 380), true, ImGuiWindowFlags_HorizontalScrollbar);
-                DrawCustomCodeHighlightedPreview(st.stagedText);
-                ImGui::EndChild();
+                // Apply completion insertion into the editor (after popup closes)
+                if (!st.completionToInsert.empty() && st.editor) {
+                    st.editor->InsertText(st.completionToInsert);
+                    st.completionToInsert.clear();
+                }
 
-                ImGui::Columns(1);
+                // Error list
+                if (!errsVec.empty()) {
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(0.92f, 0.34f, 0.34f, 1.0f), "Errors in this node:");
+                    for (const auto& e : errsVec) {
+                        ImGui::TextWrapped("L%d:%d  %s", e.line, e.col, e.message.c_str());
+                    }
+                }
 
                 ImGui::Separator();
 
                 if (ImGui::Button("Apply & Rebuild Pins")) {
-                    st.text = st.stagedText;
+                    st.text = st.editor ? st.editor->GetText() : st.stagedText;
                     auto* mutableNode = const_cast<material::MaterialNode*>(&node);
                     mutableNode->parameter = st.text;
                     m_Material->GetGraph().RebuildNodePins(node.id);
@@ -1402,6 +1336,8 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Cancel")) {
+                    // Reset editor on cancel (discard staged changes)
+                    if (st.editor) st.editor->SetText(st.text);
                     ImGui::CloseCurrentPopup();
                 }
                 ImGui::EndPopup();
