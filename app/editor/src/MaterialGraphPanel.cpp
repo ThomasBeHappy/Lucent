@@ -1485,15 +1485,31 @@ static const NodeMenuItem s_AllNodeTypes[] = {
     { material::NodeType::Clamp, "Clamp", "Math" },
     { material::NodeType::OneMinus, "One Minus", "Math" },
     { material::NodeType::Abs, "Abs", "Math" },
+    { material::NodeType::Min, "Min", "Math" },
+    { material::NodeType::Max, "Max", "Math" },
+    { material::NodeType::Saturate, "Saturate", "Math" },
+    { material::NodeType::Sqrt, "Sqrt", "Math" },
+    { material::NodeType::Floor, "Floor", "Math" },
+    { material::NodeType::Ceil, "Ceil", "Math" },
+    { material::NodeType::Fract, "Fract", "Math" },
+    { material::NodeType::Mod, "Mod", "Math" },
+    { material::NodeType::Exp, "Exp", "Math" },
+    { material::NodeType::Log, "Log", "Math" },
+    { material::NodeType::Negate, "Negate", "Math" },
     // Shading
     { material::NodeType::Fresnel, "Fresnel", "Shading" },
     // Vector
     { material::NodeType::Dot, "Dot Product", "Vector" },
     { material::NodeType::Normalize, "Normalize", "Vector" },
     { material::NodeType::Length, "Length", "Vector" },
+    { material::NodeType::Cross, "Cross Product", "Vector" },
+    { material::NodeType::Reflect, "Reflect", "Vector" },
+    { material::NodeType::Refract, "Refract", "Vector" },
     // Convert
+    { material::NodeType::SeparateVec2, "Separate XY", "Convert" },
     { material::NodeType::SeparateVec3, "Separate RGB", "Convert" },
     { material::NodeType::SeparateVec4, "Separate RGBA", "Convert" },
+    { material::NodeType::CombineVec2, "Combine XY", "Convert" },
     { material::NodeType::CombineVec3, "Combine RGB", "Convert" },
     { material::NodeType::CombineVec4, "Combine RGBA", "Convert" },
     { material::NodeType::FloatToVec3, "Float to Vec3", "Convert" },
@@ -1681,6 +1697,18 @@ void MaterialGraphPanel::DrawNodeCreationMenu() {
         addNodeMenuItem("Clamp", material::NodeType::Clamp);
         addNodeMenuItem("One Minus", material::NodeType::OneMinus);
         addNodeMenuItem("Abs", material::NodeType::Abs);
+        ImGui::Separator();
+        addNodeMenuItem("Min", material::NodeType::Min);
+        addNodeMenuItem("Max", material::NodeType::Max);
+        addNodeMenuItem("Saturate", material::NodeType::Saturate);
+        addNodeMenuItem("Sqrt", material::NodeType::Sqrt);
+        addNodeMenuItem("Floor", material::NodeType::Floor);
+        addNodeMenuItem("Ceil", material::NodeType::Ceil);
+        addNodeMenuItem("Fract", material::NodeType::Fract);
+        addNodeMenuItem("Mod", material::NodeType::Mod);
+        addNodeMenuItem("Exp", material::NodeType::Exp);
+        addNodeMenuItem("Log", material::NodeType::Log);
+        addNodeMenuItem("Negate", material::NodeType::Negate);
         ImGui::EndMenu();
     }
 
@@ -1693,12 +1721,18 @@ void MaterialGraphPanel::DrawNodeCreationMenu() {
         addNodeMenuItem("Dot Product", material::NodeType::Dot);
         addNodeMenuItem("Normalize", material::NodeType::Normalize);
         addNodeMenuItem("Length", material::NodeType::Length);
+        ImGui::Separator();
+        addNodeMenuItem("Cross Product", material::NodeType::Cross);
+        addNodeMenuItem("Reflect", material::NodeType::Reflect);
+        addNodeMenuItem("Refract", material::NodeType::Refract);
         ImGui::EndMenu();
     }
     
     if (ImGui::BeginMenu("Convert")) {
+        addNodeMenuItem("Separate XY", material::NodeType::SeparateVec2);
         addNodeMenuItem("Separate RGB", material::NodeType::SeparateVec3);
         addNodeMenuItem("Separate RGBA", material::NodeType::SeparateVec4);
+        addNodeMenuItem("Combine XY", material::NodeType::CombineVec2);
         addNodeMenuItem("Combine RGB", material::NodeType::CombineVec3);
         addNodeMenuItem("Combine RGBA", material::NodeType::CombineVec4);
         ImGui::Separator();

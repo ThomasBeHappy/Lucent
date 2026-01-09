@@ -184,8 +184,6 @@ bool EditorUI::Init(GLFWwindow* window, gfx::VulkanContext* context, gfx::Device
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
-    io.ConfigViewportsNoAutoMerge = true;
-    io.ConfigViewportsNoTaskBarIcon = true;
     
     // Disable the ID conflict popup in debug builds (we log instead)
     // This is available in ImGui 1.91+

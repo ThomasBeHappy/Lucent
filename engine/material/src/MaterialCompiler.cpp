@@ -985,6 +985,97 @@ std::string MaterialCompiler::GenerateNodeCode(const MaterialGraph& graph, const
             pinVarNames[node.outputPins[0]] = var;
             break;
         }
+
+        case NodeType::Min: {
+            std::string a = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
+            std::string b = GetPinValue(graph, node.inputPins[1], PinType::Vec3, pinVarNames);
+            std::string var = varPrefix + "minv";
+            ss << "    vec3 " << var << " = min(" << a << ", " << b << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+
+        case NodeType::Max: {
+            std::string a = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
+            std::string b = GetPinValue(graph, node.inputPins[1], PinType::Vec3, pinVarNames);
+            std::string var = varPrefix + "maxv";
+            ss << "    vec3 " << var << " = max(" << a << ", " << b << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+
+        case NodeType::Saturate: {
+            std::string v = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
+            std::string var = varPrefix + "sat";
+            ss << "    vec3 " << var << " = clamp(" << v << ", vec3(0.0), vec3(1.0));\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+
+        case NodeType::Sqrt: {
+            std::string v = GetPinValue(graph, node.inputPins[0], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "sqrt";
+            ss << "    float " << var << " = sqrt(max(" << v << ", 0.0));\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+
+        case NodeType::Floor: {
+            std::string v = GetPinValue(graph, node.inputPins[0], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "floor";
+            ss << "    float " << var << " = floor(" << v << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+
+        case NodeType::Ceil: {
+            std::string v = GetPinValue(graph, node.inputPins[0], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "ceil";
+            ss << "    float " << var << " = ceil(" << v << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+
+        case NodeType::Fract: {
+            std::string v = GetPinValue(graph, node.inputPins[0], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "fract";
+            ss << "    float " << var << " = fract(" << v << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+
+        case NodeType::Mod: {
+            std::string a = GetPinValue(graph, node.inputPins[0], PinType::Float, pinVarNames);
+            std::string b = GetPinValue(graph, node.inputPins[1], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "mod";
+            ss << "    float " << var << " = mod(" << a << ", max(" << b << ", 0.0001));\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+
+        case NodeType::Exp: {
+            std::string v = GetPinValue(graph, node.inputPins[0], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "exp";
+            ss << "    float " << var << " = exp(" << v << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+
+        case NodeType::Log: {
+            std::string v = GetPinValue(graph, node.inputPins[0], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "log";
+            ss << "    float " << var << " = log(max(" << v << ", 0.000001));\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+
+        case NodeType::Negate: {
+            std::string v = GetPinValue(graph, node.inputPins[0], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "neg";
+            ss << "    float " << var << " = -(" << v << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
         
         case NodeType::Dot: {
             std::string a = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
@@ -1010,6 +1101,34 @@ std::string MaterialCompiler::GenerateNodeCode(const MaterialGraph& graph, const
             pinVarNames[node.outputPins[0]] = var;
             break;
         }
+
+        case NodeType::Cross: {
+            std::string a = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
+            std::string b = GetPinValue(graph, node.inputPins[1], PinType::Vec3, pinVarNames);
+            std::string var = varPrefix + "cross";
+            ss << "    vec3 " << var << " = cross(" << a << ", " << b << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+
+        case NodeType::Reflect: {
+            std::string i = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
+            std::string n = GetPinValue(graph, node.inputPins[1], PinType::Vec3, pinVarNames);
+            std::string var = varPrefix + "refl";
+            ss << "    vec3 " << var << " = reflect(" << i << ", normalize(" << n << "));\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+
+        case NodeType::Refract: {
+            std::string i = GetPinValue(graph, node.inputPins[0], PinType::Vec3, pinVarNames);
+            std::string n = GetPinValue(graph, node.inputPins[1], PinType::Vec3, pinVarNames);
+            std::string eta = GetPinValue(graph, node.inputPins[2], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "refr";
+            ss << "    vec3 " << var << " = refract(" << i << ", normalize(" << n << "), " << eta << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
         
         case NodeType::SeparateVec4: {
             std::string vec = GetPinValue(graph, node.inputPins[0], PinType::Vec4, pinVarNames);
@@ -1017,6 +1136,13 @@ std::string MaterialCompiler::GenerateNodeCode(const MaterialGraph& graph, const
             pinVarNames[node.outputPins[1]] = "(" + vec + ").y";
             pinVarNames[node.outputPins[2]] = "(" + vec + ").z";
             pinVarNames[node.outputPins[3]] = "(" + vec + ").w";
+            break;
+        }
+
+        case NodeType::SeparateVec2: {
+            std::string vec = GetPinValue(graph, node.inputPins[0], PinType::Vec2, pinVarNames);
+            pinVarNames[node.outputPins[0]] = "(" + vec + ").x";
+            pinVarNames[node.outputPins[1]] = "(" + vec + ").y";
             break;
         }
         
@@ -1027,6 +1153,15 @@ std::string MaterialCompiler::GenerateNodeCode(const MaterialGraph& graph, const
             std::string a = GetPinValue(graph, node.inputPins[3], PinType::Float, pinVarNames);
             std::string var = varPrefix + "combine4";
             ss << "    vec4 " << var << " = vec4(" << r << ", " << g << ", " << b << ", " << a << ");\n";
+            pinVarNames[node.outputPins[0]] = var;
+            break;
+        }
+
+        case NodeType::CombineVec2: {
+            std::string x = GetPinValue(graph, node.inputPins[0], PinType::Float, pinVarNames);
+            std::string y = GetPinValue(graph, node.inputPins[1], PinType::Float, pinVarNames);
+            std::string var = varPrefix + "combine2";
+            ss << "    vec2 " << var << " = vec2(" << x << ", " << y << ");\n";
             pinVarNames[node.outputPins[0]] = var;
             break;
         }

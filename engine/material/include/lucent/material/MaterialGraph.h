@@ -126,6 +126,34 @@ enum class NodeType {
     Vec2ToVec3,         // Extend vec2 to vec3 (z=0)
     Vec3ToVec4,         // Extend vec3 to vec4 (a=1)
     Vec4ToVec3,         // Drop alpha from vec4
+
+    // ---------------------------------------------------------------------
+    // IMPORTANT: New nodes must be APPENDED ONLY.
+    // NodeType is serialized as an integer in .lmat files; reordering will
+    // break backwards compatibility for existing materials.
+    // ---------------------------------------------------------------------
+
+    // More Math
+    Min,            // min(A, B) (component-wise for vectors)
+    Max,            // max(A, B) (component-wise for vectors)
+    Saturate,       // clamp(X, 0..1) (component-wise for vectors)
+    Sqrt,           // sqrt(X)
+    Floor,          // floor(X)
+    Ceil,           // ceil(X)
+    Fract,          // fract(X)
+    Mod,            // mod(A, B)
+    Exp,            // exp(X)
+    Log,            // log(X)
+    Negate,         // -X
+
+    // More Vector
+    Cross,          // cross(A, B)
+    Reflect,        // reflect(I, N)
+    Refract,        // refract(I, N, eta)
+
+    // More Split/Combine
+    SeparateVec2,   // Split vec2 into X, Y
+    CombineVec2,    // Combine X, Y into vec2
 };
 
 // Get node category for UI
@@ -161,17 +189,33 @@ inline const char* GetNodeCategory(NodeType type) {
         case NodeType::Clamp:
         case NodeType::OneMinus:
         case NodeType::Abs:
+        case NodeType::Min:
+        case NodeType::Max:
+        case NodeType::Saturate:
+        case NodeType::Sqrt:
+        case NodeType::Floor:
+        case NodeType::Ceil:
+        case NodeType::Fract:
+        case NodeType::Mod:
+        case NodeType::Exp:
+        case NodeType::Log:
+        case NodeType::Negate:
             return "Math";
         case NodeType::Fresnel:
             return "Shading";
         case NodeType::Dot:
         case NodeType::Normalize:
         case NodeType::Length:
+        case NodeType::Cross:
+        case NodeType::Reflect:
+        case NodeType::Refract:
             return "Vector";
         case NodeType::SeparateVec3:
         case NodeType::SeparateVec4:
+        case NodeType::SeparateVec2:
         case NodeType::CombineVec3:
         case NodeType::CombineVec4:
+        case NodeType::CombineVec2:
             return "Convert";
         case NodeType::PBROutput:
         case NodeType::VolumetricOutput:
@@ -217,14 +261,30 @@ inline const char* GetNodeTypeName(NodeType type) {
         case NodeType::Clamp: return "Clamp";
         case NodeType::OneMinus: return "One Minus";
         case NodeType::Abs: return "Abs";
+        case NodeType::Min: return "Min";
+        case NodeType::Max: return "Max";
+        case NodeType::Saturate: return "Saturate";
+        case NodeType::Sqrt: return "Sqrt";
+        case NodeType::Floor: return "Floor";
+        case NodeType::Ceil: return "Ceil";
+        case NodeType::Fract: return "Fract";
+        case NodeType::Mod: return "Mod";
+        case NodeType::Exp: return "Exp";
+        case NodeType::Log: return "Log";
+        case NodeType::Negate: return "Negate";
         case NodeType::Fresnel: return "Fresnel";
         case NodeType::Dot: return "Dot Product";
         case NodeType::Normalize: return "Normalize";
         case NodeType::Length: return "Length";
+        case NodeType::Cross: return "Cross Product";
+        case NodeType::Reflect: return "Reflect";
+        case NodeType::Refract: return "Refract";
         case NodeType::SeparateVec3: return "Separate RGB";
         case NodeType::SeparateVec4: return "Separate RGBA";
+        case NodeType::SeparateVec2: return "Separate XY";
         case NodeType::CombineVec3: return "Combine RGB";
         case NodeType::CombineVec4: return "Combine RGBA";
+        case NodeType::CombineVec2: return "Combine XY";
         case NodeType::PBROutput: return "PBR Output";
         case NodeType::VolumetricOutput: return "Volume Output";
         case NodeType::Reroute: return "Reroute";

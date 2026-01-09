@@ -269,6 +269,32 @@ void MaterialGraph::SetupNodePins(MaterialNode& node) {
             addOutput("Result", PinType::Float);
             break;
 
+        case NodeType::Min:
+        case NodeType::Max:
+            addInput("A", PinType::Vec3, glm::vec3(0.0f));
+            addInput("B", PinType::Vec3, glm::vec3(0.0f));
+            addOutput("Result", PinType::Vec3);
+            break;
+        case NodeType::Saturate:
+            addInput("Value", PinType::Vec3, glm::vec3(0.0f));
+            addOutput("Result", PinType::Vec3);
+            break;
+        case NodeType::Sqrt:
+        case NodeType::Floor:
+        case NodeType::Ceil:
+        case NodeType::Fract:
+        case NodeType::Exp:
+        case NodeType::Log:
+        case NodeType::Negate:
+            addInput("Value", PinType::Float, 0.0f);
+            addOutput("Result", PinType::Float);
+            break;
+        case NodeType::Mod:
+            addInput("A", PinType::Float, 0.0f);
+            addInput("B", PinType::Float, 1.0f);
+            addOutput("Result", PinType::Float);
+            break;
+
         // Shading helpers
         case NodeType::Fresnel:
             addInput("Power", PinType::Float, 5.0f);
@@ -289,6 +315,23 @@ void MaterialGraph::SetupNodePins(MaterialNode& node) {
             addInput("Vector", PinType::Vec3, glm::vec3(0.0f));
             addOutput("Result", PinType::Float);
             break;
+
+        case NodeType::Cross:
+            addInput("A", PinType::Vec3, glm::vec3(1.0f, 0.0f, 0.0f));
+            addInput("B", PinType::Vec3, glm::vec3(0.0f, 1.0f, 0.0f));
+            addOutput("Result", PinType::Vec3);
+            break;
+        case NodeType::Reflect:
+            addInput("I", PinType::Vec3, glm::vec3(0.0f, 0.0f, -1.0f));
+            addInput("N", PinType::Vec3, glm::vec3(0.0f, 0.0f, 1.0f));
+            addOutput("Result", PinType::Vec3);
+            break;
+        case NodeType::Refract:
+            addInput("I", PinType::Vec3, glm::vec3(0.0f, 0.0f, -1.0f));
+            addInput("N", PinType::Vec3, glm::vec3(0.0f, 0.0f, 1.0f));
+            addInput("Eta", PinType::Float, 1.0f / 1.5f);
+            addOutput("Result", PinType::Vec3);
+            break;
             
         // Separate/Combine
         case NodeType::SeparateVec3:
@@ -304,6 +347,11 @@ void MaterialGraph::SetupNodePins(MaterialNode& node) {
             addOutput("B", PinType::Float);
             addOutput("A", PinType::Float);
             break;
+        case NodeType::SeparateVec2:
+            addInput("Vector", PinType::Vec2, glm::vec2(0.0f));
+            addOutput("X", PinType::Float);
+            addOutput("Y", PinType::Float);
+            break;
         case NodeType::CombineVec3:
             addInput("R", PinType::Float, 0.0f);
             addInput("G", PinType::Float, 0.0f);
@@ -316,6 +364,11 @@ void MaterialGraph::SetupNodePins(MaterialNode& node) {
             addInput("B", PinType::Float, 0.0f);
             addInput("A", PinType::Float, 1.0f);
             addOutput("Vector", PinType::Vec4);
+            break;
+        case NodeType::CombineVec2:
+            addInput("X", PinType::Float, 0.0f);
+            addInput("Y", PinType::Float, 0.0f);
+            addOutput("Vector", PinType::Vec2);
             break;
             
         // PBR Output
