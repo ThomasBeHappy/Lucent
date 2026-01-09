@@ -516,17 +516,18 @@ void EditorUI::BeginFrame() {
 
 void EditorUI::EndFrame() {
     ImGui::Render();
-    
-    // Handle multi-viewport if enabled
+}
+
+void EditorUI::Render(VkCommandBuffer cmd) {
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
+}
+
+void EditorUI::RenderPlatformWindows() {
     ImGuiIO& io = ImGui::GetIO();
     if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
         ImGui::UpdatePlatformWindows();
         ImGui::RenderPlatformWindowsDefault();
     }
-}
-
-void EditorUI::Render(VkCommandBuffer cmd) {
-    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
 }
 
 void EditorUI::SetViewportTexture(VkImageView view, VkSampler sampler) {

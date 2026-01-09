@@ -84,6 +84,7 @@ public:
     void BeginFrame();
     void EndFrame();
     void Render(VkCommandBuffer cmd);
+    void RenderPlatformWindows();
     
     // Scene and selection binding
     void SetScene(scene::Scene* scene) { m_Scene = scene; }
