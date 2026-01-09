@@ -160,6 +160,15 @@ void MaterialGraph::SetupNodePins(MaterialNode& node) {
         case NodeType::Time:
             addOutput("Time", PinType::Float);
             break;
+        case NodeType::WorldPosition:
+            addOutput("Position", PinType::Vec3);
+            break;
+        case NodeType::WorldNormal:
+            addOutput("Normal", PinType::Vec3);
+            break;
+        case NodeType::ViewDirection:
+            addOutput("View", PinType::Vec3);
+            break;
             
         // Constants
         case NodeType::ConstFloat:

@@ -1490,6 +1490,9 @@ static const NodeMenuItem s_AllNodeTypes[] = {
     { material::NodeType::UV, "UV", "Input" },
     { material::NodeType::VertexColor, "Vertex Color", "Input" },
     { material::NodeType::Time, "Time", "Input" },
+    { material::NodeType::WorldPosition, "World Position", "Input" },
+    { material::NodeType::WorldNormal, "World Normal", "Input" },
+    { material::NodeType::ViewDirection, "View Direction", "Input" },
     // Constants
     { material::NodeType::ConstFloat, "Float", "Constants" },
     { material::NodeType::ConstVec2, "Vector2", "Constants" },
@@ -1687,6 +1690,10 @@ void MaterialGraphPanel::DrawNodeCreationMenu() {
         addNodeMenuItem("UV", material::NodeType::UV);
         addNodeMenuItem("Vertex Color", material::NodeType::VertexColor);
         addNodeMenuItem("Time", material::NodeType::Time);
+        ImGui::Separator();
+        addNodeMenuItem("World Position", material::NodeType::WorldPosition);
+        addNodeMenuItem("World Normal", material::NodeType::WorldNormal);
+        addNodeMenuItem("View Direction", material::NodeType::ViewDirection);
         ImGui::EndMenu();
     }
     

@@ -118,6 +118,18 @@ bool MaterialIRCompiler::Compile(const MaterialGraph& graph, MaterialIR& outIR, 
             case NodeType::UV:
                 instr.type = IRNodeType::UV;
                 break;
+
+            case NodeType::WorldPosition:
+                instr.type = IRNodeType::WorldPos;
+                break;
+
+            case NodeType::WorldNormal:
+                instr.type = IRNodeType::WorldNormal;
+                break;
+
+            case NodeType::ViewDirection:
+                instr.type = IRNodeType::ViewDir;
+                break;
                 
             case NodeType::Add:
                 instr.type = IRNodeType::Add;
@@ -242,6 +254,9 @@ bool MaterialIRCompiler::IsTracedCompatible(const MaterialGraph& graph) {
             case NodeType::Texture2D:
             case NodeType::NormalMap:
             case NodeType::UV:
+            case NodeType::WorldPosition:
+            case NodeType::WorldNormal:
+            case NodeType::ViewDirection:
             case NodeType::Add:
             case NodeType::Multiply:
             case NodeType::Lerp:

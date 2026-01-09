@@ -704,6 +704,18 @@ std::string MaterialCompiler::GenerateNodeCode(const MaterialGraph& graph, const
         case NodeType::Time:
             pinVarNames[node.outputPins[0]] = "0.0"; // Placeholder
             break;
+
+        case NodeType::WorldPosition:
+            pinVarNames[node.outputPins[0]] = "inWorldPos";
+            break;
+
+        case NodeType::WorldNormal:
+            pinVarNames[node.outputPins[0]] = "normalize(inNormal)";
+            break;
+
+        case NodeType::ViewDirection:
+            pinVarNames[node.outputPins[0]] = "normalize(pc.cameraPos.xyz - inWorldPos)";
+            break;
             
         case NodeType::ConstFloat: {
             float val = std::holds_alternative<float>(node.parameter) ? std::get<float>(node.parameter) : 0.0f;

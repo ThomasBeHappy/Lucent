@@ -154,6 +154,11 @@ enum class NodeType {
     // More Split/Combine
     SeparateVec2,   // Split vec2 into X, Y
     CombineVec2,    // Combine X, Y into vec2
+
+    // More Inputs
+    WorldPosition,  // Outputs world-space position
+    WorldNormal,    // Outputs world-space normal
+    ViewDirection,  // Outputs view direction (from fragment to camera, normalized)
 };
 
 // Get node category for UI
@@ -162,6 +167,9 @@ inline const char* GetNodeCategory(NodeType type) {
         case NodeType::UV:
         case NodeType::VertexColor:
         case NodeType::Time:
+        case NodeType::WorldPosition:
+        case NodeType::WorldNormal:
+        case NodeType::ViewDirection:
             return "Input";
         case NodeType::ConstFloat:
         case NodeType::ConstVec2:
@@ -239,6 +247,9 @@ inline const char* GetNodeTypeName(NodeType type) {
         case NodeType::UV: return "UV";
         case NodeType::VertexColor: return "Vertex Color";
         case NodeType::Time: return "Time";
+        case NodeType::WorldPosition: return "World Position";
+        case NodeType::WorldNormal: return "World Normal";
+        case NodeType::ViewDirection: return "View Direction";
         case NodeType::ConstFloat: return "Float";
         case NodeType::ConstVec2: return "Vector2";
         case NodeType::ConstVec3: return "Vector3 / Color";
