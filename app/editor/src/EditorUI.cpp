@@ -3241,6 +3241,19 @@ void EditorUI::DrawModals() {
         ImGui::Text("Edit");
         ImGui::BulletText("Ctrl+D: Duplicate");
         ImGui::BulletText("Delete: Delete selection");
+
+        ImGui::Separator();
+        ImGui::Text("Mesh Edit");
+        ImGui::BulletText("1 / 2 / 3: Vertex / Edge / Face selection");
+        ImGui::BulletText("E: Extrude faces");
+        ImGui::BulletText("I: Inset faces");
+        ImGui::BulletText("Ctrl+B: Bevel edges");
+        ImGui::BulletText("Ctrl+R: Loop cut (edge selection)");
+        ImGui::BulletText("Alt+L: Select edge loop");
+        ImGui::BulletText("Alt+R: Select edge ring");
+        ImGui::BulletText("Alt+X: Dissolve selection");
+        ImGui::BulletText("Ctrl+Shift+R: Subdivide faces");
+        ImGui::BulletText("Ctrl+-: Shrink selection");
         
         ImGui::Spacing();
         if (ImGui::Button("Close", ImVec2(120, 0))) {
@@ -3616,6 +3629,87 @@ void EditorUI::HandleGlobalShortcuts() {
                     LUCENT_CORE_INFO("Inset {} faces", meshPtr->GetSelection().faces.size());
                 }
             }
+
+            // Ctrl+B - Bevel edges
+            if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_B)) {
+                if (!meshPtr->GetSelection().edges.empty()) {
+                    auto before = MeshEditCommand::CaptureSnapshot(editMesh);
+                    mesh::MeshOps::BevelEdges(*meshPtr, 0.1f, 1);
+                    editMesh->MarkDirty();
+                    m_SceneDirty = true;
+                    pushMeshUndo("Bevel", before);
+                    LUCENT_CORE_INFO("Beveled {} edges", meshPtr->GetSelection().edges.size());
+                }
+            }
+
+            // Ctrl+R - Loop cut (edge selection)
+            if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R) && !io.KeyShift) {
+                if (!meshPtr->GetSelection().edges.empty()) {
+                    auto before = MeshEditCommand::CaptureSnapshot(editMesh);
+                    EdgeID startEdge = *meshPtr->GetSelection().edges.begin();
+                    mesh::MeshOps::LoopCut(*meshPtr, startEdge, 0.5f);
+                    editMesh->MarkDirty();
+                    m_SceneDirty = true;
+                    pushMeshUndo("Loop Cut", before);
+                    LUCENT_CORE_INFO("Loop cut starting at edge {}", startEdge);
+                }
+            }
+
+            // Alt+L - Select edge loop
+            if (io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_L)) {
+                if (!meshPtr->GetSelection().edges.empty()) {
+                    EdgeID startEdge = *meshPtr->GetSelection().edges.begin();
+                    mesh::MeshOps::SelectEdgeLoop(*meshPtr, startEdge);
+                }
+            }
+
+            // Alt+R - Select edge ring
+            if (io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_R)) {
+                if (!meshPtr->GetSelection().edges.empty()) {
+                    EdgeID startEdge = *meshPtr->GetSelection().edges.begin();
+                    mesh::MeshOps::SelectEdgeRing(*meshPtr, startEdge);
+                }
+            }
+
+            // Alt+X - Dissolve selection
+            if (io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_X)) {
+                auto before = MeshEditCommand::CaptureSnapshot(editMesh);
+                bool didDissolve = false;
+                switch (m_MeshSelectMode) {
+                    case MeshSelectMode::Vertex:
+                        if (!meshPtr->GetSelection().vertices.empty()) {
+                            mesh::MeshOps::DissolveVertices(*meshPtr);
+                            didDissolve = true;
+                        }
+                        break;
+                    case MeshSelectMode::Edge:
+                        if (!meshPtr->GetSelection().edges.empty()) {
+                            mesh::MeshOps::DissolveEdges(*meshPtr);
+                            didDissolve = true;
+                        }
+                        break;
+                    case MeshSelectMode::Face:
+                        break;
+                }
+
+                if (didDissolve) {
+                    editMesh->MarkDirty();
+                    m_SceneDirty = true;
+                    pushMeshUndo("Dissolve", before);
+                }
+            }
+
+            // Ctrl+Shift+R - Subdivide faces
+            if (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_R)) {
+                if (!meshPtr->GetSelection().faces.empty()) {
+                    auto before = MeshEditCommand::CaptureSnapshot(editMesh);
+                    mesh::MeshOps::SubdivideFaces(*meshPtr, 1);
+                    editMesh->MarkDirty();
+                    m_SceneDirty = true;
+                    pushMeshUndo("Subdivide", before);
+                    LUCENT_CORE_INFO("Subdivided {} faces", meshPtr->GetSelection().faces.size());
+                }
+            }
             
             // X - Delete
             if (ImGui::IsKeyPressed(ImGuiKey_X) && !io.KeyCtrl) {
@@ -3650,6 +3744,13 @@ void EditorUI::HandleGlobalShortcuts() {
                 }
             }
             
+            // Ctrl+- - Shrink selection
+            if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Minus)) {
+                if (!meshPtr->GetSelection().Empty()) {
+                    mesh::MeshOps::ShrinkSelection(*meshPtr);
+                }
+            }
+
             // M - Merge vertices
             if (ImGui::IsKeyPressed(ImGuiKey_M)) {
                 if (!meshPtr->GetSelection().vertices.empty()) {

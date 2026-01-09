@@ -107,6 +107,7 @@ Use **Render Properties** to switch modes and tune quality:
 - **Film:** Exposure, tonemapping, and gamma.
 
 ### Keyboard Shortcuts (Quick Reference)
+Full list: [`docs/editor_workflow.md`](docs/editor_workflow.md#keyboard-shortcuts-quick-reference).
 
 | Action | Shortcut |
 | --- | --- |
@@ -118,6 +119,16 @@ Use **Render Properties** to switch modes and tune quality:
 | Undo / Redo | `Ctrl+Z` / `Ctrl+Y` |
 | Delete | `Delete` |
 | Select All | `Ctrl+A` |
+| Mesh Select Mode | `1` / `2` / `3` |
+| Extrude Faces | `E` |
+| Inset Faces | `I` |
+| Bevel Edges | `Ctrl+B` |
+| Loop Cut | `Ctrl+R` |
+| Select Edge Loop | `Alt+L` |
+| Select Edge Ring | `Alt+R` |
+| Dissolve | `Alt+X` |
+| Subdivide Faces | `Ctrl+Shift+R` |
+| Shrink Selection | `Ctrl+-` |
 
 ## Project Structure
 
