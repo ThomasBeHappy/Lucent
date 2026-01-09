@@ -36,6 +36,7 @@
 #define LUCENT_ICON_CLOSE    "\xef\x80\x8d"  // U+F00D
 #define LUCENT_ICON_PLUS     "\xef\x81\xa7"  // U+F067
 #define LUCENT_ICON_EDIT     "\xef\x81\x84"  // U+F044
+#define LUCENT_ICON_IMAGE    "\xef\x80\xbe"  // U+F03E
 
 // Editor-ish:
 #define LUCENT_ICON_CAMERA   "\xef\x80\xb0"  // U+F030
