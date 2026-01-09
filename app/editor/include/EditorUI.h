@@ -177,6 +177,7 @@ private:
     void DrawContentBrowserPanel();
     void DrawConsolePanel();
     void DrawRenderPropertiesPanel();
+    void ApplySceneEnvironment();
     
     void DrawEntityNode(scene::Entity entity);
     void DrawComponentsPanel(scene::Entity entity);

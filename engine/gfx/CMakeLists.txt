@@ -13,6 +13,7 @@ set(ENGINE_GFX_SOURCES
     src/TracerRayKHR.cpp
     src/FinalRender.cpp
     src/EnvironmentMap.cpp
+    src/EnvironmentMapLibrary.cpp
 )
 
 # Add OptiX denoiser if enabled
@@ -49,4 +50,3 @@ endif()
 
 # Alias for cleaner target names
 add_library(Lucent::Gfx ALIAS engine_gfx)
-

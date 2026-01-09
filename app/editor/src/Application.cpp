@@ -182,6 +182,8 @@ bool Application::Init(const ApplicationConfig& config) {
 #endif
         return false;
     }
+
+    gfx::EnvironmentMapLibrary::Get().Init(&m_Device);
     
     // Initialize renderer
     gfx::RendererConfig rendererConfig{};
@@ -621,6 +623,7 @@ void Application::Shutdown() {
     if (!m_Window) return;
     
     material::MaterialAssetManager::Get().Shutdown();
+    gfx::EnvironmentMapLibrary::Get().Shutdown();
     m_EditorUI.Shutdown();
     m_Renderer.Shutdown();
     m_Device.Shutdown();
@@ -785,6 +788,7 @@ void Application::RenderSceneToViewport(VkCommandBuffer cmd) {
     gfx::RenderMode renderMode = m_Renderer.GetRenderMode();
     // Keep settings mode in sync (used for convergence logic)
     m_Renderer.GetSettings().activeMode = renderMode;
+    UpdateEnvironmentMapFromSettings();
     
     if (renderMode == gfx::RenderMode::Traced && m_Renderer.GetTracerCompute()) {
         // =========================================================================
@@ -2072,21 +2076,58 @@ void Application::RenderRayTracedPath(VkCommandBuffer cmd) {
     settings.IncrementSamples(1);
 }
 
+void Application::ApplyEnvironmentMapHandle(uint32_t handle) {
+    auto* envMap = gfx::EnvironmentMapLibrary::Get().Get(handle);
+    if (!envMap) {
+        return;
+    }
+
+    if (auto* tracer = m_Renderer.GetTracerCompute()) {
+        tracer->SetEnvironmentMap(envMap);
+    }
+    if (auto* tracer = m_Renderer.GetTracerRayKHR()) {
+        tracer->SetEnvironmentMap(envMap);
+    }
+
+    m_ActiveEnvMapHandle = handle;
+}
+
+void Application::UpdateEnvironmentMapFromSettings() {
+    gfx::RenderSettings& settings = m_Renderer.GetSettings();
+    if (settings.envMapHandle == m_ActiveEnvMapHandle) {
+        return;
+    }
+
+    uint32_t desiredHandle = settings.envMapHandle;
+    if (desiredHandle == gfx::EnvironmentMapLibrary::InvalidHandle) {
+        desiredHandle = m_DefaultEnvMapHandle;
+    }
+
+    auto* envMap = gfx::EnvironmentMapLibrary::Get().Get(desiredHandle);
+    if (!envMap && m_DefaultEnvMapHandle != gfx::EnvironmentMapLibrary::InvalidHandle) {
+        desiredHandle = m_DefaultEnvMapHandle;
+        envMap = gfx::EnvironmentMapLibrary::Get().Get(desiredHandle);
+    }
+
+    if (!envMap) {
+        return;
+    }
+
+    ApplyEnvironmentMapHandle(desiredHandle);
+}
+
 void Application::InitEnvironmentMap() {
-    // Create a default procedural sky environment
-    if (!m_EnvironmentMap.CreateDefaultSky(&m_Device)) {
+    m_DefaultEnvMapHandle = gfx::EnvironmentMapLibrary::Get().CreateDefaultSky();
+    if (m_DefaultEnvMapHandle == gfx::EnvironmentMapLibrary::InvalidHandle) {
         LUCENT_CORE_WARN("Failed to create default environment map");
         return;
     }
-    
-    // Set the environment map on both tracers
-    if (auto* tracer = m_Renderer.GetTracerCompute()) {
-        tracer->SetEnvironmentMap(&m_EnvironmentMap);
-    }
-    if (auto* tracer = m_Renderer.GetTracerRayKHR()) {
-        tracer->SetEnvironmentMap(&m_EnvironmentMap);
-    }
-    
+
+    gfx::RenderSettings& settings = m_Renderer.GetSettings();
+    settings.envMapHandle = m_DefaultEnvMapHandle;
+    settings.envMapPath.clear();
+    ApplyEnvironmentMapHandle(m_DefaultEnvMapHandle);
+
     LUCENT_CORE_INFO("Environment map initialized");
 }
 

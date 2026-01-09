@@ -4,7 +4,7 @@
 #include "lucent/gfx/VulkanContext.h"
 #include "lucent/gfx/Device.h"
 #include "lucent/gfx/Renderer.h"
-#include "lucent/gfx/EnvironmentMap.h"
+#include "lucent/gfx/EnvironmentMapLibrary.h"
 #include "lucent/scene/Scene.h"
 #include "lucent/scene/EditorCamera.h"
 #include "lucent/assets/Mesh.h"
@@ -131,8 +131,11 @@ private:
     bool m_RenderPreviewTextureReady = false;
     
     // Environment mapping (HDRI)
-    gfx::EnvironmentMap m_EnvironmentMap;
     void InitEnvironmentMap();
+    void ApplyEnvironmentMapHandle(uint32_t handle);
+    void UpdateEnvironmentMapFromSettings();
+    uint32_t m_DefaultEnvMapHandle = gfx::EnvironmentMapLibrary::InvalidHandle;
+    uint32_t m_ActiveEnvMapHandle = gfx::EnvironmentMapLibrary::InvalidHandle;
 };
 
 } // namespace lucent

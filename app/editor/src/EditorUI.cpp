@@ -7,6 +7,7 @@
 #include "lucent/gfx/VulkanContext.h"
 #include "lucent/gfx/Device.h"
 #include "lucent/gfx/Renderer.h"
+#include "lucent/gfx/EnvironmentMapLibrary.h"
 #include "lucent/assets/MeshRegistry.h"
 #include "lucent/scene/Components.h"
 #include "lucent/material/MaterialAsset.h"
@@ -710,6 +711,8 @@ void EditorUI::DrawDockspace() {
                     auto light = m_Scene->CreateEntity("Directional Light");
                     auto& l = light.AddComponent<scene::LightComponent>();
                     l.type = scene::LightType::Directional;
+                    m_Scene->SetEnvironmentMapPath("");
+                    ApplySceneEnvironment();
                     
                     ClearSelection();
                     m_CurrentScenePath.clear();
@@ -743,6 +746,7 @@ void EditorUI::DrawDockspace() {
                             m_CurrentScenePath = path;
                             m_SceneDirty = false;
                             ClearSelection();
+                            ApplySceneEnvironment();
                         } else {
                             Win32FileDialogs::ShowError(L"Error", L"Failed to load scene file.");
                         }
@@ -2779,7 +2783,43 @@ void EditorUI::DrawRenderPropertiesPanel() {
                 settings.envRotation = glm::radians(rotationDeg);
                 settings.MarkDirty();
             }
-            ImGui::TextDisabled("HDR file loading: TODO");
+            ImGui::Text("HDRI");
+            ImGui::SameLine();
+            const char* browseLabel = m_IconFontLoaded ? (LUCENT_ICON_FOLDER " Browse") : "Browse";
+            if (ImGui::Button(browseLabel)) {
+                std::string path = Win32FileDialogs::OpenFile(L"Open HDRI",
+                    {{L"HDR Images", L"*.hdr;*.exr"}, {L"All Files", L"*.*"}});
+                if (!path.empty()) {
+                    uint32_t handle = gfx::EnvironmentMapLibrary::Get().LoadFromFile(path);
+                    if (handle != gfx::EnvironmentMapLibrary::InvalidHandle) {
+                        settings.envMapPath = path;
+                        settings.envMapHandle = handle;
+                        settings.MarkDirty();
+                        if (m_Scene) {
+                            m_Scene->SetEnvironmentMapPath(path);
+                        }
+                    } else {
+                        Win32FileDialogs::ShowError(L"Open HDRI", L"Failed to load the HDR environment map.");
+                    }
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Use Default")) {
+                uint32_t handle = gfx::EnvironmentMapLibrary::Get().GetDefaultHandle();
+                if (handle != gfx::EnvironmentMapLibrary::InvalidHandle) {
+                    settings.envMapPath.clear();
+                    settings.envMapHandle = handle;
+                    settings.MarkDirty();
+                    if (m_Scene) {
+                        m_Scene->SetEnvironmentMapPath("");
+                    }
+                }
+            }
+            if (settings.envMapPath.empty()) {
+                ImGui::TextDisabled("Using default sky environment.");
+            } else {
+                ImGui::TextWrapped("%s", settings.envMapPath.c_str());
+            }
         }
     }
     
@@ -3201,6 +3241,34 @@ bool EditorUI::RayIntersectsSphere(const glm::vec3& rayOrigin, const glm::vec3& 
     }
     
     return false;
+}
+
+void EditorUI::ApplySceneEnvironment() {
+    if (!m_Renderer || !m_Scene) {
+        return;
+    }
+
+    gfx::RenderSettings& settings = m_Renderer->GetSettings();
+    const std::string& path = m_Scene->GetEnvironmentMapPath();
+    if (path.empty()) {
+        uint32_t handle = gfx::EnvironmentMapLibrary::Get().GetDefaultHandle();
+        if (handle != gfx::EnvironmentMapLibrary::InvalidHandle) {
+            settings.envMapPath.clear();
+            settings.envMapHandle = handle;
+            settings.MarkDirty();
+        }
+        return;
+    }
+
+    uint32_t handle = gfx::EnvironmentMapLibrary::Get().LoadFromFile(path);
+    if (handle == gfx::EnvironmentMapLibrary::InvalidHandle) {
+        LUCENT_CORE_WARN("Failed to load HDRI from scene: {}", path);
+        return;
+    }
+
+    settings.envMapPath = path;
+    settings.envMapHandle = handle;
+    settings.MarkDirty();
 }
 
 // ============================================================================
