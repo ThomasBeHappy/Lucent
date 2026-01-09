@@ -333,6 +333,12 @@ void EditableMeshComponent::InitFromPrimitive(MeshRendererComponent::PrimitiveTy
             mesh::EditableMesh::FromFaces(positions, faces)
         );
 
+        // Ensure consistent winding and outward orientation (fixes inverted lighting on the default cube).
+        // This must happen before we derive UV projections from face normals.
+        if (mesh) {
+            mesh->MakeWindingConsistentAndOutward();
+        }
+
         // Assign per-face UVs (per-loop) so materials don't "break" when entering Edit Mode.
         // With only 8 shared vertices we can't have per-face vertex UV seams, but EditableMesh
         // supports per-loop UVs which is exactly what a cube needs.
