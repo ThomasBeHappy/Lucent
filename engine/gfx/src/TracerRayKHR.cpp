@@ -1,9 +1,164 @@
 #include "lucent/gfx/TracerRayKHR.h"
 #include "lucent/gfx/PipelineBuilder.h"
 #include "lucent/core/Log.h"
+#include <stb_image.h>
 #include <cstring>
+#include <cmath>
+#include <algorithm>
 
 namespace lucent::gfx {
+
+static constexpr uint32_t kMaxRTMaterialTextures = 256; // fixed-size sampler array bound for RT material evaluation
+
+static bool CreateRTSampler(VkDevice device, uint32_t mipLevels, VkSampler& outSampler) {
+    if (outSampler != VK_NULL_HANDLE) return true;
+
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = static_cast<float>(std::max<uint32_t>(mipLevels, 1u));
+
+    return vkCreateSampler(device, &samplerInfo, nullptr, &outSampler) == VK_SUCCESS;
+}
+
+static void GenerateMipmapsRT(VkCommandBuffer cmd, VkImage image, uint32_t width, uint32_t height, uint32_t mipLevels) {
+    if (mipLevels <= 1) return;
+
+    int32_t mipWidth = static_cast<int32_t>(width);
+    int32_t mipHeight = static_cast<int32_t>(height);
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.image = image;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.subresourceRange.levelCount = 1;
+
+    for (uint32_t i = 1; i < mipLevels; i++) {
+        barrier.subresourceRange.baseMipLevel = i - 1;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+            0, nullptr, 0, nullptr, 1, &barrier);
+
+        VkImageBlit blit{};
+        blit.srcOffsets[0] = { 0, 0, 0 };
+        blit.srcOffsets[1] = { mipWidth, mipHeight, 1 };
+        blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.srcSubresource.mipLevel = i - 1;
+        blit.srcSubresource.baseArrayLayer = 0;
+        blit.srcSubresource.layerCount = 1;
+
+        int32_t nextWidth = mipWidth > 1 ? mipWidth / 2 : 1;
+        int32_t nextHeight = mipHeight > 1 ? mipHeight / 2 : 1;
+
+        blit.dstOffsets[0] = { 0, 0, 0 };
+        blit.dstOffsets[1] = { nextWidth, nextHeight, 1 };
+        blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.dstSubresource.mipLevel = i;
+        blit.dstSubresource.baseArrayLayer = 0;
+        blit.dstSubresource.layerCount = 1;
+
+        vkCmdBlitImage(cmd,
+            image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, &blit, VK_FILTER_LINEAR);
+
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+            0, nullptr, 0, nullptr, 1, &barrier);
+
+        mipWidth = nextWidth;
+        mipHeight = nextHeight;
+    }
+
+    barrier.subresourceRange.baseMipLevel = mipLevels - 1;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+        0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+static bool CreateSolid1x1Texture(Device* device, VkFormat format, uint8_t r, uint8_t g, uint8_t b, uint8_t a,
+                                  const char* debugName, std::unique_ptr<Image>& outImage) {
+    if (outImage) return true;
+
+    outImage = std::make_unique<Image>();
+
+    ImageDesc imageDesc{};
+    imageDesc.width = 1;
+    imageDesc.height = 1;
+    imageDesc.format = format;
+    imageDesc.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageDesc.mipLevels = 1;
+    imageDesc.debugName = debugName;
+
+    if (!outImage->Init(device, imageDesc)) {
+        outImage.reset();
+        return false;
+    }
+
+    uint8_t pixel[4] = { r, g, b, a };
+
+    BufferDesc stagingDesc{};
+    stagingDesc.size = sizeof(pixel);
+    stagingDesc.usage = BufferUsage::Staging;
+    stagingDesc.hostVisible = true;
+    stagingDesc.debugName = "RTFallbackTexStaging";
+
+    Buffer staging;
+    if (!staging.Init(device, stagingDesc)) {
+        outImage.reset();
+        return false;
+    }
+    staging.Upload(pixel, sizeof(pixel));
+
+    VkCommandBuffer cmd = device->BeginSingleTimeCommands();
+    outImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+    VkBufferImageCopy region{};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = { 1, 1, 1 };
+
+    vkCmdCopyBufferToImage(cmd, staging.GetHandle(), outImage->GetHandle(),
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    outImage->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    device->EndSingleTimeCommands(cmd);
+
+    staging.Shutdown();
+    return true;
+}
 
 TracerRayKHR::~TracerRayKHR() {
     Shutdown();
@@ -34,10 +189,11 @@ bool TracerRayKHR::Init(VulkanContext* context, Device* device) {
     VkDescriptorPoolSize poolSizes[] = {
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },  // accumImage + albedoImage + normalImage
-        // vertices, indices, materials, primitiveMaterialIds, lights, volumes
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 },
+        // vertices, indices, materials, primitiveMaterialIds, lights, volumes, materialHeaders, materialInstrs
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 }  // env map + marginal CDF + conditional CDF
+        // env map + marginal CDF + conditional CDF + material texture array
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 + kMaxRTMaterialTextures }
     };
     
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -67,12 +223,16 @@ bool TracerRayKHR::Init(VulkanContext* context, Device* device) {
         { 11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR, nullptr },  // envMarginalCDF
         { 12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR, nullptr },  // envConditionalCDF
         // volumes: used by raygen (AOV defaults) + volume closest-hit integration
-        { 13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_INTERSECTION_BIT_KHR, nullptr }
+        { 13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_INTERSECTION_BIT_KHR, nullptr },
+        // material evaluation (closest-hit only)
+        { 14, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxRTMaterialTextures, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }, // materialTextures[]
+        { 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }, // material headers
+        { 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr }  // material instructions
     };
     
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 14;
+    layoutInfo.bindingCount = 17;
     layoutInfo.pBindings = bindings;
     
     if (vkCreateDescriptorSetLayout(context->GetDevice(), &layoutInfo, nullptr, &m_DescriptorLayout) != VK_SUCCESS) {
@@ -122,6 +282,8 @@ void TracerRayKHR::Shutdown() {
     m_IndexBuffer.Shutdown();
     m_PrimitiveMaterialBuffer.Shutdown();
     m_MaterialBuffer.Shutdown();
+    m_RTMaterialHeaderBuffer.Shutdown();
+    m_RTMaterialInstrBuffer.Shutdown();
     m_LightBuffer.Shutdown();
     m_VolumeBuffer.Shutdown();
     m_SBTBuffer.Shutdown();
@@ -987,6 +1149,9 @@ bool TracerRayKHR::BuildVolumeBLAS(const std::vector<GPUVolume>& volumes) {
 
 void TracerRayKHR::UpdateScene(const std::vector<BVHBuilder::Triangle>& triangles,
                                 const std::vector<GPUMaterial>& materials,
+                                const std::vector<RTTextureKey>& materialTextures,
+                                const std::vector<RTMaterialHeader>& materialHeaders,
+                                const std::vector<RTMaterialInstr>& materialInstrs,
                                 const std::vector<GPULight>& lights,
                                 const std::vector<GPUVolume>& volumes) {
     if (!m_Supported || triangles.empty()) return;
@@ -1030,6 +1195,145 @@ void TracerRayKHR::UpdateScene(const std::vector<BVHBuilder::Triangle>& triangle
     m_MaterialBuffer.Shutdown();
     if (m_MaterialBuffer.Init(m_Device, matDesc)) {
         m_MaterialBuffer.Upload(packedMaterials.data(), matDesc.size);
+    }
+
+    // Upload material IR headers (per material)
+    {
+        const size_t headerCount = std::max(materialHeaders.size(), size_t(1));
+        BufferDesc hdrDesc{};
+        hdrDesc.size = headerCount * sizeof(RTMaterialHeader);
+        hdrDesc.usage = BufferUsage::Storage;
+        hdrDesc.hostVisible = true;
+        hdrDesc.debugName = "RTMaterialHeaders";
+
+        m_RTMaterialHeaderBuffer.Shutdown();
+        if (m_RTMaterialHeaderBuffer.Init(m_Device, hdrDesc)) {
+            if (!materialHeaders.empty()) {
+                m_RTMaterialHeaderBuffer.Upload(materialHeaders.data(), materialHeaders.size() * sizeof(RTMaterialHeader));
+            } else {
+                RTMaterialHeader dummy{};
+                m_RTMaterialHeaderBuffer.Upload(&dummy, sizeof(RTMaterialHeader));
+            }
+        }
+    }
+
+    // Upload material IR instruction stream (global)
+    {
+        const size_t instrCount = std::max(materialInstrs.size(), size_t(1));
+        BufferDesc irDesc{};
+        irDesc.size = instrCount * sizeof(RTMaterialInstr);
+        irDesc.usage = BufferUsage::Storage;
+        irDesc.hostVisible = true;
+        irDesc.debugName = "RTMaterialInstrs";
+
+        m_RTMaterialInstrBuffer.Shutdown();
+        if (m_RTMaterialInstrBuffer.Init(m_Device, irDesc)) {
+            if (!materialInstrs.empty()) {
+                m_RTMaterialInstrBuffer.Upload(materialInstrs.data(), materialInstrs.size() * sizeof(RTMaterialInstr));
+            } else {
+                RTMaterialInstr dummy{};
+                m_RTMaterialInstrBuffer.Upload(&dummy, sizeof(RTMaterialInstr));
+            }
+        }
+    }
+
+    // Load / keep alive material textures for this RT scene (global pool)
+    {
+        // Destroy old samplers (images are owned and will be destroyed by their unique_ptr)
+        for (VkSampler s : m_MaterialTextureSamplers) {
+            if (s != VK_NULL_HANDLE) {
+                vkDestroySampler(m_Context->GetDevice(), s, nullptr);
+            }
+        }
+        m_MaterialTextureImages.clear();
+        m_MaterialTextureSamplers.clear();
+        m_MaterialTextureIsSRGB.clear();
+        m_MaterialTextureImages.reserve(std::min<size_t>(materialTextures.size(), kMaxRTMaterialTextures));
+        m_MaterialTextureSamplers.reserve(std::min<size_t>(materialTextures.size(), kMaxRTMaterialTextures));
+        m_MaterialTextureIsSRGB.reserve(std::min<size_t>(materialTextures.size(), kMaxRTMaterialTextures));
+
+        // Lazy-create fallbacks (one sRGB, one UNORM) + samplers
+        CreateSolid1x1Texture(m_Device, VK_FORMAT_R8G8B8A8_SRGB, 255, 0, 255, 255, "RTMissingTexture_sRGB", m_FallbackTextureSRGB);
+        CreateSolid1x1Texture(m_Device, VK_FORMAT_R8G8B8A8_UNORM, 255, 0, 255, 255, "RTMissingTexture_UNORM", m_FallbackTextureUNORM);
+        CreateRTSampler(m_Context->GetDevice(), 1, m_FallbackSamplerSRGB);
+        CreateRTSampler(m_Context->GetDevice(), 1, m_FallbackSamplerUNORM);
+
+        const size_t loadCount = std::min<size_t>(materialTextures.size(), kMaxRTMaterialTextures);
+        for (size_t i = 0; i < loadCount; ++i) {
+            const auto& key = materialTextures[i];
+            m_MaterialTextureIsSRGB.push_back(key.sRGB ? uint8_t(1) : uint8_t(0));
+
+            // Load texture via stb into a GPU Image
+            std::unique_ptr<Image> img;
+            VkSampler sampler = VK_NULL_HANDLE;
+
+            if (!key.path.empty()) {
+                int w = 0, h = 0, comp = 0;
+                stbi_set_flip_vertically_on_load(1);
+                unsigned char* data = stbi_load(key.path.c_str(), &w, &h, &comp, 4);
+                if (data && w > 0 && h > 0) {
+                    const uint32_t width = static_cast<uint32_t>(w);
+                    const uint32_t height = static_cast<uint32_t>(h);
+                    const uint32_t mipLevels = static_cast<uint32_t>(std::floor(std::log2(std::max(w, h)))) + 1u;
+                    const VkFormat format = key.sRGB ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+
+                    BufferDesc stagingDesc{};
+                    stagingDesc.size = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+                    stagingDesc.usage = BufferUsage::Staging;
+                    stagingDesc.hostVisible = true;
+                    stagingDesc.debugName = "RTTexStaging";
+
+                    Buffer staging;
+                    if (staging.Init(m_Device, stagingDesc)) {
+                        staging.Upload(data, stagingDesc.size);
+
+                        img = std::make_unique<Image>();
+                        ImageDesc imageDesc{};
+                        imageDesc.width = width;
+                        imageDesc.height = height;
+                        imageDesc.format = format;
+                        imageDesc.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                        imageDesc.mipLevels = mipLevels;
+                        imageDesc.debugName = key.path.c_str();
+
+                        if (img->Init(m_Device, imageDesc)) {
+                            VkCommandBuffer cmd = m_Device->BeginSingleTimeCommands();
+                            img->TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+                            VkBufferImageCopy region{};
+                            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                            region.imageSubresource.mipLevel = 0;
+                            region.imageSubresource.baseArrayLayer = 0;
+                            region.imageSubresource.layerCount = 1;
+                            region.imageExtent = { width, height, 1 };
+
+                            vkCmdCopyBufferToImage(cmd, staging.GetHandle(), img->GetHandle(),
+                                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+                            GenerateMipmapsRT(cmd, img->GetHandle(), width, height, mipLevels);
+                            if (mipLevels == 1) {
+                                img->TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                            }
+
+                            m_Device->EndSingleTimeCommands(cmd);
+
+                            CreateRTSampler(m_Context->GetDevice(), mipLevels, sampler);
+                        } else {
+                            img.reset();
+                        }
+
+                        staging.Shutdown();
+                    }
+                }
+                if (data) stbi_image_free(data);
+            }
+
+            // Keep slot alignment even if load failed (nullptr => fallback in descriptor write)
+            m_MaterialTextureImages.push_back(std::move(img));
+            m_MaterialTextureSamplers.push_back(sampler);
+        }
+
+        m_MaterialTextureCount = static_cast<uint32_t>(loadCount);
     }
     
     // Upload light data
@@ -1207,6 +1511,37 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
         volumeInfo.offset = 0;
         volumeInfo.range = m_VolumeBuffer.GetSize();
 
+        VkDescriptorBufferInfo matHdrInfo{};
+        matHdrInfo.buffer = m_RTMaterialHeaderBuffer.GetHandle();
+        matHdrInfo.offset = 0;
+        matHdrInfo.range = m_RTMaterialHeaderBuffer.GetSize();
+
+        VkDescriptorBufferInfo matInstrInfo{};
+        matInstrInfo.buffer = m_RTMaterialInstrBuffer.GetHandle();
+        matInstrInfo.offset = 0;
+        matInstrInfo.range = m_RTMaterialInstrBuffer.GetSize();
+
+        // Material texture array (fixed-size)
+        std::vector<VkDescriptorImageInfo> materialTexInfos(kMaxRTMaterialTextures);
+        for (uint32_t i = 0; i < kMaxRTMaterialTextures; ++i) {
+            const bool wantSRGB = (i < m_MaterialTextureIsSRGB.size()) ? (m_MaterialTextureIsSRGB[i] != 0) : true;
+            Image* fallbackImg = wantSRGB ? m_FallbackTextureSRGB.get() : m_FallbackTextureUNORM.get();
+            VkSampler fallbackSampler = wantSRGB ? m_FallbackSamplerSRGB : m_FallbackSamplerUNORM;
+
+            Image* img = nullptr;
+            VkSampler sampler = VK_NULL_HANDLE;
+            if (i < m_MaterialTextureCount && i < m_MaterialTextureImages.size()) {
+                img = m_MaterialTextureImages[i].get();
+                sampler = (i < m_MaterialTextureSamplers.size()) ? m_MaterialTextureSamplers[i] : VK_NULL_HANDLE;
+            }
+
+            VkDescriptorImageInfo info{};
+            info.sampler = (img && sampler != VK_NULL_HANDLE) ? sampler : fallbackSampler;
+            info.imageView = (img ? img : fallbackImg)->GetView();
+            info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            materialTexInfos[i] = info;
+        }
+
         // Environment map textures
         VkDescriptorImageInfo envMapInfo{};
         VkDescriptorImageInfo envMarginalInfo{};
@@ -1226,7 +1561,7 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
             envConditionalInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
 
-        VkWriteDescriptorSet writes[14] = {};
+        VkWriteDescriptorSet writes[20] = {};
 
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].pNext = &asWrite;
@@ -1305,32 +1640,55 @@ void TracerRayKHR::Trace(VkCommandBuffer cmd,
         writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[10].pBufferInfo = &volumeInfo;
 
-        uint32_t writeCount = 11;
+        // Material evaluation bindings
+        writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[11].dstSet = m_DescriptorSet;
+        writes[11].dstBinding = 14;
+        writes[11].dstArrayElement = 0;
+        writes[11].descriptorCount = kMaxRTMaterialTextures;
+        writes[11].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[11].pImageInfo = materialTexInfos.data();
+
+        writes[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[12].dstSet = m_DescriptorSet;
+        writes[12].dstBinding = 15;
+        writes[12].descriptorCount = 1;
+        writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[12].pBufferInfo = &matHdrInfo;
+
+        writes[13].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[13].dstSet = m_DescriptorSet;
+        writes[13].dstBinding = 16;
+        writes[13].descriptorCount = 1;
+        writes[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[13].pBufferInfo = &matInstrInfo;
+
+        uint32_t writeCount = 14;
         
         // Environment map writes - only add if we have valid views
         if (m_EnvMap && m_EnvMap->IsLoaded()) {
-            writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[11].dstSet = m_DescriptorSet;
-            writes[11].dstBinding = 10;
-            writes[11].descriptorCount = 1;
-            writes[11].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes[11].pImageInfo = &envMapInfo;
+            writes[14].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[14].dstSet = m_DescriptorSet;
+            writes[14].dstBinding = 10;
+            writes[14].descriptorCount = 1;
+            writes[14].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[14].pImageInfo = &envMapInfo;
             
-            writes[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[12].dstSet = m_DescriptorSet;
-            writes[12].dstBinding = 11;
-            writes[12].descriptorCount = 1;
-            writes[12].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes[12].pImageInfo = &envMarginalInfo;
+            writes[15].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[15].dstSet = m_DescriptorSet;
+            writes[15].dstBinding = 11;
+            writes[15].descriptorCount = 1;
+            writes[15].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[15].pImageInfo = &envMarginalInfo;
             
-            writes[13].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[13].dstSet = m_DescriptorSet;
-            writes[13].dstBinding = 12;
-            writes[13].descriptorCount = 1;
-            writes[13].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes[13].pImageInfo = &envConditionalInfo;
+            writes[16].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[16].dstSet = m_DescriptorSet;
+            writes[16].dstBinding = 12;
+            writes[16].descriptorCount = 1;
+            writes[16].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[16].pImageInfo = &envConditionalInfo;
             
-            writeCount = 14;
+            writeCount = 17;
         }
 
         vkUpdateDescriptorSets(device, writeCount, writes, 0, nullptr);

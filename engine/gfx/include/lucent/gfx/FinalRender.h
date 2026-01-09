@@ -16,6 +16,9 @@ namespace lucent::gfx {
 class Renderer;
 class TracerCompute;
 class TracerRayKHR;
+struct RTTextureKey;
+struct RTMaterialHeader;
+struct RTMaterialInstr;
 
 // Final render job configuration
 struct FinalRenderConfig {
@@ -59,6 +62,9 @@ public:
     bool Start(const FinalRenderConfig& config, const GPUCamera& camera,
                const std::vector<BVHBuilder::Triangle>& triangles,
                const std::vector<GPUMaterial>& materials,
+               const std::vector<RTTextureKey>& rtTextures = {},
+               const std::vector<RTMaterialHeader>& rtHeaders = {},
+               const std::vector<RTMaterialInstr>& rtInstrs = {},
                const std::vector<GPULight>& lights = {},
                const std::vector<GPUVolume>& volumes = {});
     

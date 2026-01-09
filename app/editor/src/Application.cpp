@@ -1348,11 +1348,26 @@ void Application::RenderShadowPass(VkCommandBuffer cmd) {
 void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& triangles,
                                        std::vector<gfx::GPUMaterial>& materials,
                                        std::vector<gfx::GPULight>& lights,
-                                       std::vector<gfx::GPUVolume>& volumes) {
+                                       std::vector<gfx::GPUVolume>& volumes,
+                                       std::vector<gfx::RTTextureKey>* outRTTextures,
+                                       std::vector<gfx::RTMaterialHeader>* outRTHeaders,
+                                       std::vector<gfx::RTMaterialInstr>* outRTInstrs) {
     triangles.clear();
     materials.clear();
     lights.clear();
     volumes.clear();
+
+    // Optional RT material evaluation outputs (raytraced KHR backend)
+    std::unordered_map<std::string, uint32_t> texKeyToIndex;
+    if (outRTTextures) {
+        outRTTextures->clear();
+        // Index 0 reserved for "fallback" (empty path). TracerRayKHR will map it to a valid magenta texture.
+        outRTTextures->push_back(gfx::RTTextureKey{ "", true });
+        texKeyToIndex["S:"] = 0;
+        texKeyToIndex["U:"] = 0;
+    }
+    if (outRTHeaders) outRTHeaders->clear();
+    if (outRTInstrs) outRTInstrs->clear();
 
     // Collect lights from scene
     auto lightView = m_Scene.GetView<scene::LightComponent, scene::TransformComponent>();
@@ -1411,6 +1426,282 @@ void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& t
     defaultMat.ior = 1.5f;
     defaultMat.flags = 0;
     materials.push_back(defaultMat);
+
+    if (outRTHeaders) {
+        outRTHeaders->push_back(gfx::RTMaterialHeader{}); // default material has no IR
+    }
+
+    // Minimal RT material IR compiler (Surface domain only, UV + Texture2D + basic math).
+    // This feeds the raytracing closest-hit interpreter in `shaders/rt_closesthit.rchit`.
+    auto compileGraphToRTIR = [&](const material::MaterialGraph& graph,
+                                  gfx::RTMaterialHeader& outHdr,
+                                  std::vector<gfx::RTMaterialInstr>& outInstrsLocal,
+                                  std::string& outErr) -> bool {
+        outHdr = gfx::RTMaterialHeader{};
+        outInstrsLocal.clear();
+        outErr.clear();
+
+        // V1: surface-only
+        if (graph.GetDomain() == material::MaterialDomain::Volume) {
+            outErr = "Volume domain not supported for RT per-hit evaluation";
+            return false;
+        }
+
+        const material::NodeID outNodeId = graph.GetOutputNodeId();
+        const material::MaterialNode* outNode = graph.GetNode(outNodeId);
+        if (!outNode || outNode->type != material::NodeType::PBROutput) {
+            outErr = "Missing PBR output node";
+            return false;
+        }
+
+        auto emit = [&](uint32_t type,
+                        uint32_t a = 0, uint32_t b = 0, uint32_t c = 0,
+                        uint32_t texIndex = 0,
+                        const glm::vec4& imm = glm::vec4(0.0f)) -> uint32_t {
+            gfx::RTMaterialInstr ins{};
+            ins.type = type;
+            ins.a = a;
+            ins.b = b;
+            ins.c = c;
+            ins.texIndex = texIndex;
+            ins.imm = imm;
+            outInstrsLocal.push_back(ins);
+            return static_cast<uint32_t>(outInstrsLocal.size()); // reg = instrIndex+1 => size
+        };
+
+        auto emitConstFromValue = [&](const material::PinValue& v) -> uint32_t {
+            if (std::holds_alternative<float>(v)) {
+                return emit(1u, 0, 0, 0, 0, glm::vec4(std::get<float>(v), 0.0f, 0.0f, 0.0f));
+            }
+            if (std::holds_alternative<glm::vec2>(v)) {
+                auto vv = std::get<glm::vec2>(v);
+                return emit(1u, 0, 0, 0, 0, glm::vec4(vv.x, vv.y, 0.0f, 0.0f));
+            }
+            if (std::holds_alternative<glm::vec3>(v)) {
+                auto vv = std::get<glm::vec3>(v);
+                return emit(1u, 0, 0, 0, 0, glm::vec4(vv, 1.0f));
+            }
+            if (std::holds_alternative<glm::vec4>(v)) {
+                return emit(1u, 0, 0, 0, 0, std::get<glm::vec4>(v));
+            }
+            // String / other: not constant-evaluable here
+            return emit(1u, 0, 0, 0, 0, glm::vec4(0.0f));
+        };
+
+        // Cache per-pin output register
+        std::unordered_map<material::PinID, uint32_t> pinToReg;
+        std::unordered_map<material::PinID, uint8_t> state; // 0=unvisited, 1=visiting, 2=done
+
+        std::function<uint32_t(material::PinID)> compilePin;
+        compilePin = [&](material::PinID pinId) -> uint32_t {
+            if (pinId == material::INVALID_PIN_ID) return 0u;
+
+            auto itCached = pinToReg.find(pinId);
+            if (itCached != pinToReg.end()) return itCached->second;
+
+            uint8_t& st = state[pinId];
+            if (st == 1) {
+                // cycle
+                return 0u;
+            }
+            st = 1;
+
+            const material::MaterialPin* pin = graph.GetPin(pinId);
+            if (!pin) { st = 2; return 0u; }
+
+            // Input pins resolve to their connected source, or default value
+            if (pin->direction == material::PinDirection::Input) {
+                material::LinkID linkId = graph.FindLinkByEndPin(pinId);
+                if (linkId != material::INVALID_LINK_ID) {
+                    const material::MaterialLink* link = graph.GetLink(linkId);
+                    if (link) {
+                        uint32_t r = compilePin(link->startPinId);
+                        pinToReg[pinId] = r;
+                        st = 2;
+                        return r;
+                    }
+                }
+                uint32_t r = emitConstFromValue(pin->defaultValue);
+                pinToReg[pinId] = r;
+                st = 2;
+                return r;
+            }
+
+            const material::MaterialNode* node = graph.GetNode(pin->nodeId);
+            if (!node) { st = 2; return 0u; }
+
+            // Determine which output index this pin is
+            int outIdx = -1;
+            for (int i = 0; i < (int)node->outputPins.size(); ++i) {
+                if (node->outputPins[i] == pinId) { outIdx = i; break; }
+            }
+
+            uint32_t r = 0u;
+            switch (node->type) {
+                case material::NodeType::ConstFloat:
+                case material::NodeType::ConstVec2:
+                case material::NodeType::ConstVec3:
+                case material::NodeType::ConstVec4:
+                    r = emitConstFromValue(node->parameter);
+                    break;
+
+                case material::NodeType::UV:
+                    r = emit(2u);
+                    break;
+
+                case material::NodeType::Texture2D:
+                case material::NodeType::NormalMap: {
+                    uint32_t uvReg = 0u;
+                    if (!node->inputPins.empty()) {
+                        // If UV is unconnected, leave uvReg = 0 -> shader defaults to mesh UV input
+                        material::LinkID linkId = graph.FindLinkByEndPin(node->inputPins[0]);
+                        if (linkId != material::INVALID_LINK_ID) {
+                            uvReg = compilePin(node->inputPins[0]);
+                        }
+                    }
+
+                    std::string path;
+                    if (std::holds_alternative<std::string>(node->parameter)) path = std::get<std::string>(node->parameter);
+
+                    bool sRGB = (node->type == material::NodeType::Texture2D);
+                    if (!path.empty()) {
+                        const auto& slots = graph.GetTextureSlots();
+                        for (const auto& slot : slots) {
+                            if (slot.path == path) { sRGB = slot.sRGB; break; }
+                        }
+                    }
+
+                    uint32_t texIndex = 0u;
+                    if (outRTTextures) {
+                        const std::string key = std::string(sRGB ? "S:" : "U:") + path;
+                        auto it = texKeyToIndex.find(key);
+                        if (it != texKeyToIndex.end()) {
+                            texIndex = it->second;
+                        } else {
+                            // Reserve index 0 for fallback; array size is 256.
+                            if (outRTTextures->size() < 256) {
+                                texIndex = static_cast<uint32_t>(outRTTextures->size());
+                                outRTTextures->push_back(gfx::RTTextureKey{ path, sRGB });
+                                texKeyToIndex[key] = texIndex;
+                            } else {
+                                texIndex = 0u;
+                            }
+                        }
+                    }
+
+                    uint32_t sampleReg = emit(3u, uvReg, 0u, 0u, texIndex);
+
+                    // outputs: 0=RGB, 1=R, 2=G, 3=B, 4=A (see MaterialGraph SetupNodePins)
+                    uint32_t swz = 4u;
+                    if (outIdx == 1) swz = 0u;
+                    else if (outIdx == 2) swz = 1u;
+                    else if (outIdx == 3) swz = 2u;
+                    else if (outIdx == 4) swz = 3u;
+                    r = emit(10u, sampleReg, 0u, 0u, swz);
+                    break;
+                }
+
+                case material::NodeType::Add:
+                    r = emit(4u, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    break;
+
+                case material::NodeType::Multiply:
+                    r = emit(5u, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    break;
+
+                case material::NodeType::Lerp:
+                    r = emit(6u, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]), compilePin(node->inputPins[2]));
+                    break;
+
+                case material::NodeType::Clamp:
+                    r = emit(7u, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]), compilePin(node->inputPins[2]));
+                    break;
+
+                case material::NodeType::Saturate:
+                    r = emit(8u, compilePin(node->inputPins[0]));
+                    break;
+
+                case material::NodeType::OneMinus:
+                    r = emit(9u, compilePin(node->inputPins[0]));
+                    break;
+
+                case material::NodeType::SeparateVec3: {
+                    uint32_t v = compilePin(node->inputPins[0]);
+                    uint32_t swz = (outIdx == 1) ? 1u : (outIdx == 2) ? 2u : 0u;
+                    r = emit(10u, v, 0u, 0u, swz);
+                    break;
+                }
+
+                case material::NodeType::CombineVec3:
+                    r = emit(11u, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]), compilePin(node->inputPins[2]));
+                    break;
+
+                case material::NodeType::FloatToVec3: {
+                    uint32_t f = compilePin(node->inputPins[0]);
+                    r = emit(11u, f, f, f);
+                    break;
+                }
+
+                case material::NodeType::Vec3ToFloat: {
+                    uint32_t v = compilePin(node->inputPins[0]);
+                    r = emit(10u, v, 0u, 0u, 0u);
+                    break;
+                }
+
+                case material::NodeType::Vec4ToVec3: {
+                    uint32_t v = compilePin(node->inputPins[0]);
+                    r = emit(10u, v, 0u, 0u, 4u);
+                    break;
+                }
+
+                case material::NodeType::Reroute:
+                    r = compilePin(node->inputPins[0]);
+                    break;
+
+                default:
+                    // Unsupported for this minimal RT interpreter (yet)
+                    outErr = "Unsupported node for RT per-hit eval";
+                    r = emit(1u, 0, 0, 0, 0, glm::vec4(0.0f));
+                    break;
+            }
+
+            pinToReg[pinId] = r;
+            st = 2;
+            return r;
+        };
+
+        // Find PBR output pins by name (compile from inputs so defaults work)
+        material::PinID baseColorIn = material::INVALID_PIN_ID;
+        material::PinID metallicIn = material::INVALID_PIN_ID;
+        material::PinID roughnessIn = material::INVALID_PIN_ID;
+        material::PinID emissiveIn = material::INVALID_PIN_ID;
+        material::PinID normalIn = material::INVALID_PIN_ID;
+
+        for (material::PinID pid : outNode->inputPins) {
+            const material::MaterialPin* p = graph.GetPin(pid);
+            if (!p) continue;
+            if (p->name == "Base Color") baseColorIn = pid;
+            else if (p->name == "Metallic") metallicIn = pid;
+            else if (p->name == "Roughness") roughnessIn = pid;
+            else if (p->name == "Emissive") emissiveIn = pid;
+            else if (p->name == "Normal") normalIn = pid;
+        }
+
+        outHdr.baseColorReg = compilePin(baseColorIn);
+        outHdr.metallicReg = compilePin(metallicIn);
+        outHdr.roughnessReg = compilePin(roughnessIn);
+        outHdr.emissiveReg = compilePin(emissiveIn);
+        outHdr.normalReg = compilePin(normalIn);
+
+        // Clamp instruction count to shader interpreter limit
+        if (outInstrsLocal.size() > 128) {
+            outErr = "Material graph too complex for RT interpreter (instr limit)";
+            return false;
+        }
+
+        outHdr.instrCount = static_cast<uint32_t>(outInstrsLocal.size());
+        return true;
+    };
 
     auto view = m_Scene.GetView<scene::MeshRendererComponent, scene::TransformComponent>();
     view.Each([&](scene::Entity entity, scene::MeshRendererComponent& renderer, scene::TransformComponent& transform) {
@@ -1822,6 +2113,26 @@ void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& t
 
         materials.push_back(mat);
 
+        // Optional RT per-hit material evaluation (UV-driven)
+        if (outRTHeaders) {
+            gfx::RTMaterialHeader hdr{};
+
+            if (outRTInstrs && outRTTextures && matAsset && matAsset->IsValid() && !matAsset->IsVolumeMaterial()) {
+                std::vector<gfx::RTMaterialInstr> localInstrs;
+                std::string irErr;
+                if (compileGraphToRTIR(matAsset->GetGraph(), hdr, localInstrs, irErr) && hdr.instrCount > 0) {
+                    hdr.instrOffset = static_cast<uint32_t>(outRTInstrs->size());
+                    outRTInstrs->insert(outRTInstrs->end(), localInstrs.begin(), localInstrs.end());
+                } else {
+                    // Leave hdr empty; constants buffer will be used
+                    (void)irErr;
+                    hdr = gfx::RTMaterialHeader{};
+                }
+            }
+
+            outRTHeaders->push_back(hdr);
+        }
+
         // Add triangles using the Vertex struct
         for (size_t i = 0; i + 2 < indices.size(); i += 3) {
             gfx::BVHBuilder::Triangle tri;
@@ -1858,15 +2169,20 @@ void Application::UpdateTracerScene() {
     std::vector<gfx::GPULight> lights;
     std::vector<gfx::GPUVolume> volumes;
 
-    BuildTracerSceneData(triangles, materials, lights, volumes);
+    // Optional RT per-hit material evaluation data (only used by RayTraced backend)
+    std::vector<gfx::RTTextureKey> rtTextures;
+    std::vector<gfx::RTMaterialHeader> rtHeaders;
+    std::vector<gfx::RTMaterialInstr> rtInstrs;
 
     // Update the currently active tracer backend
     gfx::RenderMode mode = m_Renderer.GetRenderMode();
     if (mode == gfx::RenderMode::RayTraced) {
+        BuildTracerSceneData(triangles, materials, lights, volumes, &rtTextures, &rtHeaders, &rtInstrs);
         if (gfx::TracerRayKHR* rt = m_Renderer.GetTracerRayKHR(); rt && rt->IsSupported()) {
-            rt->UpdateScene(triangles, materials, lights, volumes);
+            rt->UpdateScene(triangles, materials, rtTextures, rtHeaders, rtInstrs, lights, volumes);
         }
     } else {
+        BuildTracerSceneData(triangles, materials, lights, volumes);
         if (gfx::TracerCompute* compute = m_Renderer.GetTracerCompute()) {
             compute->UpdateScene(triangles, materials, lights, volumes);
         }
@@ -2008,11 +2324,24 @@ void Application::StartFinalRenderFromMainCamera() {
     gpuCamera.nearPlane = camera->nearClip;
     gpuCamera.farPlane = camera->farClip;
 
+    const bool canRayTrace = m_Renderer.GetTracerRayKHR() && m_Renderer.GetTracerRayKHR()->IsSupported();
+
     std::vector<gfx::BVHBuilder::Triangle> triangles;
     std::vector<gfx::GPUMaterial> materials;
     std::vector<gfx::GPULight> lights;
     std::vector<gfx::GPUVolume> volumes;
-    BuildTracerSceneData(triangles, materials, lights, volumes);
+
+    // Optional RT per-hit material evaluation data (only used by RayTraced backend)
+    std::vector<gfx::RTTextureKey> rtTextures;
+    std::vector<gfx::RTMaterialHeader> rtHeaders;
+    std::vector<gfx::RTMaterialInstr> rtInstrs;
+
+    // Build scene data. If we intend to raytrace, also build RT IR + texture key buffers so materials vary per-hit.
+    if ((m_Renderer.GetRenderMode() == gfx::RenderMode::RayTraced) && canRayTrace) {
+        BuildTracerSceneData(triangles, materials, lights, volumes, &rtTextures, &rtHeaders, &rtInstrs);
+    } else {
+        BuildTracerSceneData(triangles, materials, lights, volumes);
+    }
 
     gfx::FinalRenderConfig config;
     config.width = width;
@@ -2027,11 +2356,9 @@ void Application::StartFinalRenderFromMainCamera() {
     config.denoiseRadius = settings.denoiseRadius;
     config.transparentBackground = settings.transparentBackground;
     config.outputPath.clear();
-
-    bool canRayTrace = m_Renderer.GetTracerRayKHR() && m_Renderer.GetTracerRayKHR()->IsSupported();
     config.useRayTracing = (m_Renderer.GetRenderMode() == gfx::RenderMode::RayTraced) && canRayTrace;
 
-    if (!finalRender->Start(config, gpuCamera, triangles, materials, lights, volumes)) {
+    if (!finalRender->Start(config, gpuCamera, triangles, materials, rtTextures, rtHeaders, rtInstrs, lights, volumes)) {
         LUCENT_CORE_WARN("Final render failed to start");
         return;
     }

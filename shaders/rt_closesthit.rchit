@@ -2,6 +2,7 @@
 #extension GL_EXT_ray_tracing : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_nonuniform_qualifier : enable
 
 // Ray payload: carries radiance, throughput, hit info for multi-bounce
 struct RayPayload {
@@ -53,6 +54,37 @@ layout(set = 0, binding = 6, scalar) readonly buffer PrimitiveMaterials {
     uint materialIds[];
 };
 
+// Material evaluation: bind a fixed-size global texture array + per-material IR
+layout(set = 0, binding = 14) uniform sampler2D materialTextures[256];
+
+struct RTMaterialHeader {
+    uint instrOffset;
+    uint instrCount;
+    uint baseColorReg;
+    uint metallicReg;
+    uint roughnessReg;
+    uint emissiveReg;
+    uint normalReg;
+    uint alphaReg;
+};
+
+layout(set = 0, binding = 15, scalar) readonly buffer MaterialHeaders {
+    RTMaterialHeader headers[];
+};
+
+struct RTMaterialInstr {
+    uint type;
+    uint a;
+    uint b;
+    uint c;
+    uint texIndex;
+    vec4 imm;
+};
+
+layout(set = 0, binding = 16, scalar) readonly buffer MaterialInstrs {
+    RTMaterialInstr instrs[];
+};
+
 layout(push_constant) uniform PushConstants {
     uint frameIndex;
     uint sampleIndex;
@@ -63,6 +95,96 @@ layout(push_constant) uniform PushConstants {
 hitAttributeEXT vec2 hitAttribs;
 
 const float PI = 3.14159265359;
+
+bool isScalar(vec4 v) {
+    return abs(v.y) < 1e-6 && abs(v.z) < 1e-6 && abs(v.w) < 1e-6;
+}
+
+vec4 splatScalar(vec4 v) {
+    return vec4(v.x, v.x, v.x, v.x);
+}
+
+// Instruction opcodes (must match CPU-side compiler)
+const uint OP_CONST      = 1u;
+const uint OP_UV         = 2u;
+const uint OP_TEX2D      = 3u;
+const uint OP_ADD        = 4u;
+const uint OP_MUL        = 5u;
+const uint OP_LERP       = 6u;
+const uint OP_CLAMP      = 7u;
+const uint OP_SATURATE   = 8u;
+const uint OP_ONEMINUS   = 9u;
+const uint OP_SWIZZLE    = 10u; // texIndex: 0=r,1=g,2=b,3=a,4=rgb
+const uint OP_COMBINE3   = 11u;
+
+void evalMaterialIR(uint matIdx, vec2 uv, out vec4 outBaseColor, out vec4 outEmissive, out float outMetallic, out float outRoughness) {
+    outBaseColor = vec4(0.0);
+    outEmissive = vec4(0.0);
+    outMetallic = 0.0;
+    outRoughness = 0.5;
+
+    if (matIdx >= headers.length()) return;
+    RTMaterialHeader h = headers[matIdx];
+    if (h.instrCount == 0u) return;
+
+    // Hard cap to keep shader stack bounded
+    const uint MAX_REGS = 128u;
+    const uint count = min(h.instrCount, MAX_REGS);
+    vec4 regs[129];
+    regs[0] = vec4(0.0);
+
+    for (uint i = 0u; i < count; ++i) {
+        RTMaterialInstr ins = instrs[h.instrOffset + i];
+        vec4 a = (ins.a <= MAX_REGS) ? regs[ins.a] : vec4(0.0);
+        vec4 b = (ins.b <= MAX_REGS) ? regs[ins.b] : vec4(0.0);
+        vec4 c = (ins.c <= MAX_REGS) ? regs[ins.c] : vec4(0.0);
+
+        vec4 r = vec4(0.0);
+        if (ins.type == OP_CONST) {
+            r = ins.imm;
+        } else if (ins.type == OP_UV) {
+            r = vec4(uv, 0.0, 0.0);
+        } else if (ins.type == OP_TEX2D) {
+            vec2 tuv = (ins.a != 0u) ? a.xy : uv;
+            r = texture(materialTextures[nonuniformEXT(ins.texIndex)], tuv);
+        } else if (ins.type == OP_ADD) {
+            vec4 aa = isScalar(a) ? splatScalar(a) : a;
+            vec4 bb = isScalar(b) ? splatScalar(b) : b;
+            r = aa + bb;
+        } else if (ins.type == OP_MUL) {
+            vec4 aa = isScalar(a) ? splatScalar(a) : a;
+            vec4 bb = isScalar(b) ? splatScalar(b) : b;
+            r = aa * bb;
+        } else if (ins.type == OP_LERP) {
+            vec4 aa = isScalar(a) ? splatScalar(a) : a;
+            vec4 bb = isScalar(b) ? splatScalar(b) : b;
+            float t = c.x;
+            r = mix(aa, bb, t);
+        } else if (ins.type == OP_CLAMP) {
+            r = clamp(a, b, c);
+        } else if (ins.type == OP_SATURATE) {
+            r = clamp(a, vec4(0.0), vec4(1.0));
+        } else if (ins.type == OP_ONEMINUS) {
+            r = vec4(1.0) - a;
+        } else if (ins.type == OP_SWIZZLE) {
+            if (ins.texIndex == 0u) r = vec4(a.x, 0.0, 0.0, 0.0);
+            else if (ins.texIndex == 1u) r = vec4(a.y, 0.0, 0.0, 0.0);
+            else if (ins.texIndex == 2u) r = vec4(a.z, 0.0, 0.0, 0.0);
+            else if (ins.texIndex == 3u) r = vec4(a.w, 0.0, 0.0, 0.0);
+            else r = vec4(a.xyz, 1.0);
+        } else if (ins.type == OP_COMBINE3) {
+            r = vec4(a.x, b.x, c.x, 1.0);
+        }
+
+        uint dst = i + 1u;
+        regs[dst] = r;
+    }
+
+    if (h.baseColorReg != 0u && h.baseColorReg <= MAX_REGS) outBaseColor = regs[h.baseColorReg];
+    if (h.emissiveReg != 0u && h.emissiveReg <= MAX_REGS) outEmissive = regs[h.emissiveReg];
+    if (h.metallicReg != 0u && h.metallicReg <= MAX_REGS) outMetallic = regs[h.metallicReg].x;
+    if (h.roughnessReg != 0u && h.roughnessReg <= MAX_REGS) outRoughness = regs[h.roughnessReg].x;
+}
 
 // PCG random
 uint pcgHash(uint v) {
@@ -135,6 +257,20 @@ void main() {
     vec3 emissive = emissivePacked.rgb * emissivePacked.a;
     float metallic = props.x;
     float roughness = max(props.y, 0.04);  // Clamp to avoid perfect mirrors
+
+    // If a UV-driven IR is present, override the constant-packed material values
+    vec4 irBase = vec4(0.0);
+    vec4 irEmissive = vec4(0.0);
+    float irMetallic = metallic;
+    float irRoughness = roughness;
+    evalMaterialIR(matIdx, uv, irBase, irEmissive, irMetallic, irRoughness);
+    bool hasIR = (matIdx < headers.length()) && (headers[matIdx].instrCount != 0u);
+    if (hasIR) {
+        albedo = (irBase.xyz);
+        emissive = irEmissive.xyz;
+        metallic = irMetallic;
+        roughness = max(irRoughness, 0.04);
+    }
     
     // Store hit info in payload for raygen to handle bouncing
     payload.hit = true;

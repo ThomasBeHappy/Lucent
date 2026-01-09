@@ -10,8 +10,36 @@
 #include <glm/glm.hpp>
 #include <vector>
 #include <memory>
+#include <string>
 
 namespace lucent::gfx {
+
+// GPU-evaluated material instruction for raytraced mode (simple IR interpreter in shaders)
+// NOTE: Instruction "destination register" is implicit: regIndex = instructionIndex + 1 within a material.
+struct RTMaterialInstr {
+    uint32_t type = 0;
+    uint32_t a = 0;         // operand register (0 = none)
+    uint32_t b = 0;         // operand register (0 = none)
+    uint32_t c = 0;         // operand register / extra (0 = none)
+    uint32_t texIndex = 0;  // global texture index (for texture sampling / swizzles)
+    glm::vec4 imm = glm::vec4(0.0f); // immediates (constants / params)
+};
+
+struct RTMaterialHeader {
+    uint32_t instrOffset = 0;      // start index into the global instruction buffer
+    uint32_t instrCount = 0;       // number of instructions for this material
+    uint32_t baseColorReg = 0;     // vec3 in xyz
+    uint32_t metallicReg = 0;      // float in x
+    uint32_t roughnessReg = 0;     // float in x
+    uint32_t emissiveReg = 0;      // vec3 in xyz
+    uint32_t normalReg = 0;        // vec3 in xyz (0 = use geometry normal)
+    uint32_t alphaReg = 0;         // float in x (optional)
+};
+
+struct RTTextureKey {
+    std::string path;
+    bool sRGB = true;
+};
 
 // Bottom-level acceleration structure (per mesh)
 struct BLAS {
@@ -88,6 +116,9 @@ public:
     // Update scene - builds/updates acceleration structures
     void UpdateScene(const std::vector<BVHBuilder::Triangle>& triangles,
                      const std::vector<GPUMaterial>& materials,
+                     const std::vector<RTTextureKey>& materialTextures,
+                     const std::vector<RTMaterialHeader>& materialHeaders,
+                     const std::vector<RTMaterialInstr>& materialInstrs,
                      const std::vector<GPULight>& lights = {},
                      const std::vector<GPUVolume>& volumes = {});
     
@@ -157,11 +188,23 @@ private:
     Buffer m_IndexBuffer;
     Buffer m_PrimitiveMaterialBuffer;
     Buffer m_MaterialBuffer;
+    Buffer m_RTMaterialHeaderBuffer;
+    Buffer m_RTMaterialInstrBuffer;
     Buffer m_LightBuffer;
     Buffer m_VolumeBuffer;
     uint32_t m_TriangleCount = 0;
     uint32_t m_LightCount = 0;
     uint32_t m_VolumeCount = 0;
+
+    // Material texture pool (global for the RT pipeline)
+    std::vector<std::unique_ptr<Image>> m_MaterialTextureImages; // owned images (shader-read, mipped)
+    std::vector<VkSampler> m_MaterialTextureSamplers;           // 1:1 with images
+    std::vector<uint8_t> m_MaterialTextureIsSRGB;               // 0/1 per index, for fallback selection
+    std::unique_ptr<Image> m_FallbackTextureSRGB;
+    std::unique_ptr<Image> m_FallbackTextureUNORM;
+    VkSampler m_FallbackSamplerSRGB = VK_NULL_HANDLE;
+    VkSampler m_FallbackSamplerUNORM = VK_NULL_HANDLE;
+    uint32_t m_MaterialTextureCount = 0;
     
     // Environment map
     EnvironmentMap* m_EnvMap = nullptr;

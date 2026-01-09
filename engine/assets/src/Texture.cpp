@@ -2,7 +2,6 @@
 #include "lucent/core/Log.h"
 #include "lucent/gfx/Buffer.h"
 
-#define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
 #include <cmath>

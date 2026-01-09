@@ -4,6 +4,7 @@ set(ENGINE_GFX_SOURCES
     src/Swapchain.cpp
     src/Buffer.cpp
     src/Image.cpp
+    src/stb_image_impl.cpp
     src/DescriptorAllocator.cpp
     src/PipelineBuilder.cpp
     src/Renderer.cpp
@@ -23,9 +24,13 @@ endif()
 
 add_library(engine_gfx STATIC ${ENGINE_GFX_SOURCES})
 
+find_package(Stb REQUIRED)
+
 target_include_directories(engine_gfx
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${Stb_INCLUDE_DIR}
 )
 
 target_link_libraries(engine_gfx

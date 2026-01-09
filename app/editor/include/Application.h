@@ -121,7 +121,10 @@ private:
     void BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& triangles,
                               std::vector<gfx::GPUMaterial>& materials,
                               std::vector<gfx::GPULight>& lights,
-                              std::vector<gfx::GPUVolume>& volumes);
+                              std::vector<gfx::GPUVolume>& volumes,
+                              std::vector<gfx::RTTextureKey>* outRTTextures = nullptr,
+                              std::vector<gfx::RTMaterialHeader>* outRTHeaders = nullptr,
+                              std::vector<gfx::RTMaterialInstr>* outRTInstrs = nullptr);
     void StartFinalRenderFromMainCamera();
     bool m_TracerSceneDirty = true;
     std::vector<gfx::GPULight> m_LastTracerLights;

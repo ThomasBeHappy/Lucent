@@ -139,6 +139,9 @@ void FinalRender::Shutdown() {
 bool FinalRender::Start(const FinalRenderConfig& config, const GPUCamera& camera,
                          const std::vector<BVHBuilder::Triangle>& triangles,
                          const std::vector<GPUMaterial>& materials,
+                         const std::vector<RTTextureKey>& rtTextures,
+                         const std::vector<RTMaterialHeader>& rtHeaders,
+                         const std::vector<RTMaterialInstr>& rtInstrs,
                          const std::vector<GPULight>& lights,
                          const std::vector<GPUVolume>& volumes) {
     if (m_Status == FinalRenderStatus::Rendering) {
@@ -165,7 +168,7 @@ bool FinalRender::Start(const FinalRenderConfig& config, const GPUCamera& camera
                          m_Renderer->GetTracerRayKHR()->IsSupported());
 
     if (m_UsingRayTracing) {
-        m_Renderer->GetTracerRayKHR()->UpdateScene(triangles, materials, lights, volumes);
+        m_Renderer->GetTracerRayKHR()->UpdateScene(triangles, materials, rtTextures, rtHeaders, rtInstrs, lights, volumes);
         m_Renderer->GetTracerRayKHR()->ResetAccumulation();
     } else if (m_Renderer->GetTracerCompute()) {
         m_Renderer->GetTracerCompute()->UpdateScene(triangles, materials, lights, volumes);
