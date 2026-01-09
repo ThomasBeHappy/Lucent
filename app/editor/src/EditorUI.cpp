@@ -7,6 +7,7 @@
 #include "lucent/gfx/VulkanContext.h"
 #include "lucent/gfx/Device.h"
 #include "lucent/gfx/Renderer.h"
+#include "lucent/assets/MeshRegistry.h"
 #include "lucent/scene/Components.h"
 #include "lucent/material/MaterialAsset.h"
 
@@ -78,6 +79,48 @@ static ImVec4 ThemeSuccess() { return ImVec4(0.33f, 0.78f, 0.47f, 1.0f); }
 static ImVec4 ThemeWarning() { return ImVec4(0.95f, 0.70f, 0.28f, 1.0f); }
 static ImVec4 ThemeError() { return ImVec4(0.92f, 0.34f, 0.34f, 1.0f); }
 static ImVec4 ThemeMutedText() { return ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]; }
+
+static bool InitEditableMeshFromAsset(scene::EditableMeshComponent& editMesh,
+                                      const scene::MeshRendererComponent& meshRenderer) {
+    if (meshRenderer.meshAssetID == UINT32_MAX) {
+        LUCENT_CORE_WARN("Cannot enter Edit Mode: mesh renderer has no mesh asset");
+        return false;
+    }
+
+    const auto* mesh = assets::MeshRegistry::Get().GetMesh(meshRenderer.meshAssetID);
+    if (!mesh) {
+        LUCENT_CORE_WARN("Cannot enter Edit Mode: mesh asset {} not found", meshRenderer.meshAssetID);
+        return false;
+    }
+
+    const auto& vertices = mesh->GetCPUVertices();
+    const auto& indices = mesh->GetCPUIndices();
+    if (vertices.empty() || indices.empty()) {
+        LUCENT_CORE_WARN("Cannot enter Edit Mode: mesh asset {} has no CPU geometry", meshRenderer.meshAssetID);
+        return false;
+    }
+
+    std::vector<glm::vec3> positions;
+    std::vector<glm::vec3> normals;
+    std::vector<glm::vec2> uvs;
+    positions.reserve(vertices.size());
+    normals.reserve(vertices.size());
+    uvs.reserve(vertices.size());
+
+    for (const auto& vertex : vertices) {
+        positions.push_back(vertex.position);
+        normals.push_back(vertex.normal);
+        uvs.push_back(vertex.uv);
+    }
+
+    editMesh.InitFromTriangles(positions, normals, uvs, indices);
+    if (!editMesh.HasMesh()) {
+        LUCENT_CORE_WARN("Cannot enter Edit Mode: failed to build editable mesh from asset {}", meshRenderer.meshAssetID);
+        return false;
+    }
+
+    return true;
+}
 
 static std::filesystem::path GetExecutableDir() {
 #if defined(_WIN32)
@@ -3720,12 +3763,19 @@ void EditorUI::SetEditorMode(EditorMode mode) {
         // Create EditableMeshComponent if it doesn't exist
         if (!entity.HasComponent<scene::EditableMeshComponent>()) {
             auto& editMesh = entity.AddComponent<scene::EditableMeshComponent>();
-            
+            bool initialized = false;
+
             // Initialize from primitive type if applicable
             if (meshRenderer->primitiveType != scene::MeshRendererComponent::PrimitiveType::None) {
                 editMesh.InitFromPrimitive(meshRenderer->primitiveType);
+                initialized = editMesh.HasMesh();
             } else {
-                LUCENT_CORE_WARN("Cannot enter Edit Mode: mesh is not a primitive (import support TODO)");
+                initialized = InitEditableMeshFromAsset(editMesh, *meshRenderer);
+            }
+
+            if (!initialized) {
+                entity.RemoveComponent<scene::EditableMeshComponent>();
+                LUCENT_CORE_WARN("Cannot enter Edit Mode: failed to convert mesh to editable topology");
                 return;
             }
         }
