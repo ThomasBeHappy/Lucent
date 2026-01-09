@@ -159,6 +159,9 @@ enum class NodeType {
     WorldPosition,  // Outputs world-space position
     WorldNormal,    // Outputs world-space normal
     ViewDirection,  // Outputs view direction (from fragment to camera, normalized)
+
+    // Custom / Advanced
+    CustomCode,     // User-authored GLSL-like code block (surface domain only)
 };
 
 // Get node category for UI
@@ -171,6 +174,8 @@ inline const char* GetNodeCategory(NodeType type) {
         case NodeType::WorldNormal:
         case NodeType::ViewDirection:
             return "Input";
+        case NodeType::CustomCode:
+            return "Custom";
         case NodeType::ConstFloat:
         case NodeType::ConstVec2:
         case NodeType::ConstVec3:
@@ -250,6 +255,7 @@ inline const char* GetNodeTypeName(NodeType type) {
         case NodeType::WorldPosition: return "World Position";
         case NodeType::WorldNormal: return "World Normal";
         case NodeType::ViewDirection: return "View Direction";
+        case NodeType::CustomCode: return "Custom Code";
         case NodeType::ConstFloat: return "Float";
         case NodeType::ConstVec2: return "Vector2";
         case NodeType::ConstVec3: return "Vector3 / Color";
@@ -380,6 +386,10 @@ public:
     MaterialPin* GetPin(PinID pinId);
     const MaterialPin* GetPin(PinID pinId) const;
     NodeID GetPinNodeId(PinID pinId) const;
+
+    // Rebuild a node's pins based on its parameters (e.g. CustomCode declarations).
+    // NOTE: This deletes all links connected to the node's old pins.
+    void RebuildNodePins(NodeID nodeId);
     
     // Link management
     LinkID CreateLink(PinID startPinId, PinID endPinId);
@@ -430,6 +440,7 @@ private:
     uint64_t AllocateId();
     PinID CreatePin(NodeID nodeId, const std::string& name, PinType type, PinDirection direction, PinValue defaultValue = 0.0f);
     void SetupNodePins(MaterialNode& node);
+    void DeleteNodePinsAndLinks(MaterialNode& node);
     
     uint64_t m_NextId = 1;
     

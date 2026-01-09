@@ -7,6 +7,8 @@
 #include <cctype>
 #include <algorithm>
 #include <chrono>
+#include <array>
+#include <cstring>
 
 namespace lucent::material {
 
@@ -27,6 +29,56 @@ static std::string NormalizeMaterialPath(const std::string& inPath) {
         std::replace(s.begin(), s.end(), '\\', '/');
         return s;
     }
+}
+
+// For node parameters that need multi-line or arbitrary text (e.g. CustomCode),
+// we store the string as base64 in the .lmat file (single-line format).
+static const char* kParamStringB64Prefix = "B64:";
+
+static std::string Base64Encode(const std::string& in) {
+    static const char* kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((in.size() + 2) / 3) * 4);
+    uint32_t val = 0;
+    int valb = -6;
+    for (unsigned char c : in) {
+        val = (val << 8) + c;
+        valb += 8;
+        while (valb >= 0) {
+            out.push_back(kAlphabet[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6) out.push_back(kAlphabet[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
+    return out;
+}
+
+static bool Base64Decode(const std::string& in, std::string& out) {
+    static std::array<int, 256> T = [] {
+        std::array<int, 256> t{};
+        t.fill(-1);
+        const char* a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; ++i) t[(unsigned char)a[i]] = i;
+        return t;
+    }();
+
+    out.clear();
+    out.reserve((in.size() / 4) * 3);
+    uint32_t val = 0;
+    int valb = -8;
+    for (unsigned char c : in) {
+        if (c == '=') break;
+        int d = T[c];
+        if (d == -1) return false;
+        val = (val << 6) + (uint32_t)d;
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(char((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return true;
 }
 } // namespace
 
@@ -649,6 +701,13 @@ MaterialAsset* MaterialAssetManager::LoadMaterial(const std::string& path) {
                     hasString = true;
                     pString = line.substr(std::string("PARAM_STRING:").size());
                     trimLeft(pString);
+                    // Decode base64-encoded strings (used for multiline CustomCode node parameters).
+                    if (pString.rfind(kParamStringB64Prefix, 0) == 0) {
+                        std::string decoded;
+                        if (Base64Decode(pString.substr(strlen(kParamStringB64Prefix)), decoded)) {
+                            pString = std::move(decoded);
+                        }
+                    }
                 }
             }
             
@@ -809,7 +868,12 @@ bool MaterialAssetManager::SaveMaterial(MaterialAsset* material, const std::stri
             const auto& v = std::get<glm::vec4>(node.parameter);
             file << "  PARAM_VEC4: " << v.x << " " << v.y << " " << v.z << " " << v.w << "\n";
         } else if (std::holds_alternative<std::string>(node.parameter)) {
-            file << "  PARAM_STRING: " << std::get<std::string>(node.parameter) << "\n";
+            const std::string& s = std::get<std::string>(node.parameter);
+            if (node.type == NodeType::CustomCode) {
+                file << "  PARAM_STRING: " << kParamStringB64Prefix << Base64Encode(s) << "\n";
+            } else {
+                file << "  PARAM_STRING: " << s << "\n";
+            }
         }
         
         file << "NODE_END\n\n";

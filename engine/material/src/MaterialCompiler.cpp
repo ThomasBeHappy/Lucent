@@ -5,6 +5,7 @@
 #include <queue>
 #include <set>
 #include <mutex>
+#include <cctype>
 
 namespace lucent::material {
 
@@ -21,6 +22,73 @@ static bool ParseNoise2Param(const std::string& s, int& outType, glm::vec4& outP
     }
     return false;
 }
+
+namespace {
+struct CustomCodeDecl {
+    bool isOutput = false;
+    PinType type = PinType::Float;
+    std::string name;
+};
+
+static bool ParsePinTypeToken(const std::string& tok, PinType& outType) {
+    if (tok == "float") { outType = PinType::Float; return true; }
+    if (tok == "vec2")  { outType = PinType::Vec2;  return true; }
+    if (tok == "vec3")  { outType = PinType::Vec3;  return true; }
+    if (tok == "vec4")  { outType = PinType::Vec4;  return true; }
+    return false;
+}
+
+static std::string TrimLeft(std::string s) {
+    size_t i = 0;
+    while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
+    return s.substr(i);
+}
+
+static bool ParseCustomCodeDeclLine(const std::string& line, CustomCodeDecl& outDecl) {
+    std::string s = TrimLeft(line);
+    if (s.empty()) return false;
+    if (s.rfind("//", 0) == 0) return false;
+
+    bool isOut = false;
+    if (s.rfind("out ", 0) == 0) { isOut = true; s = TrimLeft(s.substr(4)); }
+    else if (s.rfind("in ", 0) == 0) { s = TrimLeft(s.substr(3)); }
+    else if (s.rfind("uniform ", 0) == 0) { s = TrimLeft(s.substr(8)); }
+    else return false;
+
+    std::istringstream iss(s);
+    std::string typeTok;
+    std::string nameTok;
+    if (!(iss >> typeTok >> nameTok)) return false;
+    if (!nameTok.empty() && nameTok.back() == ';') nameTok.pop_back();
+    if (nameTok.empty()) return false;
+
+    PinType pinType{};
+    if (!ParsePinTypeToken(typeTok, pinType)) return false;
+
+    outDecl.isOutput = isOut;
+    outDecl.type = pinType;
+    outDecl.name = nameTok;
+    return true;
+}
+
+static void ParseCustomCode(const std::string& code, std::vector<CustomCodeDecl>& outDecls, std::string& outBody) {
+    outDecls.clear();
+    outBody.clear();
+    std::istringstream ss(code);
+    std::string line;
+    bool first = true;
+    while (std::getline(ss, line)) {
+        CustomCodeDecl d{};
+        if (ParseCustomCodeDeclLine(line, d)) {
+            outDecls.push_back(std::move(d));
+            continue; // strip decl from body
+        }
+        if (!first) outBody += "\n";
+        first = false;
+        outBody += line;
+    }
+}
+} // namespace
 
 // Standard vertex shader source (same interface as mesh.vert)
 static const char* s_StandardVertexShaderGLSL = R"(
@@ -288,6 +356,58 @@ vec4 ramp_eval(float t, vec4 c0, float t0, vec4 c1, float t1) {
 }
 )";
     }
+
+    // Custom code node helper functions (surface only)
+    for (const auto& [id, node] : graph.GetNodes()) {
+        if (node.type != NodeType::CustomCode) continue;
+        const std::string code = std::holds_alternative<std::string>(node.parameter)
+            ? std::get<std::string>(node.parameter)
+            : std::string();
+
+        std::vector<CustomCodeDecl> decls;
+        std::string body;
+        ParseCustomCode(code, decls, body);
+
+        // Build unique input/output lists with defaults.
+        struct Item { std::string name; PinType type; bool isOutput; };
+        std::vector<Item> inputs;
+        std::vector<Item> outputs;
+
+        auto addUnique = [](std::vector<Item>& items, const std::string& name, PinType type, bool isOutput) {
+            for (const auto& it : items) {
+                if (it.name == name) return;
+            }
+            items.push_back({ name, type, isOutput });
+        };
+
+        addUnique(inputs, "In", PinType::Vec3, false);
+        addUnique(outputs, "Out", PinType::Vec3, true);
+
+        for (const auto& d : decls) {
+            if (d.isOutput) addUnique(outputs, d.name, d.type, true);
+            else addUnique(inputs, d.name, d.type, false);
+        }
+
+        ss << "\n// -----------------------------------------------------------------------------\n";
+        ss << "// CustomCode node " << id << "\n";
+        ss << "// -----------------------------------------------------------------------------\n";
+        ss << "void custom_node_" << id << "(";
+        bool firstParam = true;
+        for (const auto& in : inputs) {
+            if (!firstParam) ss << ", ";
+            firstParam = false;
+            ss << "in " << GetGLSLTypeName(in.type) << " " << in.name;
+        }
+        for (const auto& out : outputs) {
+            if (!firstParam) ss << ", ";
+            firstParam = false;
+            ss << "out " << GetGLSLTypeName(out.type) << " " << out.name;
+        }
+        ss << ") {\n";
+        ss << "#line 1\n";
+        ss << body << "\n";
+        ss << "}\n\n";
+    }
     
     // PBR lighting functions
     ss << R"(
@@ -393,6 +513,19 @@ float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
 
 std::string MaterialCompiler::GenerateVolumeFragmentGLSL(const MaterialGraph& graph) {
     std::ostringstream ss;
+
+    // Surface-only feature: CustomCode is not supported in volume materials.
+    for (const auto& [id, node] : graph.GetNodes()) {
+        if (node.type == NodeType::CustomCode) {
+            return std::string(
+                "#version 450\n"
+                "// ERROR: Custom Code node is only supported in Surface materials.\n"
+                "void main() {\n"
+                "    int __lucent_custom_code_surface_only[-1];\n"
+                "}\n"
+            );
+        }
+    }
     
     // Header
     ss << "#version 450\n\n";
@@ -716,6 +849,61 @@ std::string MaterialCompiler::GenerateNodeCode(const MaterialGraph& graph, const
         case NodeType::ViewDirection:
             pinVarNames[node.outputPins[0]] = "normalize(pc.cameraPos.xyz - inWorldPos)";
             break;
+
+        case NodeType::CustomCode: {
+            // Build input expressions by pin name, call the generated helper function,
+            // and map outputs to local variables.
+            const auto& graphPins = graph.GetPins();
+
+            auto findPinByName = [&](const std::vector<PinID>& pins, const char* name) -> const MaterialPin* {
+                for (PinID pid : pins) {
+                    const MaterialPin* p = graph.GetPin(pid);
+                    if (p && p->name == name) return p;
+                }
+                return nullptr;
+            };
+
+            const MaterialPin* inPin = findPinByName(node.inputPins, "In");
+            const MaterialPin* outPin = findPinByName(node.outputPins, "Out");
+            (void)graphPins;
+
+            // Always provide In/Out (pins are created by SetupNodePins).
+            if (outPin) {
+                // Declare locals for all outputs
+                for (PinID pid : node.outputPins) {
+                    const MaterialPin* p = graph.GetPin(pid);
+                    if (!p) continue;
+                    std::string var = varPrefix + "out_" + std::to_string(pid);
+                    ss << "    " << GetGLSLTypeName(p->type) << " " << var << ";\n";
+                    pinVarNames[pid] = var;
+                }
+
+                // Build call
+                ss << "    custom_node_" << node.id << "(";
+                bool firstArg = true;
+                for (PinID pid : node.inputPins) {
+                    const MaterialPin* p = graph.GetPin(pid);
+                    if (!p) continue;
+                    if (!firstArg) ss << ", ";
+                    firstArg = false;
+                    ss << GetPinValue(graph, pid, p->type, pinVarNames);
+                }
+                for (PinID pid : node.outputPins) {
+                    const MaterialPin* p = graph.GetPin(pid);
+                    if (!p) continue;
+                    if (!firstArg) ss << ", ";
+                    firstArg = false;
+                    ss << pinVarNames[pid];
+                }
+                ss << ");\n";
+
+                // Ensure default Out pin has a mapping (already set above).
+                if (inPin && !outPin) {
+                    // no-op
+                }
+            }
+            break;
+        }
             
         case NodeType::ConstFloat: {
             float val = std::holds_alternative<float>(node.parameter) ? std::get<float>(node.parameter) : 0.0f;

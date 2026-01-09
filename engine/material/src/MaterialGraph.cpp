@@ -1,8 +1,84 @@
 #include "lucent/material/MaterialGraph.h"
 #include "lucent/core/Log.h"
 #include <algorithm>
+#include <sstream>
+#include <cctype>
 
 namespace lucent::material {
+
+namespace {
+
+struct CustomCodeDecl {
+    bool isOutput = false; // false = input (includes 'uniform')
+    PinType type = PinType::Float;
+    std::string name;
+};
+
+static bool ParsePinTypeToken(const std::string& tok, PinType& outType) {
+    if (tok == "float") { outType = PinType::Float; return true; }
+    if (tok == "vec2")  { outType = PinType::Vec2;  return true; }
+    if (tok == "vec3")  { outType = PinType::Vec3;  return true; }
+    if (tok == "vec4")  { outType = PinType::Vec4;  return true; }
+    return false;
+}
+
+static std::string TrimLeft(std::string s) {
+    size_t i = 0;
+    while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
+    return s.substr(i);
+}
+
+static bool ParseCustomCodeDeclLine(const std::string& line, CustomCodeDecl& outDecl) {
+    // Accept:
+    //   in vec3 Name;
+    //   uniform float Strength;
+    //   out vec2 UV;
+    std::string s = TrimLeft(line);
+    if (s.empty()) return false;
+    // Skip comments (// ...)
+    if (s.rfind("//", 0) == 0) return false;
+
+    bool isOut = false;
+    bool isIn = false;
+    bool isUniform = false;
+    if (s.rfind("out ", 0) == 0) { isOut = true; s = TrimLeft(s.substr(4)); }
+    else if (s.rfind("in ", 0) == 0) { isIn = true; s = TrimLeft(s.substr(3)); }
+    else if (s.rfind("uniform ", 0) == 0) { isUniform = true; s = TrimLeft(s.substr(8)); }
+    else return false;
+
+    std::istringstream iss(s);
+    std::string typeTok;
+    std::string nameTok;
+    if (!(iss >> typeTok >> nameTok)) return false;
+    // Strip trailing ';' from name
+    if (!nameTok.empty() && nameTok.back() == ';') nameTok.pop_back();
+    if (nameTok.empty()) return false;
+
+    PinType pinType{};
+    if (!ParsePinTypeToken(typeTok, pinType)) return false;
+
+    outDecl.isOutput = isOut;
+    outDecl.type = pinType;
+    outDecl.name = nameTok;
+    (void)isIn;
+    (void)isUniform;
+    return true;
+}
+
+static std::vector<CustomCodeDecl> ParseCustomCodeDecls(const std::string& code) {
+    std::vector<CustomCodeDecl> decls;
+    std::istringstream ss(code);
+    std::string line;
+    while (std::getline(ss, line)) {
+        CustomCodeDecl d{};
+        if (ParseCustomCodeDeclLine(line, d)) {
+            decls.push_back(std::move(d));
+        }
+    }
+    return decls;
+}
+
+} // namespace
 
 MaterialGraph::MaterialGraph() {
 }
@@ -116,6 +192,20 @@ NodeID MaterialGraph::CreateNode(NodeType type, const glm::vec2& position) {
             // Format: "FRAME:w,h,r,g,b,a;title"
             node.parameter = std::string("FRAME:300,200,0.2,0.2,0.2,0.5;Comment");
             break;
+        case NodeType::CustomCode:
+            // Free-form code block stored as a string.
+            // Pins are inferred from `in/uniform/out` declarations when rebuilt.
+            node.parameter = std::string(
+                "// Custom Code (Surface)\n"
+                "// - Default pins always exist: `In` (vec3), `Out` (vec3)\n"
+                "// - Declare extra pins:\n"
+                "//     uniform float Strength;\n"
+                "//     in vec3 Color;\n"
+                "//     out vec3 Result;\n"
+                "\n"
+                "Out = In;\n"
+            );
+            break;
         default:
             node.parameter = 0.0f;
             break;
@@ -169,6 +259,37 @@ void MaterialGraph::SetupNodePins(MaterialNode& node) {
         case NodeType::ViewDirection:
             addOutput("View", PinType::Vec3);
             break;
+
+        case NodeType::CustomCode: {
+            // Always provide a default RGB passthrough-like interface.
+            addInput("In", PinType::Vec3, glm::vec3(0.0f));
+            addOutput("Out", PinType::Vec3);
+
+            const std::string code = std::holds_alternative<std::string>(node.parameter)
+                ? std::get<std::string>(node.parameter)
+                : std::string();
+            const auto decls = ParseCustomCodeDecls(code);
+
+            auto hasName = [&](const std::vector<PinID>& pins, const std::string& name) -> bool {
+                for (PinID pid : pins) {
+                    const MaterialPin* p = GetPin(pid);
+                    if (p && p->name == name) return true;
+                }
+                return false;
+            };
+
+            for (const auto& d : decls) {
+                // Avoid duplicates (including the defaults).
+                if (d.isOutput) {
+                    if (hasName(node.outputPins, d.name)) continue;
+                    addOutput(d.name, d.type);
+                } else {
+                    if (hasName(node.inputPins, d.name)) continue;
+                    addInput(d.name, d.type, 0.0f);
+                }
+            }
+            break;
+        }
             
         // Constants
         case NodeType::ConstFloat:
@@ -514,6 +635,179 @@ PinID MaterialGraph::CreatePin(NodeID nodeId, const std::string& name, PinType t
 MaterialPin* MaterialGraph::GetPin(PinID pinId) {
     auto it = m_Pins.find(pinId);
     return it != m_Pins.end() ? &it->second : nullptr;
+}
+
+void MaterialGraph::DeleteNodePinsAndLinks(MaterialNode& node) {
+    // Delete links touching any pin of this node, then delete pins.
+    std::vector<PinID> allPins;
+    allPins.reserve(node.inputPins.size() + node.outputPins.size());
+    allPins.insert(allPins.end(), node.inputPins.begin(), node.inputPins.end());
+    allPins.insert(allPins.end(), node.outputPins.begin(), node.outputPins.end());
+
+    // Delete links referencing these pins
+    std::vector<LinkID> linksToDelete;
+    for (const auto& [linkId, link] : m_Links) {
+        for (PinID pid : allPins) {
+            if (link.startPinId == pid || link.endPinId == pid) {
+                linksToDelete.push_back(linkId);
+                break;
+            }
+        }
+    }
+    for (LinkID lid : linksToDelete) {
+        m_Links.erase(lid);
+    }
+
+    // Delete pins
+    for (PinID pid : allPins) {
+        m_Pins.erase(pid);
+    }
+    node.inputPins.clear();
+    node.outputPins.clear();
+}
+
+void MaterialGraph::RebuildNodePins(NodeID nodeId) {
+    auto it = m_Nodes.find(nodeId);
+    if (it == m_Nodes.end()) return;
+    MaterialNode& node = it->second;
+
+    // Don't rebuild output nodes (pin layout is stable)
+    if (node.type == NodeType::PBROutput || node.type == NodeType::VolumetricOutput) return;
+
+    if (node.type == NodeType::CustomCode) {
+        // Preserve pins (and links) for unchanged declarations where possible.
+        struct PinSpec {
+            std::string name;
+            PinType type;
+            PinDirection dir;
+        };
+
+        auto buildDesired = [&](std::vector<PinSpec>& ins, std::vector<PinSpec>& outs) {
+            ins.clear();
+            outs.clear();
+            ins.push_back({ "In", PinType::Vec3, PinDirection::Input });
+            outs.push_back({ "Out", PinType::Vec3, PinDirection::Output });
+
+            const std::string code = std::holds_alternative<std::string>(node.parameter)
+                ? std::get<std::string>(node.parameter)
+                : std::string();
+            const auto decls = ParseCustomCodeDecls(code);
+
+            auto addUnique = [](std::vector<PinSpec>& v, const PinSpec& s) {
+                for (const auto& it : v) {
+                    if (it.name == s.name && it.dir == s.dir) return;
+                }
+                v.push_back(s);
+            };
+
+            for (const auto& d : decls) {
+                if (d.isOutput) addUnique(outs, { d.name, d.type, PinDirection::Output });
+                else addUnique(ins, { d.name, d.type, PinDirection::Input });
+            }
+        };
+
+        std::vector<PinSpec> desiredIn, desiredOut;
+        buildDesired(desiredIn, desiredOut);
+
+        auto deleteLinksForPin = [&](PinID pid) {
+            std::vector<LinkID> linksToDelete;
+            linksToDelete.reserve(8);
+            for (const auto& [linkId, link] : m_Links) {
+                if (link.startPinId == pid || link.endPinId == pid) {
+                    linksToDelete.push_back(linkId);
+                }
+            }
+            for (LinkID lid : linksToDelete) {
+                m_Links.erase(lid);
+            }
+        };
+
+        // Build lookup of existing pins by name+dir.
+        struct ExistingInfo { PinID id; PinType type; };
+        std::unordered_map<std::string, ExistingInfo> existingIn;
+        std::unordered_map<std::string, ExistingInfo> existingOut;
+        existingIn.reserve(node.inputPins.size());
+        existingOut.reserve(node.outputPins.size());
+
+        for (PinID pid : node.inputPins) {
+            const MaterialPin* p = GetPin(pid);
+            if (!p) continue;
+            existingIn[p->name] = { pid, p->type };
+        }
+        for (PinID pid : node.outputPins) {
+            const MaterialPin* p = GetPin(pid);
+            if (!p) continue;
+            existingOut[p->name] = { pid, p->type };
+        }
+
+        // Build new pin lists; reuse old PinIDs when unchanged.
+        std::vector<PinID> newInputs;
+        std::vector<PinID> newOutputs;
+        newInputs.reserve(desiredIn.size());
+        newOutputs.reserve(desiredOut.size());
+
+        auto ensurePin = [&](const PinSpec& s) -> PinID {
+            auto& table = (s.dir == PinDirection::Input) ? existingIn : existingOut;
+            auto it2 = table.find(s.name);
+            if (it2 != table.end() && it2->second.type == s.type) {
+                return it2->second.id; // unchanged; keep id+links
+            }
+
+            // If name exists but type changed, delete old pin+links.
+            if (it2 != table.end()) {
+                deleteLinksForPin(it2->second.id);
+                m_Pins.erase(it2->second.id);
+                table.erase(it2);
+            }
+
+            // Create new pin
+            PinValue def = 0.0f;
+            if (s.dir == PinDirection::Input) {
+                if (s.type == PinType::Vec2) def = glm::vec2(0.0f);
+                else if (s.type == PinType::Vec3) def = glm::vec3(0.0f);
+                else if (s.type == PinType::Vec4) def = glm::vec4(0.0f);
+            }
+            return CreatePin(node.id, s.name, s.type, s.dir, def);
+        };
+
+        for (const auto& s : desiredIn) newInputs.push_back(ensurePin(s));
+        for (const auto& s : desiredOut) newOutputs.push_back(ensurePin(s));
+
+        // Delete any remaining old pins not present in desired schema.
+        auto desiredNameSet = [&](const std::vector<PinSpec>& v) {
+            std::unordered_map<std::string, bool> set;
+            set.reserve(v.size());
+            for (const auto& s : v) set[s.name] = true;
+            return set;
+        };
+        const auto desiredInSet = desiredNameSet(desiredIn);
+        const auto desiredOutSet = desiredNameSet(desiredOut);
+
+        for (PinID pid : node.inputPins) {
+            const MaterialPin* p = GetPin(pid);
+            if (!p) continue;
+            if (desiredInSet.find(p->name) == desiredInSet.end()) {
+                deleteLinksForPin(pid);
+                m_Pins.erase(pid);
+            }
+        }
+        for (PinID pid : node.outputPins) {
+            const MaterialPin* p = GetPin(pid);
+            if (!p) continue;
+            if (desiredOutSet.find(p->name) == desiredOutSet.end()) {
+                deleteLinksForPin(pid);
+                m_Pins.erase(pid);
+            }
+        }
+
+        node.inputPins = std::move(newInputs);
+        node.outputPins = std::move(newOutputs);
+        return;
+    }
+
+    // Default behavior for other nodes
+    DeleteNodePinsAndLinks(node);
+    SetupNodePins(node);
 }
 
 const MaterialPin* MaterialGraph::GetPin(PinID pinId) const {

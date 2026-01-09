@@ -17,6 +17,11 @@ add_executable(editor
     ${CMAKE_CURRENT_BINARY_DIR}/editor.rc
 )
 
+# Fix sporadic MSVC PDB contention (C1041) during parallel builds.
+if(MSVC)
+    target_compile_options(editor PRIVATE /FS)
+endif()
+
 # Add manifest for comctl32 v6.0 (required for LoadIconMetric)
 if(WIN32)
     target_sources(editor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/editor.manifest)

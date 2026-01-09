@@ -80,6 +80,12 @@ bool MaterialIRCompiler::Compile(const MaterialGraph& graph, MaterialIR& outIR, 
     const auto& nodes = graph.GetNodes();
     
     for (const auto& [nodeId, node] : nodes) {
+        if (node.type == NodeType::CustomCode) {
+            errorMsg = "Custom Code node is not supported in traced mode";
+            LUCENT_CORE_WARN("MaterialIR: {}", errorMsg);
+            return false;
+        }
+
         IRInstruction instr;
         instr.id = nextInstrId++;
         nodeToInstr[nodeId] = instr.id;
@@ -281,6 +287,8 @@ bool MaterialIRCompiler::IsTracedCompatible(const MaterialGraph& graph) {
             case NodeType::Vec3ToVec4:
             case NodeType::Vec4ToVec3:
                 break;
+            case NodeType::CustomCode:
+                return false;
                 
             // Unsupported or partially supported
             default:

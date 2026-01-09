@@ -67,6 +67,229 @@ static std::string MakeNoise2Param(int type, const glm::vec4& p) {
     return std::string(buf);
 }
 
+// ----------------------------
+// CustomCode lightweight autocomplete ("intellisense")
+// ----------------------------
+struct CustomCodeEditorState {
+    std::string text;
+    int cursorPos = 0;
+    bool openCompletion = false;
+    int completionIndex = 0;
+    std::string completionToInsert;
+    bool openFullEditor = false;
+    std::string stagedText; // edited in modal; only applied on Apply
+};
+
+static bool IsIdentChar(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+static std::string GetTokenPrefix(const std::string& s, int cursorPos) {
+    int i = std::clamp(cursorPos, 0, (int)s.size());
+    int start = i;
+    while (start > 0 && IsIdentChar(s[start - 1])) --start;
+    return s.substr(start, i - start);
+}
+
+static void BuildCustomCodeCompletions(const std::string& code, std::vector<std::string>& out) {
+    out.clear();
+    // Simple keyword + built-in list
+    static const char* kWords[] = {
+        "in", "out", "uniform",
+        "float", "vec2", "vec3", "vec4", "mat3", "mat4",
+        "if", "else", "for", "while", "return",
+        "sin", "cos", "tan", "abs", "min", "max", "clamp", "mix", "pow", "sqrt", "fract", "floor", "ceil",
+        "normalize", "length", "dot", "cross", "reflect", "refract",
+        "texture",
+        // common graph/material inputs in this shader generator
+        "inWorldPos", "inNormal", "inUV", "inTangent", "inBitangent", "pc"
+    };
+    out.reserve(128);
+    for (const char* w : kWords) out.emplace_back(w);
+
+    // Default pins
+    out.emplace_back("In");
+    out.emplace_back("Out");
+
+    // Parse declared pins: in/uniform/out <type> <Name>;
+    std::istringstream ss(code);
+    std::string line;
+    while (std::getline(ss, line)) {
+        // trim left
+        size_t p = 0;
+        while (p < line.size() && std::isspace(static_cast<unsigned char>(line[p]))) ++p;
+        if (p >= line.size()) continue;
+        if (line.rfind("//", 0) == 0) continue;
+
+        auto startsWith = [&](const char* kw) -> bool {
+            const size_t n = strlen(kw);
+            return line.compare(p, n, kw) == 0 && (p + n == line.size() || std::isspace((unsigned char)line[p + n]));
+        };
+
+        if (!(startsWith("in") || startsWith("out") || startsWith("uniform"))) continue;
+        // Tokenize
+        std::istringstream ls(line.substr(p));
+        std::string dir, type, name;
+        if (!(ls >> dir >> type >> name)) continue;
+        if (!name.empty() && name.back() == ';') name.pop_back();
+        if (name.empty()) continue;
+        out.emplace_back(name);
+    }
+
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+}
+
+// Very lightweight GLSL-ish syntax highlight (preview only).
+enum class CC_TokKind : uint8_t { Normal, Keyword, Type, Number, String, Comment, Identifier };
+
+static bool IsDigit(char c) { return c >= '0' && c <= '9'; }
+
+static bool IsIdentStart(char c) {
+    return std::isalpha(static_cast<unsigned char>(c)) || c == '_';
+}
+
+static ImU32 CC_Color(CC_TokKind k) {
+    switch (k) {
+        case CC_TokKind::Keyword: return IM_COL32(198, 120, 221, 255);   // purple
+        case CC_TokKind::Type: return IM_COL32(97, 175, 239, 255);      // blue
+        case CC_TokKind::Number: return IM_COL32(209, 154, 102, 255);   // orange
+        case CC_TokKind::String: return IM_COL32(152, 195, 121, 255);   // green
+        case CC_TokKind::Comment: return IM_COL32(92, 99, 112, 255);    // gray
+        case CC_TokKind::Identifier: return IM_COL32(224, 224, 224, 255);
+        default: return IM_COL32(224, 224, 224, 255);
+    }
+}
+
+static bool IsInWordSet(const std::string& w, const std::unordered_map<std::string, bool>& set) {
+    return set.find(w) != set.end();
+}
+
+static void DrawCustomCodeHighlightedPreview(const std::string& code) {
+    // Word sets
+    static const std::unordered_map<std::string, bool> kKeywords = {
+        {"if",true},{"else",true},{"for",true},{"while",true},{"return",true},{"break",true},{"continue",true},
+        {"in",true},{"out",true},{"uniform",true},
+    };
+    static const std::unordered_map<std::string, bool> kTypes = {
+        {"float",true},{"vec2",true},{"vec3",true},{"vec4",true},{"mat3",true},{"mat4",true},{"int",true},{"bool",true},
+    };
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 start = ImGui::GetCursorScreenPos();
+    ImFont* font = ImGui::GetFont();
+    const float fontSize = ImGui::GetFontSize();
+    const float lineH = ImGui::GetTextLineHeightWithSpacing();
+
+    std::istringstream ss(code);
+    std::string line;
+    int lineIdx = 0;
+    while (std::getline(ss, line)) {
+        ImVec2 pos(start.x, start.y + lineIdx * lineH);
+
+        // Tokenize line
+        size_t i = 0;
+        while (i < line.size()) {
+            // Comment
+            if (i + 1 < line.size() && line[i] == '/' && line[i + 1] == '/') {
+                const std::string tok = line.substr(i);
+                dl->AddText(font, fontSize, pos, CC_Color(CC_TokKind::Comment), tok.c_str());
+                pos.x += ImGui::CalcTextSize(tok.c_str()).x;
+                break;
+            }
+
+            // String
+            if (line[i] == '"') {
+                size_t j = i + 1;
+                while (j < line.size()) {
+                    if (line[j] == '"' && line[j - 1] != '\\') { ++j; break; }
+                    ++j;
+                }
+                const std::string tok = line.substr(i, j - i);
+                dl->AddText(font, fontSize, pos, CC_Color(CC_TokKind::String), tok.c_str());
+                pos.x += ImGui::CalcTextSize(tok.c_str()).x;
+                i = j;
+                continue;
+            }
+
+            // Whitespace
+            if (std::isspace(static_cast<unsigned char>(line[i]))) {
+                size_t j = i;
+                while (j < line.size() && std::isspace(static_cast<unsigned char>(line[j]))) ++j;
+                const std::string tok = line.substr(i, j - i);
+                dl->AddText(font, fontSize, pos, CC_Color(CC_TokKind::Normal), tok.c_str());
+                pos.x += ImGui::CalcTextSize(tok.c_str()).x;
+                i = j;
+                continue;
+            }
+
+            // Number
+            if (IsDigit(line[i]) || (line[i] == '.' && i + 1 < line.size() && IsDigit(line[i + 1]))) {
+                size_t j = i + 1;
+                while (j < line.size() && (IsDigit(line[j]) || line[j] == '.' || line[j] == 'f')) ++j;
+                const std::string tok = line.substr(i, j - i);
+                dl->AddText(font, fontSize, pos, CC_Color(CC_TokKind::Number), tok.c_str());
+                pos.x += ImGui::CalcTextSize(tok.c_str()).x;
+                i = j;
+                continue;
+            }
+
+            // Identifier/keyword/type
+            if (IsIdentStart(line[i])) {
+                size_t j = i + 1;
+                while (j < line.size() && IsIdentChar(line[j])) ++j;
+                const std::string tok = line.substr(i, j - i);
+                CC_TokKind kind = CC_TokKind::Identifier;
+                if (IsInWordSet(tok, kKeywords)) kind = CC_TokKind::Keyword;
+                else if (IsInWordSet(tok, kTypes)) kind = CC_TokKind::Type;
+                dl->AddText(font, fontSize, pos, CC_Color(kind), tok.c_str());
+                pos.x += ImGui::CalcTextSize(tok.c_str()).x;
+                i = j;
+                continue;
+            }
+
+            // Single char fallback
+            char c[2]{ line[i], '\0' };
+            dl->AddText(font, fontSize, pos, CC_Color(CC_TokKind::Normal), c);
+            pos.x += ImGui::CalcTextSize(c).x;
+            ++i;
+        }
+
+        ++lineIdx;
+    }
+
+    // Reserve space so the child scrolls
+    ImGui::Dummy(ImVec2(0.0f, std::max(1, lineIdx) * lineH));
+}
+
+static int CustomCodeInputCallback(ImGuiInputTextCallbackData* data) {
+    auto* state = static_cast<CustomCodeEditorState*>(data->UserData);
+    if (!state) return 0;
+
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
+        // Standard ImGui pattern for std::string buffers.
+        // data->BufTextLen is the new length (excluding null terminator).
+        state->stagedText.resize((size_t)data->BufTextLen);
+        data->Buf = state->stagedText.data();
+    }
+
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackAlways) {
+        state->cursorPos = data->CursorPos;
+        // Insert pending completion (if any) at cursor.
+        if (!state->completionToInsert.empty()) {
+            data->InsertChars(data->CursorPos, state->completionToInsert.c_str());
+            data->CursorPos += (int)state->completionToInsert.size();
+            data->SelectionStart = data->SelectionEnd = data->CursorPos;
+            state->completionToInsert.clear();
+        }
+    } else if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
+        // Keep staged buffer in sync while editing.
+        state->stagedText.assign(data->Buf, data->BufTextLen);
+        state->cursorPos = data->CursorPos;
+    }
+    return 0;
+}
+
 } // namespace
 
 MaterialGraphPanel::~MaterialGraphPanel() {
@@ -1039,6 +1262,154 @@ void MaterialGraphPanel::DrawNode(const material::MaterialNode& node) {
             }
             break;
         }
+        case material::NodeType::CustomCode: {
+            // Full editor button (rebuild pins clears links on this node).
+            static std::unordered_map<uint64_t, CustomCodeEditorState> s_CodeEditors;
+            CustomCodeEditorState& st = s_CodeEditors[node.id];
+            if (st.text.empty() && std::holds_alternative<std::string>(node.parameter)) {
+                st.text = std::get<std::string>(node.parameter);
+            }
+
+            ImGui::TextDisabled("Custom Code (Surface)");
+            ImGui::TextDisabled("Declare pins: `in/uniform/out <type> <Name>;` (float/vec2/vec3/vec4)");
+            ImGui::TextDisabled("Default pins: In(vec3) -> Out(vec3). Rebuild clears links on this node.");
+
+            // Show a tiny preview (first line) so the node stays compact.
+            {
+                std::string firstLine = st.text;
+                size_t nl = firstLine.find('\n');
+                if (nl != std::string::npos) firstLine = firstLine.substr(0, nl);
+                if (firstLine.size() > 32) firstLine = firstLine.substr(0, 29) + "...";
+                ImGui::TextDisabled("%s", firstLine.empty() ? "(empty)" : firstLine.c_str());
+            }
+
+            if (ImGui::Button("Open Editor...")) {
+                st.openFullEditor = true;
+            }
+
+            // Modal editor
+            if (st.openFullEditor) {
+                // Refresh staged text from current stored text when opening
+                st.stagedText = st.text;
+                ImGui::OpenPopup("Custom Code Editor");
+                st.openFullEditor = false;
+            }
+
+            // IMPORTANT: When a popup/modal is shown, ax::NodeEditor can capture all mouse/keyboard input.
+            // Suspend the node editor so ImGui popups behave correctly (clicks + typing).
+            ed::Suspend();
+
+            ImGui::SetNextWindowSize(ImVec2(720, 520), ImGuiCond_Appearing);
+            if (ImGui::BeginPopupModal("Custom Code Editor", nullptr, ImGuiWindowFlags_NoResize)) {
+                ImGui::Text("Custom Code Editor (Surface)");
+                ImGui::Separator();
+                ImGui::TextDisabled("Autocomplete: Ctrl+Space");
+
+                // Split: editable text on left, highlighted preview on right.
+                ImGui::Columns(2, "##cc_cols", true);
+                ImGui::SetColumnWidth(0, 380.0f);
+
+                ImGui::TextDisabled("Editor");
+                ImGuiInputTextFlags flags = ImGuiInputTextFlags_AllowTabInput |
+                                            ImGuiInputTextFlags_CallbackAlways |
+                                            ImGuiInputTextFlags_CallbackEdit |
+                                            ImGuiInputTextFlags_CallbackResize;
+
+                ImGui::InputTextMultiline("##customcode_full",
+                    st.stagedText.data(),
+                    st.stagedText.capacity() + 1,
+                    ImVec2(-1, 380),
+                    flags,
+                    CustomCodeInputCallback,
+                    &st
+                );
+
+                // Trigger completion (inside modal editor)
+                if (ImGui::IsItemActive() && ImGui::IsKeyPressed(ImGuiKey_Space) && ImGui::GetIO().KeyCtrl) {
+                    st.openCompletion = true;
+                }
+
+                if (st.openCompletion) {
+                    ImGui::OpenPopup("##CustomCodeCompletion");
+                    st.openCompletion = false;
+                    st.completionIndex = 0;
+                }
+                if (ImGui::BeginPopup("##CustomCodeCompletion")) {
+                    const std::string prefix = GetTokenPrefix(st.stagedText, st.cursorPos);
+                    std::vector<std::string> items;
+                    BuildCustomCodeCompletions(st.stagedText, items);
+                    std::vector<const std::string*> filtered;
+                    filtered.reserve(items.size());
+                    for (const auto& it : items) {
+                        if (prefix.empty()) { filtered.push_back(&it); continue; }
+                        if (it.size() < prefix.size()) continue;
+                        bool ok = true;
+                        for (size_t i = 0; i < prefix.size(); ++i) {
+                            char a = (char)std::tolower((unsigned char)it[i]);
+                            char b = (char)std::tolower((unsigned char)prefix[i]);
+                            if (a != b) { ok = false; break; }
+                        }
+                        if (ok) filtered.push_back(&it);
+                    }
+                    if (filtered.empty()) {
+                        ImGui::TextDisabled("No completions");
+                    } else {
+                        st.completionIndex = std::clamp(st.completionIndex, 0, (int)filtered.size() - 1);
+                        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) st.completionIndex = std::min(st.completionIndex + 1, (int)filtered.size() - 1);
+                        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) st.completionIndex = std::max(st.completionIndex - 1, 0);
+
+                        ImGui::BeginChild("##cc_list", ImVec2(400, 180), true);
+                        for (int i = 0; i < (int)filtered.size(); ++i) {
+                            bool sel = (i == st.completionIndex);
+                            if (ImGui::Selectable(filtered[i]->c_str(), sel)) {
+                                st.completionIndex = i;
+                                ImGui::CloseCurrentPopup();
+                            }
+                        }
+                        ImGui::EndChild();
+
+                        const bool accept = ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter);
+                        if (accept) {
+                            const std::string& choice = *filtered[st.completionIndex];
+                            st.completionToInsert = choice.substr(prefix.size());
+                            ImGui::CloseCurrentPopup();
+                        }
+                    }
+
+                    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::EndPopup();
+                }
+
+                ImGui::NextColumn();
+                ImGui::TextDisabled("Preview (syntax highlighting)");
+                ImGui::BeginChild("##cc_preview", ImVec2(-1, 380), true, ImGuiWindowFlags_HorizontalScrollbar);
+                DrawCustomCodeHighlightedPreview(st.stagedText);
+                ImGui::EndChild();
+
+                ImGui::Columns(1);
+
+                ImGui::Separator();
+
+                if (ImGui::Button("Apply & Rebuild Pins")) {
+                    st.text = st.stagedText;
+                    auto* mutableNode = const_cast<material::MaterialNode*>(&node);
+                    mutableNode->parameter = st.text;
+                    m_Material->GetGraph().RebuildNodePins(node.id);
+                    m_Material->MarkDirty();
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel")) {
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+
+            ed::Resume();
+            break;
+        }
         case material::NodeType::ColorRamp: {
             // ColorRamp (custom UI). Store stops as: "RAMP:t,r,g,b;..."
             // NOTE: We intentionally do NOT use ImGradient::Edit() from ImGuizmo because the vcpkg
@@ -1555,6 +1926,8 @@ static const NodeMenuItem s_AllNodeTypes[] = {
     // Utility
     { material::NodeType::Reroute, "Reroute", "Utility" },
     { material::NodeType::Frame, "Frame", "Utility" },
+    // Custom
+    { material::NodeType::CustomCode, "Custom Code", "Custom" },
     // Output (special handling in UI)
     { material::NodeType::PBROutput, "PBR Output", "Output" },
     { material::NodeType::VolumetricOutput, "Volume Output", "Output" },
@@ -1786,6 +2159,13 @@ void MaterialGraphPanel::DrawNodeCreationMenu() {
     if (ImGui::BeginMenu("Utility")) {
         addNodeMenuItem("Reroute", material::NodeType::Reroute);
         addNodeMenuItem("Frame", material::NodeType::Frame);
+        ImGui::Separator();
+        addNodeMenuItem("Custom Code", material::NodeType::CustomCode);
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Custom")) {
+        addNodeMenuItem("Custom Code", material::NodeType::CustomCode);
         ImGui::EndMenu();
     }
     
