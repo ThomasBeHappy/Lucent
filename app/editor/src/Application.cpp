@@ -1417,19 +1417,50 @@ void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& t
 
         if (!renderer.visible) return;
 
-        assets::Mesh* mesh = nullptr;
-        if (renderer.primitiveType != scene::MeshRendererComponent::PrimitiveType::None) {
-            auto it = m_PrimitiveMeshes.find(renderer.primitiveType);
-            if (it == m_PrimitiveMeshes.end() || !it->second) return;
-            mesh = it->second.get();
-        } else if (renderer.meshAssetID != UINT32_MAX) {
-            mesh = lucent::assets::MeshRegistry::Get().GetMesh(renderer.meshAssetID);
-            if (!mesh) return;
-        } else {
-            return;
+        // Prefer editable mesh topology when present (Edit Mode / converted primitives).
+        // Tracers operate on triangles, so we triangulate ngons here.
+        std::vector<assets::Vertex> tempVertices;
+        std::vector<uint32_t> tempIndices;
+        const std::vector<assets::Vertex>* verticesPtr = nullptr;
+        const std::vector<uint32_t>* indicesPtr = nullptr;
+
+        if (auto* editMesh = entity.GetComponent<scene::EditableMeshComponent>(); editMesh && editMesh->HasMesh()) {
+            auto triOut = editMesh->mesh->ToTriangles();
+            if (!triOut.vertices.empty() && !triOut.indices.empty()) {
+                tempVertices.reserve(triOut.vertices.size());
+                for (const auto& v : triOut.vertices) {
+                    assets::Vertex av{};
+                    av.position = v.position;
+                    av.normal = v.normal;
+                    av.uv = v.uv;
+                    av.tangent = v.tangent;
+                    tempVertices.push_back(av);
+                }
+                tempIndices = std::move(triOut.indices);
+                verticesPtr = &tempVertices;
+                indicesPtr = &tempIndices;
+            }
         }
-        const auto& vertices = mesh->GetCPUVertices();
-        const auto& indices = mesh->GetCPUIndices();
+
+        assets::Mesh* mesh = nullptr;
+        if (!verticesPtr || !indicesPtr) {
+            if (renderer.primitiveType != scene::MeshRendererComponent::PrimitiveType::None) {
+                auto it = m_PrimitiveMeshes.find(renderer.primitiveType);
+                if (it == m_PrimitiveMeshes.end() || !it->second) return;
+                mesh = it->second.get();
+            } else if (renderer.meshAssetID != UINT32_MAX) {
+                mesh = lucent::assets::MeshRegistry::Get().GetMesh(renderer.meshAssetID);
+                if (!mesh) return;
+            } else {
+                return;
+            }
+
+            verticesPtr = &mesh->GetCPUVertices();
+            indicesPtr = &mesh->GetCPUIndices();
+        }
+
+        const auto& vertices = *verticesPtr;
+        const auto& indices = *indicesPtr;
 
         if (vertices.empty() || indices.empty()) return;
 

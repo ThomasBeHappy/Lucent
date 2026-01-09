@@ -332,6 +332,66 @@ void EditableMeshComponent::InitFromPrimitive(MeshRendererComponent::PrimitiveTy
         mesh = std::make_unique<mesh::EditableMesh>(
             mesh::EditableMesh::FromFaces(positions, faces)
         );
+
+        // Assign per-face UVs (per-loop) so materials don't "break" when entering Edit Mode.
+        // With only 8 shared vertices we can't have per-face vertex UV seams, but EditableMesh
+        // supports per-loop UVs which is exactly what a cube needs.
+        if (mesh) {
+            auto* m = mesh.get();
+            for (const auto& face : m->GetFaces()) {
+                if (face.id == mesh::INVALID_ID) continue;
+                const mesh::EMFace* f = m->GetFace(face.id);
+                if (!f) continue;
+
+                // Choose a stable projection plane based on face normal.
+                glm::vec3 n = f->normal;
+                glm::vec3 an = glm::abs(n);
+                int axisU = 0;
+                int axisV = 1;
+                if (an.x >= an.y && an.x >= an.z) {
+                    // +/-X face: project to (z,y)
+                    axisU = 2; axisV = 1;
+                } else if (an.y >= an.x && an.y >= an.z) {
+                    // +/-Y face: project to (x,z)
+                    axisU = 0; axisV = 2;
+                } else {
+                    // +/-Z face: project to (x,y)
+                    axisU = 0; axisV = 1;
+                }
+
+                // Collect loops and 2D projected coords
+                std::vector<mesh::LoopID> loopIds;
+                std::vector<glm::vec2> uvProj;
+                loopIds.reserve(f->vertCount);
+                uvProj.reserve(f->vertCount);
+
+                glm::vec2 minUV(FLT_MAX);
+                glm::vec2 maxUV(-FLT_MAX);
+
+                m->ForEachFaceLoop(face.id, [&](const mesh::EMLoop& loop) {
+                    const mesh::EMVertex* v = m->GetVertex(loop.vertex);
+                    if (!v) return;
+                    glm::vec3 p = v->position;
+                    glm::vec2 q(p[axisU], p[axisV]);
+                    loopIds.push_back(loop.id);
+                    uvProj.push_back(q);
+                    minUV = glm::min(minUV, q);
+                    maxUV = glm::max(maxUV, q);
+                });
+
+                glm::vec2 span = maxUV - minUV;
+                if (span.x < 1e-6f) span.x = 1.0f;
+                if (span.y < 1e-6f) span.y = 1.0f;
+
+                for (size_t i = 0; i < loopIds.size() && i < uvProj.size(); ++i) {
+                    mesh::EMLoop* l = m->GetLoop(loopIds[i]);
+                    if (!l) continue;
+                    glm::vec2 uv = (uvProj[i] - minUV) / span;
+                    l->uv = uv;
+                }
+            }
+        }
+
         sourcePrimitive = type;
         fromImport = false;
         dirty = true;

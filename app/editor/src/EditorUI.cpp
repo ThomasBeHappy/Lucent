@@ -1625,18 +1625,13 @@ void EditorUI::DrawGizmo() {
         return;
     }
 
-    // IMPORTANT: Do NOT mutate the shared editor camera here.
-    // The viewport renderer owns camera aspect based on the render target; changing it here (only when selected)
-    // can cause constant accumulation resets. We only need matrices for ImGuizmo, so build a local projection.
-    const float aspectRatio = m_ViewportSize.x / m_ViewportSize.y;
     glm::mat4 view = m_EditorCamera->GetViewMatrix();
-    glm::mat4 projection = glm::perspective(
-        glm::radians(m_EditorCamera->GetFOV()),
-        aspectRatio,
-        m_EditorCamera->GetNearClip(),
-        m_EditorCamera->GetFarClip()
-    );
-    // Match the engine's Vulkan projection convention (we flip Y in the camera projection).
+    // Use the *same* projection the renderer uses for the actual viewport render target.
+    // Using the ImGui panel aspect causes gizmo/overlays to drift when panel != render target.
+    glm::mat4 projection = m_EditorCamera->GetProjectionMatrix();
+
+    // ImGuizmo expects OpenGL-style projection (Y-up), but Vulkan is Y-down.
+    // Flip the Y axis in the projection matrix for ImGuizmo.
     projection[1][1] *= -1.0f;
     
     // Get transform matrix
@@ -4058,16 +4053,9 @@ glm::vec3 EditorUI::WorldToScreen(const glm::vec3& worldPos) {
     if (!m_EditorCamera) return glm::vec3(0);
     
     glm::mat4 view = m_EditorCamera->GetViewMatrix();
-
-    // IMPORTANT: Use viewport aspect for overlays/picking. The editor camera's stored aspect
-    // can lag behind docking/resizing and causes overlays (e.g. camera frustums) to drift/flicker.
-    const float aspectRatio = (m_ViewportSize.y > 0.0f) ? (m_ViewportSize.x / m_ViewportSize.y) : 1.0f;
-    glm::mat4 proj = glm::perspective(
-        glm::radians(m_EditorCamera->GetFOV()),
-        aspectRatio,
-        m_EditorCamera->GetNearClip(),
-        m_EditorCamera->GetFarClip()
-    );
+    // Use the same projection used for rendering the viewport texture (render target aspect).
+    // If we use the ImGui panel aspect here, the overlay will "swim" when the camera moves.
+    glm::mat4 proj = m_EditorCamera->GetProjectionMatrix();
     
     glm::vec4 clipPos = proj * view * glm::vec4(worldPos, 1.0f);
     if (clipPos.w <= 0.0f) return glm::vec3(-1000, -1000, -1); // Behind camera
