@@ -205,6 +205,11 @@ public:
                      uint32_t tileOffsetY,
                      uint32_t tileWidth,
                      uint32_t tileHeight);
+
+    // Explicitly override the accumulation storage image target (descriptor binding 0).
+    // Must be RGBA32F and created with VK_IMAGE_USAGE_STORAGE_BIT.
+    // Passing nullptr reverts back to the internal accumulation image.
+    void SetExternalAccumulationImage(Image* image);
     
     // Reset accumulation
     void ResetAccumulation();

@@ -126,6 +126,12 @@ bool FinalRender::Init(Renderer* renderer) {
 
 void FinalRender::Shutdown() {
     Cancel();
+    // Ensure we never leave the compute tracer bound to our accumulation image.
+    if (m_Renderer) {
+        if (auto* compute = m_Renderer->GetTracerCompute()) {
+            compute->SetExternalAccumulationImage(nullptr);
+        }
+    }
     DestroyRenderResources();
     m_Renderer = nullptr;
 }
@@ -163,6 +169,8 @@ bool FinalRender::Start(const FinalRenderConfig& config, const GPUCamera& camera
         m_Renderer->GetTracerRayKHR()->ResetAccumulation();
     } else if (m_Renderer->GetTracerCompute()) {
         m_Renderer->GetTracerCompute()->UpdateScene(triangles, materials, lights, volumes);
+        // FinalRender uses a dedicated accumulation image. Bind it explicitly as the tracer's storage target.
+        m_Renderer->GetTracerCompute()->SetExternalAccumulationImage(&m_AccumImage);
         m_Renderer->GetTracerCompute()->ResetAccumulation();
     } else {
         LUCENT_CORE_ERROR("FinalRender: No tracer available");
@@ -197,6 +205,11 @@ void FinalRender::Cancel() {
     if (m_Status == FinalRenderStatus::Rendering) {
         m_CancelRequested = true;
         m_Status = FinalRenderStatus::Cancelled;
+        if (!m_UsingRayTracing && m_Renderer) {
+            if (auto* compute = m_Renderer->GetTracerCompute()) {
+                compute->SetExternalAccumulationImage(nullptr);
+            }
+        }
         LUCENT_CORE_INFO("FinalRender: Cancelled");
     }
 }
@@ -215,6 +228,11 @@ bool FinalRender::RenderSample() {
         // Apply tonemapping and finalize
         ApplyTonemap();
         m_Status = FinalRenderStatus::Completed;
+        if (!m_UsingRayTracing && m_Renderer) {
+            if (auto* compute = m_Renderer->GetTracerCompute()) {
+                compute->SetExternalAccumulationImage(nullptr);
+            }
+        }
         
         float elapsed = GetElapsedTime();
         LUCENT_CORE_INFO("FinalRender: Completed in {:.2f}s ({:.2f}ms/sample)", 
@@ -256,8 +274,8 @@ bool FinalRender::RenderSample() {
         const uint32_t tileW = std::min(m_TileSize, m_Config.width - offsetX);
         const uint32_t tileH = std::min(m_TileSize, m_Config.height - offsetY);
 
-        // Trace one tile of the current sample
-        m_Renderer->GetTracerCompute()->TraceRegion(cmd, m_Camera, settings, &m_AccumImage, offsetX, offsetY, tileW, tileH);
+        // Trace one tile of the current sample (accum target already set via SetExternalAccumulationImage())
+        m_Renderer->GetTracerCompute()->TraceRegion(cmd, m_Camera, settings, nullptr, offsetX, offsetY, tileW, tileH);
 
         // Advance tile/sample
         m_CurrentTile++;
@@ -276,6 +294,11 @@ bool FinalRender::RenderSample() {
         if (m_CurrentSample >= m_Config.samples) {
             ApplyTonemap();
             m_Status = FinalRenderStatus::Completed;
+            if (!m_UsingRayTracing && m_Renderer) {
+                if (auto* compute = m_Renderer->GetTracerCompute()) {
+                    compute->SetExternalAccumulationImage(nullptr);
+                }
+            }
 
             float elapsed = GetElapsedTime();
             LUCENT_CORE_INFO("FinalRender: Completed in {:.2f}s ({:.2f}ms/sample)",

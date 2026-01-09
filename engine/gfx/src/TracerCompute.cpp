@@ -800,8 +800,13 @@ void TracerCompute::Trace(VkCommandBuffer cmd,
                            const GPUCamera& camera,
                            const RenderSettings& settings,
                            Image* outputImage) {
-    if (!outputImage) return;
-    TraceRegion(cmd, camera, settings, outputImage, 0, 0, outputImage->GetWidth(), outputImage->GetHeight());
+    // In editor/runtime we may pass nullptr (internal accumulation sized from camera resolution),
+    // or pass an image just to provide sizing. The accumulation storage target is controlled
+    // explicitly via SetExternalAccumulationImage().
+    uint32_t w = outputImage ? outputImage->GetWidth() : static_cast<uint32_t>(camera.resolution.x);
+    uint32_t h = outputImage ? outputImage->GetHeight() : static_cast<uint32_t>(camera.resolution.y);
+    if (w == 0 || h == 0) return;
+    TraceRegion(cmd, camera, settings, outputImage, 0, 0, w, h);
 }
 
 void TracerCompute::TraceRegion(VkCommandBuffer cmd,
@@ -814,28 +819,23 @@ void TracerCompute::TraceRegion(VkCommandBuffer cmd,
                            uint32_t tileHeight) {
     if (!m_SceneGPU.valid) return;
 
-    // Bind external accumulation target if provided (FinalRender path)
-    if (outputImage) {
-        if (m_ExternalAccumImage != outputImage || m_ExternalAccumView != outputImage->GetView()) {
-            m_ExternalAccumImage = outputImage;
-            m_ExternalAccumView = outputImage->GetView();
-            m_DescriptorsDirty = true;
-            // Force accumulation recreation path to update AOV images + layouts
-            m_AccumWidth = 0;
-            m_AccumHeight = 0;
-        }
+    // Determine target dimensions:
+    // - Prefer explicit external accumulation image size if set
+    // - Else use provided outputImage size (sizing-only)
+    // - Else fall back to camera resolution
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (m_ExternalAccumImage) {
+        width = m_ExternalAccumImage->GetWidth();
+        height = m_ExternalAccumImage->GetHeight();
+    } else if (outputImage) {
+        width = outputImage->GetWidth();
+        height = outputImage->GetHeight();
     } else {
-        if (m_ExternalAccumImage) {
-            m_ExternalAccumImage = nullptr;
-            m_ExternalAccumView = VK_NULL_HANDLE;
-            m_DescriptorsDirty = true;
-            m_AccumWidth = 0;
-            m_AccumHeight = 0;
-        }
+        width = static_cast<uint32_t>(camera.resolution.x);
+        height = static_cast<uint32_t>(camera.resolution.y);
     }
-    
-    uint32_t width = outputImage ? outputImage->GetWidth() : m_AccumWidth;
-    uint32_t height = outputImage ? outputImage->GetHeight() : m_AccumHeight;
+    if (width == 0 || height == 0) return;
     
     // Ensure accumulation image is correct size
     if (!CreateAccumulationImage(width, height)) {
@@ -907,6 +907,30 @@ void TracerCompute::TraceRegion(VkCommandBuffer cmd,
     
     m_FrameIndex++;
     m_Ready = true;
+}
+
+void TracerCompute::SetExternalAccumulationImage(Image* image) {
+    // No change
+    if (m_ExternalAccumImage == image) return;
+
+    if (image) {
+        if (image->GetHandle() == VK_NULL_HANDLE) {
+            LUCENT_CORE_ERROR("TracerCompute: external accumulation image handle is null");
+            return;
+        }
+        if (image->GetFormat() != VK_FORMAT_R32G32B32A32_SFLOAT) {
+            LUCENT_CORE_ERROR("TracerCompute: external accumulation image must be VK_FORMAT_R32G32B32A32_SFLOAT");
+            return;
+        }
+    }
+
+    m_ExternalAccumImage = image;
+    m_ExternalAccumView = image ? image->GetView() : VK_NULL_HANDLE;
+
+    // Force accumulation recreation path to update AOV images + layouts and update descriptor binding 0.
+    m_AccumWidth = 0;
+    m_AccumHeight = 0;
+    m_DescriptorsDirty = true;
 }
 
 void TracerCompute::ResetAccumulation() {
