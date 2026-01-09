@@ -1454,6 +1454,56 @@ void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& t
             return false;
         }
 
+        // ---------------------------------------------------------------------
+        // RT material IR opcodes (must match `shaders/rt_closesthit.rchit`)
+        // ---------------------------------------------------------------------
+        constexpr uint32_t OP_CONST       = 1u;
+        constexpr uint32_t OP_UV          = 2u;
+        constexpr uint32_t OP_TEX2D       = 3u;
+        constexpr uint32_t OP_ADD         = 4u;
+        constexpr uint32_t OP_MUL         = 5u;
+        constexpr uint32_t OP_LERP        = 6u;
+        constexpr uint32_t OP_CLAMP       = 7u;
+        constexpr uint32_t OP_SATURATE    = 8u;
+        constexpr uint32_t OP_ONEMINUS    = 9u;
+        constexpr uint32_t OP_SWIZZLE     = 10u; // texIndex: 0=x,1=y,2=z,3=w,4=xyz (w=1)
+        constexpr uint32_t OP_COMBINE3    = 11u;
+        constexpr uint32_t OP_FRESNEL     = 12u;
+        constexpr uint32_t OP_SUB         = 13u;
+        constexpr uint32_t OP_DIV         = 14u;
+        constexpr uint32_t OP_POW         = 15u;
+        // NOTE: Remap is expanded into primitive ops on the CPU side (keeps interpreter simpler)
+        constexpr uint32_t OP_STEP        = 17u;
+        constexpr uint32_t OP_SMOOTHSTEP  = 18u;
+        constexpr uint32_t OP_SIN         = 19u;
+        constexpr uint32_t OP_COS         = 20u;
+        constexpr uint32_t OP_ABS         = 21u;
+        constexpr uint32_t OP_MIN         = 22u;
+        constexpr uint32_t OP_MAX         = 23u;
+        constexpr uint32_t OP_SQRT        = 24u;
+        constexpr uint32_t OP_FLOOR       = 25u;
+        constexpr uint32_t OP_CEIL        = 26u;
+        constexpr uint32_t OP_FRACT       = 27u;
+        constexpr uint32_t OP_MOD         = 28u;
+        constexpr uint32_t OP_EXP         = 29u;
+        constexpr uint32_t OP_LOG         = 30u;
+        constexpr uint32_t OP_NEGATE      = 31u;
+        constexpr uint32_t OP_DOT         = 32u;
+        constexpr uint32_t OP_NORMALIZE   = 33u;
+        constexpr uint32_t OP_LENGTH      = 34u;
+        constexpr uint32_t OP_CROSS       = 35u;
+        constexpr uint32_t OP_REFLECT     = 36u;
+        constexpr uint32_t OP_REFRACT     = 37u;
+        constexpr uint32_t OP_COMBINE2    = 38u;
+        constexpr uint32_t OP_COMBINE4    = 39u;
+        constexpr uint32_t OP_WORLDPOS    = 40u;
+        constexpr uint32_t OP_WORLDNORM   = 41u;
+        constexpr uint32_t OP_VIEWDIR     = 42u;
+        constexpr uint32_t OP_TIME        = 43u;
+        constexpr uint32_t OP_VCOLOR      = 44u;
+        constexpr uint32_t OP_NORMALMAP   = 45u;
+        constexpr uint32_t OP_NOISE       = 46u; // imm = (scale, detail, roughness, distortion), texIndex selects type
+
         auto emit = [&](uint32_t type,
                         uint32_t a = 0, uint32_t b = 0, uint32_t c = 0,
                         uint32_t texIndex = 0,
@@ -1471,21 +1521,31 @@ void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& t
 
         auto emitConstFromValue = [&](const material::PinValue& v) -> uint32_t {
             if (std::holds_alternative<float>(v)) {
-                return emit(1u, 0, 0, 0, 0, glm::vec4(std::get<float>(v), 0.0f, 0.0f, 0.0f));
+                return emit(OP_CONST, 0, 0, 0, 0, glm::vec4(std::get<float>(v), 0.0f, 0.0f, 0.0f));
             }
             if (std::holds_alternative<glm::vec2>(v)) {
                 auto vv = std::get<glm::vec2>(v);
-                return emit(1u, 0, 0, 0, 0, glm::vec4(vv.x, vv.y, 0.0f, 0.0f));
+                return emit(OP_CONST, 0, 0, 0, 0, glm::vec4(vv.x, vv.y, 0.0f, 0.0f));
             }
             if (std::holds_alternative<glm::vec3>(v)) {
                 auto vv = std::get<glm::vec3>(v);
-                return emit(1u, 0, 0, 0, 0, glm::vec4(vv, 1.0f));
+                return emit(OP_CONST, 0, 0, 0, 0, glm::vec4(vv, 1.0f));
             }
             if (std::holds_alternative<glm::vec4>(v)) {
-                return emit(1u, 0, 0, 0, 0, std::get<glm::vec4>(v));
+                return emit(OP_CONST, 0, 0, 0, 0, std::get<glm::vec4>(v));
             }
             // String / other: not constant-evaluable here
-            return emit(1u, 0, 0, 0, 0, glm::vec4(0.0f));
+            return emit(OP_CONST, 0, 0, 0, 0, glm::vec4(0.0f));
+        };
+
+        auto isConnectedInput = [&](const material::MaterialNode& node, size_t inputIndex) -> bool {
+            if (inputIndex >= node.inputPins.size()) return false;
+            return graph.FindLinkByEndPin(node.inputPins[inputIndex]) != material::INVALID_LINK_ID;
+        };
+
+        // Helpers for swizzling components from a packed vec4 register.
+        auto emitSwizzle = [&](uint32_t vReg, uint32_t component) -> uint32_t {
+            return emit(OP_SWIZZLE, vReg, 0u, 0u, component);
         };
 
         // Cache per-pin output register
@@ -1538,6 +1598,29 @@ void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& t
 
             uint32_t r = 0u;
             switch (node->type) {
+                // -------------------------------------------------------------
+                // Inputs
+                // -------------------------------------------------------------
+                case material::NodeType::UV:
+                    r = emit(OP_UV);
+                    break;
+                case material::NodeType::WorldPosition:
+                    r = emit(OP_WORLDPOS);
+                    break;
+                case material::NodeType::WorldNormal:
+                    r = emit(OP_WORLDNORM);
+                    break;
+                case material::NodeType::ViewDirection:
+                    r = emit(OP_VIEWDIR);
+                    break;
+                case material::NodeType::Time:
+                    r = emit(OP_TIME);
+                    break;
+                case material::NodeType::VertexColor:
+                    // RT vertices currently don't carry color; default to white.
+                    r = emit(OP_VCOLOR);
+                    break;
+
                 case material::NodeType::ConstFloat:
                 case material::NodeType::ConstVec2:
                 case material::NodeType::ConstVec3:
@@ -1545,12 +1628,8 @@ void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& t
                     r = emitConstFromValue(node->parameter);
                     break;
 
-                case material::NodeType::UV:
-                    r = emit(2u);
-                    break;
-
                 case material::NodeType::Texture2D:
-                case material::NodeType::NormalMap: {
+                {
                     uint32_t uvReg = 0u;
                     if (!node->inputPins.empty()) {
                         // If UV is unconnected, leave uvReg = 0 -> shader defaults to mesh UV input
@@ -1589,7 +1668,7 @@ void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& t
                         }
                     }
 
-                    uint32_t sampleReg = emit(3u, uvReg, 0u, 0u, texIndex);
+                    uint32_t sampleReg = emit(OP_TEX2D, uvReg, 0u, 0u, texIndex);
 
                     // outputs: 0=RGB, 1=R, 2=G, 3=B, 4=A (see MaterialGraph SetupNodePins)
                     uint32_t swz = 4u;
@@ -1597,60 +1676,381 @@ void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& t
                     else if (outIdx == 2) swz = 1u;
                     else if (outIdx == 3) swz = 2u;
                     else if (outIdx == 4) swz = 3u;
-                    r = emit(10u, sampleReg, 0u, 0u, swz);
+                    r = emit(OP_SWIZZLE, sampleReg, 0u, 0u, swz);
+                    break;
+                }
+
+                case material::NodeType::NormalMap: {
+                    uint32_t uvReg = 0u;
+                    if (!node->inputPins.empty()) {
+                        material::LinkID linkId = graph.FindLinkByEndPin(node->inputPins[0]);
+                        if (linkId != material::INVALID_LINK_ID) {
+                            uvReg = compilePin(node->inputPins[0]);
+                        }
+                    }
+                    uint32_t strengthReg = (node->inputPins.size() >= 2) ? compilePin(node->inputPins[1]) : emit(OP_CONST, 0, 0, 0, 0, glm::vec4(1, 0, 0, 0));
+
+                    std::string path;
+                    if (std::holds_alternative<std::string>(node->parameter)) path = std::get<std::string>(node->parameter);
+
+                    // Normal maps are data textures by default; honor explicit slot sRGB flag if present.
+                    bool sRGB = false;
+                    if (!path.empty()) {
+                        const auto& slots = graph.GetTextureSlots();
+                        for (const auto& slot : slots) {
+                            if (slot.path == path) { sRGB = slot.sRGB; break; }
+                        }
+                    }
+
+                    uint32_t texIndex = 0u;
+                    if (outRTTextures) {
+                        const std::string key = std::string(sRGB ? "S:" : "U:") + path;
+                        auto it = texKeyToIndex.find(key);
+                        if (it != texKeyToIndex.end()) {
+                            texIndex = it->second;
+                        } else {
+                            if (outRTTextures->size() < 256) {
+                                texIndex = static_cast<uint32_t>(outRTTextures->size());
+                                outRTTextures->push_back(gfx::RTTextureKey{ path, sRGB });
+                                texKeyToIndex[key] = texIndex;
+                            } else {
+                                texIndex = 0u;
+                            }
+                        }
+                    }
+
+                    r = emit(OP_NORMALMAP, uvReg, strengthReg, 0u, texIndex);
+                    break;
+                }
+
+                // -------------------------------------------------------------
+                // Procedural
+                // -------------------------------------------------------------
+                case material::NodeType::Noise: {
+                    // Provide a useful default for Vector when unconnected: vec3(UV, 0)
+                    uint32_t vecReg = 0u;
+                    if (isConnectedInput(*node, 0)) {
+                        vecReg = compilePin(node->inputPins[0]);
+                    } else {
+                        uint32_t uv2 = emit(OP_UV);
+                        uint32_t z0 = emit(OP_CONST, 0, 0, 0, 0, glm::vec4(0, 0, 0, 0));
+                        uint32_t ux = emitSwizzle(uv2, 0u);
+                        uint32_t uy = emitSwizzle(uv2, 1u);
+                        vecReg = emit(OP_COMBINE3, ux, uy, z0);
+                    }
+
+                    // Parameters: use node.parameter defaults (pins are allowed but not currently dynamic in RT IR)
+                    glm::vec4 p = glm::vec4(5.0f, 4.0f, 0.5f, 0.0f); // scale, detail, roughness, distortion
+                    if (std::holds_alternative<glm::vec4>(node->parameter)) {
+                        p = std::get<glm::vec4>(node->parameter);
+                    }
+
+                    uint32_t noiseType = 0u; // 0=fbm,1=value,2=ridged,3=turbulence
+                    if (std::holds_alternative<std::string>(node->parameter)) {
+                        // Keep as FBM for now (parameter may be "NOISE2:..." blob)
+                        noiseType = 0u;
+                    }
+
+                    // Emit noise; pack as vec4(n, n, n, 1)
+                    uint32_t n = emit(OP_NOISE, vecReg, 0u, 0u, noiseType, p);
+
+                    // outputs: 0=Value (float), 1=Color (vec3)
+                    if (outIdx == 0) r = emitSwizzle(n, 0u);
+                    else r = emit(OP_SWIZZLE, n, 0u, 0u, 4u);
                     break;
                 }
 
                 case material::NodeType::Add:
-                    r = emit(4u, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    r = emit(OP_ADD, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    break;
+
+                case material::NodeType::Subtract:
+                    r = emit(OP_SUB, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
                     break;
 
                 case material::NodeType::Multiply:
-                    r = emit(5u, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    r = emit(OP_MUL, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    break;
+
+                case material::NodeType::Divide:
+                    r = emit(OP_DIV, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
                     break;
 
                 case material::NodeType::Lerp:
-                    r = emit(6u, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]), compilePin(node->inputPins[2]));
+                    r = emit(OP_LERP, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]), compilePin(node->inputPins[2]));
                     break;
 
                 case material::NodeType::Clamp:
-                    r = emit(7u, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]), compilePin(node->inputPins[2]));
+                    r = emit(OP_CLAMP, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]), compilePin(node->inputPins[2]));
                     break;
 
                 case material::NodeType::Saturate:
-                    r = emit(8u, compilePin(node->inputPins[0]));
+                    r = emit(OP_SATURATE, compilePin(node->inputPins[0]));
                     break;
 
                 case material::NodeType::OneMinus:
-                    r = emit(9u, compilePin(node->inputPins[0]));
+                    r = emit(OP_ONEMINUS, compilePin(node->inputPins[0]));
                     break;
 
                 case material::NodeType::SeparateVec3: {
                     uint32_t v = compilePin(node->inputPins[0]);
                     uint32_t swz = (outIdx == 1) ? 1u : (outIdx == 2) ? 2u : 0u;
-                    r = emit(10u, v, 0u, 0u, swz);
+                    r = emit(OP_SWIZZLE, v, 0u, 0u, swz);
                     break;
                 }
 
                 case material::NodeType::CombineVec3:
-                    r = emit(11u, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]), compilePin(node->inputPins[2]));
+                    r = emit(OP_COMBINE3, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]), compilePin(node->inputPins[2]));
+                    break;
+
+                case material::NodeType::Fresnel:
+                    // Fresnel term from N·V (view-dependent; evaluated in shader using current hit normal + ray direction)
+                    r = emit(OP_FRESNEL, compilePin(node->inputPins[0]));
+                    break;
+
+                case material::NodeType::Power:
+                    r = emit(OP_POW, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    break;
+                case material::NodeType::Remap:
+                    // Expand remap to primitive ops:
+                    // t = (x - inMin) / (inMax - inMin); out = outMin + t * (outMax - outMin)
+                    {
+                        uint32_t x = compilePin(node->inputPins[0]);
+                        uint32_t inMin = compilePin(node->inputPins[1]);
+                        uint32_t inMax = compilePin(node->inputPins[2]);
+                        uint32_t outMin = compilePin(node->inputPins[3]);
+                        uint32_t outMax = compilePin(node->inputPins[4]);
+                        uint32_t denom = emit(OP_SUB, inMax, inMin);
+                        uint32_t num = emit(OP_SUB, x, inMin);
+                        uint32_t t = emit(OP_DIV, num, denom);
+                        uint32_t range = emit(OP_SUB, outMax, outMin);
+                        uint32_t scaled = emit(OP_MUL, t, range);
+                        r = emit(OP_ADD, scaled, outMin);
+                    }
+                    break;
+                case material::NodeType::Step:
+                    // step(edge, x)
+                    r = emit(OP_STEP, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    break;
+                case material::NodeType::Smoothstep:
+                    r = emit(OP_SMOOTHSTEP, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]), compilePin(node->inputPins[2]));
+                    break;
+                case material::NodeType::Sin:
+                    r = emit(OP_SIN, compilePin(node->inputPins[0]));
+                    break;
+                case material::NodeType::Cos:
+                    r = emit(OP_COS, compilePin(node->inputPins[0]));
+                    break;
+                case material::NodeType::Abs:
+                    r = emit(OP_ABS, compilePin(node->inputPins[0]));
+                    break;
+                case material::NodeType::Min:
+                    r = emit(OP_MIN, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    break;
+                case material::NodeType::Max:
+                    r = emit(OP_MAX, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    break;
+                case material::NodeType::Sqrt:
+                    r = emit(OP_SQRT, compilePin(node->inputPins[0]));
+                    break;
+                case material::NodeType::Floor:
+                    r = emit(OP_FLOOR, compilePin(node->inputPins[0]));
+                    break;
+                case material::NodeType::Ceil:
+                    r = emit(OP_CEIL, compilePin(node->inputPins[0]));
+                    break;
+                case material::NodeType::Fract:
+                    r = emit(OP_FRACT, compilePin(node->inputPins[0]));
+                    break;
+                case material::NodeType::Mod:
+                    r = emit(OP_MOD, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    break;
+                case material::NodeType::Exp:
+                    r = emit(OP_EXP, compilePin(node->inputPins[0]));
+                    break;
+                case material::NodeType::Log:
+                    r = emit(OP_LOG, compilePin(node->inputPins[0]));
+                    break;
+                case material::NodeType::Negate:
+                    r = emit(OP_NEGATE, compilePin(node->inputPins[0]));
+                    break;
+
+                case material::NodeType::Dot:
+                    r = emit(OP_DOT, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    break;
+                case material::NodeType::Normalize:
+                    r = emit(OP_NORMALIZE, compilePin(node->inputPins[0]));
+                    break;
+                case material::NodeType::Length:
+                    r = emit(OP_LENGTH, compilePin(node->inputPins[0]));
+                    break;
+                case material::NodeType::Cross:
+                    r = emit(OP_CROSS, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    break;
+                case material::NodeType::Reflect:
+                    r = emit(OP_REFLECT, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    break;
+                case material::NodeType::Refract:
+                    r = emit(OP_REFRACT, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]), compilePin(node->inputPins[2]));
+                    break;
+
+                case material::NodeType::SeparateVec4: {
+                    uint32_t v = compilePin(node->inputPins[0]);
+                    uint32_t swz = (outIdx == 3) ? 3u : (outIdx == 2) ? 2u : (outIdx == 1) ? 1u : 0u;
+                    r = emit(OP_SWIZZLE, v, 0u, 0u, swz);
+                    break;
+                }
+                case material::NodeType::SeparateVec2: {
+                    uint32_t v = compilePin(node->inputPins[0]);
+                    uint32_t swz = (outIdx == 1) ? 1u : 0u;
+                    r = emit(OP_SWIZZLE, v, 0u, 0u, swz);
+                    break;
+                }
+                case material::NodeType::CombineVec2:
+                    r = emit(OP_COMBINE2, compilePin(node->inputPins[0]), compilePin(node->inputPins[1]));
+                    break;
+                case material::NodeType::CombineVec4:
+                    {
+                        uint32_t rr = compilePin(node->inputPins[0]);
+                        uint32_t gg = compilePin(node->inputPins[1]);
+                        uint32_t bb = compilePin(node->inputPins[2]);
+                        uint32_t aa = compilePin(node->inputPins[3]);
+                        // OP_COMBINE4 takes rgb operands in (a,b,c) and stores alpha operand register in texIndex.
+                        r = emit(OP_COMBINE4, rr, gg, bb, aa);
+                    }
                     break;
 
                 case material::NodeType::FloatToVec3: {
                     uint32_t f = compilePin(node->inputPins[0]);
-                    r = emit(11u, f, f, f);
+                    r = emit(OP_COMBINE3, f, f, f);
                     break;
                 }
 
                 case material::NodeType::Vec3ToFloat: {
                     uint32_t v = compilePin(node->inputPins[0]);
-                    r = emit(10u, v, 0u, 0u, 0u);
+                    r = emit(OP_SWIZZLE, v, 0u, 0u, 0u);
                     break;
                 }
 
                 case material::NodeType::Vec4ToVec3: {
                     uint32_t v = compilePin(node->inputPins[0]);
-                    r = emit(10u, v, 0u, 0u, 4u);
+                    r = emit(OP_SWIZZLE, v, 0u, 0u, 4u);
+                    break;
+                }
+
+                case material::NodeType::Vec2ToVec3: {
+                    uint32_t v2 = compilePin(node->inputPins[0]);
+                    uint32_t z = compilePin(node->inputPins[1]);
+                    uint32_t x = emitSwizzle(v2, 0u);
+                    uint32_t y = emitSwizzle(v2, 1u);
+                    r = emit(OP_COMBINE3, x, y, z);
+                    break;
+                }
+
+                case material::NodeType::Vec3ToVec4: {
+                    uint32_t v3 = compilePin(node->inputPins[0]);
+                    uint32_t a = compilePin(node->inputPins[1]);
+                    // Reuse COMBINE4 by swizzling xyz.
+                    uint32_t x = emitSwizzle(v3, 0u);
+                    uint32_t y = emitSwizzle(v3, 1u);
+                    uint32_t z = emitSwizzle(v3, 2u);
+                    r = emit(OP_COMBINE4, x, y, z, a);
+                    break;
+                }
+
+                case material::NodeType::ColorRamp: {
+                    // Compile a piecewise-linear color ramp into basic ops.
+                    // NOTE: Graph stores stops in node.parameter string: "RAMP:t,r,g,b;...".
+                    // We output vec4(color.rgb, alpha=1).
+                    uint32_t tReg = compilePin(node->inputPins[0]);
+
+                    // Parse stops
+                    std::vector<std::pair<float, glm::vec3>> stops;
+                    if (std::holds_alternative<std::string>(node->parameter)) {
+                        const std::string blob = std::get<std::string>(node->parameter);
+                        const std::string prefix = "RAMP:";
+                        size_t start = (blob.rfind(prefix, 0) == 0) ? prefix.size() : 0;
+                        while (start < blob.size()) {
+                            size_t end = blob.find(';', start);
+                            std::string token = blob.substr(start, end == std::string::npos ? std::string::npos : (end - start));
+                            if (!token.empty()) {
+                                float tt = 0, rr = 1, gg = 1, bb = 1;
+                                if (sscanf_s(token.c_str(), "%f,%f,%f,%f", &tt, &rr, &gg, &bb) == 4) {
+                                    stops.push_back({ tt, glm::vec3(rr, gg, bb) });
+                                }
+                            }
+                            if (end == std::string::npos) break;
+                            start = end + 1;
+                        }
+                    }
+                    if (stops.empty()) {
+                        stops.push_back({ 0.0f, glm::vec3(0.0f) });
+                        stops.push_back({ 1.0f, glm::vec3(1.0f) });
+                    }
+                    std::sort(stops.begin(), stops.end(), [](auto& a, auto& b) { return a.first < b.first; });
+                    // Limit stop count to keep instruction counts bounded
+                    if (stops.size() > 8) {
+                        std::vector<std::pair<float, glm::vec3>> reduced;
+                        reduced.reserve(8);
+                        for (size_t i = 0; i < 8; ++i) {
+                            size_t idx = (i * (stops.size() - 1)) / 7;
+                            reduced.push_back(stops[idx]);
+                        }
+                        stops = std::move(reduced);
+                    }
+
+                    auto constFloat = [&](float v) { return emit(OP_CONST, 0, 0, 0, 0, glm::vec4(v, 0, 0, 0)); };
+                    auto constVec3 = [&](glm::vec3 v) { return emit(OP_CONST, 0, 0, 0, 0, glm::vec4(v, 1)); };
+                    auto constOne = [&]() { return constFloat(1.0f); };
+                    auto constZero = [&]() { return constFloat(0.0f); };
+
+                    // colorAccum = 0
+                    uint32_t colorAccum = constVec3(glm::vec3(0.0f));
+
+                    // Below first stop: maskBelow = 1 - step(t0, t)
+                    const float t0f = stops.front().first;
+                    const glm::vec3 c0 = stops.front().second;
+                    uint32_t t0 = constFloat(t0f);
+                    uint32_t maskBelow = emit(OP_ONEMINUS, emit(OP_STEP, t0, tReg));
+                    colorAccum = emit(OP_ADD, colorAccum, emit(OP_MUL, constVec3(c0), maskBelow));
+
+                    // Segments
+                    for (size_t i = 0; i + 1 < stops.size(); ++i) {
+                        float ta = stops[i].first;
+                        float tb = stops[i + 1].first;
+                        glm::vec3 ca = stops[i].second;
+                        glm::vec3 cb = stops[i + 1].second;
+
+                        uint32_t taR = constFloat(ta);
+                        uint32_t tbR = constFloat(tb);
+
+                        // segMask = step(ta, t) * (1 - step(tb, t))
+                        uint32_t inA = emit(OP_STEP, taR, tReg);
+                        uint32_t inB = emit(OP_ONEMINUS, emit(OP_STEP, tbR, tReg));
+                        uint32_t segMask = emit(OP_MUL, inA, inB);
+
+                        // u = clamp((t - ta) / (tb - ta), 0..1)
+                        uint32_t denom = emit(OP_SUB, tbR, taR);
+                        uint32_t num = emit(OP_SUB, tReg, taR);
+                        uint32_t u = emit(OP_DIV, num, denom);
+                        u = emit(OP_CLAMP, u, constZero(), constOne());
+
+                        uint32_t caR = constVec3(ca);
+                        uint32_t cbR = constVec3(cb);
+                        uint32_t segColor = emit(OP_LERP, caR, cbR, u);
+
+                        colorAccum = emit(OP_ADD, colorAccum, emit(OP_MUL, segColor, segMask));
+                    }
+
+                    // Above last stop: maskAbove = step(tLast, t)
+                    const float tLf = stops.back().first;
+                    const glm::vec3 cL = stops.back().second;
+                    uint32_t tL = constFloat(tLf);
+                    uint32_t maskAbove = emit(OP_STEP, tL, tReg);
+                    colorAccum = emit(OP_ADD, colorAccum, emit(OP_MUL, constVec3(cL), maskAbove));
+
+                    // Pack output as vec4(rgb, 1)
+                    r = emit(OP_SWIZZLE, colorAccum, 0u, 0u, 4u);
                     break;
                 }
 
@@ -1659,8 +2059,8 @@ void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& t
                     break;
 
                 default:
-                    // Unsupported for this minimal RT interpreter (yet)
-                    outErr = "Unsupported node for RT per-hit eval";
+                    // Unsupported for RT per-hit evaluation
+                    outErr = std::string("Unsupported node for RT per-hit eval: ") + material::GetNodeTypeName(node->type);
                     r = emit(1u, 0, 0, 0, 0, glm::vec4(0.0f));
                     break;
             }
@@ -1676,6 +2076,7 @@ void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& t
         material::PinID roughnessIn = material::INVALID_PIN_ID;
         material::PinID emissiveIn = material::INVALID_PIN_ID;
         material::PinID normalIn = material::INVALID_PIN_ID;
+        material::PinID alphaIn = material::INVALID_PIN_ID;
 
         for (material::PinID pid : outNode->inputPins) {
             const material::MaterialPin* p = graph.GetPin(pid);
@@ -1685,13 +2086,25 @@ void Application::BuildTracerSceneData(std::vector<gfx::BVHBuilder::Triangle>& t
             else if (p->name == "Roughness") roughnessIn = pid;
             else if (p->name == "Emissive") emissiveIn = pid;
             else if (p->name == "Normal") normalIn = pid;
+            else if (p->name == "Alpha") alphaIn = pid;
         }
 
         outHdr.baseColorReg = compilePin(baseColorIn);
         outHdr.metallicReg = compilePin(metallicIn);
         outHdr.roughnessReg = compilePin(roughnessIn);
         outHdr.emissiveReg = compilePin(emissiveIn);
-        outHdr.normalReg = compilePin(normalIn);
+        // Important: if Normal is unconnected, keep geometry normal (normalReg = 0).
+        if (normalIn != material::INVALID_PIN_ID && graph.FindLinkByEndPin(normalIn) != material::INVALID_LINK_ID) {
+            outHdr.normalReg = compilePin(normalIn);
+        } else {
+            outHdr.normalReg = 0u;
+        }
+        // Alpha currently not used by tracer shading, but we can still evaluate it for future use.
+        if (alphaIn != material::INVALID_PIN_ID && graph.FindLinkByEndPin(alphaIn) != material::INVALID_LINK_ID) {
+            outHdr.alphaReg = compilePin(alphaIn);
+        } else {
+            outHdr.alphaReg = 0u;
+        }
 
         // Clamp instruction count to shader interpreter limit
         if (outInstrsLocal.size() > 128) {
