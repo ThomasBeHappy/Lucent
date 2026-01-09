@@ -7,6 +7,117 @@
 
 namespace lucent::mesh {
 namespace MeshOps {
+namespace {
+
+std::vector<VertexID> CollectFaceVertices(const EditableMesh& mesh, FaceID fid) {
+    std::vector<VertexID> verts;
+    mesh.ForEachFaceLoop(fid, [&](const EMLoop& loop) {
+        verts.push_back(loop.vertex);
+    });
+    return verts;
+}
+
+std::vector<LoopID> CollectFaceLoops(const EditableMesh& mesh, FaceID fid) {
+    std::vector<LoopID> loops;
+    mesh.ForEachFaceLoop(fid, [&](const EMLoop& loop) {
+        loops.push_back(loop.id);
+    });
+    return loops;
+}
+
+EdgeID FindEdgeBetween(const EditableMesh& mesh, VertexID v0, VertexID v1) {
+    auto edges = mesh.GetVertexEdges(v0);
+    for (EdgeID eid : edges) {
+        const EMEdge* e = mesh.GetEdge(eid);
+        if (!e) continue;
+        if ((e->v0 == v0 && e->v1 == v1) || (e->v0 == v1 && e->v1 == v0)) {
+            return eid;
+        }
+    }
+    return INVALID_ID;
+}
+
+void CleanupOrphanEdges(EditableMesh& mesh) {
+    std::vector<EdgeID> toRemove;
+    for (const auto& e : mesh.GetEdges()) {
+        if (e.id == INVALID_ID) continue;
+        if (e.loop0 == INVALID_ID && e.loop1 == INVALID_ID) {
+            toRemove.push_back(e.id);
+        }
+    }
+    for (EdgeID eid : toRemove) {
+        mesh.RemoveEdge(eid);
+    }
+}
+
+bool FaceHasEdge(const EditableMesh& mesh, FaceID fid, EdgeID eid, size_t& loopIndex) {
+    auto loops = CollectFaceLoops(mesh, fid);
+    for (size_t i = 0; i < loops.size(); ++i) {
+        const EMLoop* loop = mesh.GetLoop(loops[i]);
+        if (!loop) continue;
+        if (loop->edge == eid) {
+            loopIndex = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<VertexID> BuildPathAvoidingEdge(const std::vector<VertexID>& verts, VertexID start, VertexID end) {
+    std::vector<VertexID> path;
+    const size_t n = verts.size();
+    if (n < 2) return path;
+    
+    size_t startIdx = n;
+    size_t endIdx = n;
+    for (size_t i = 0; i < n; ++i) {
+        if (verts[i] == start) startIdx = i;
+        if (verts[i] == end) endIdx = i;
+    }
+    if (startIdx == n || endIdx == n) return path;
+    
+    bool forwardIsEdge = ((startIdx + 1) % n) == endIdx;
+    int dir = forwardIsEdge ? -1 : 1;
+    
+    size_t idx = startIdx;
+    while (true) {
+        path.push_back(verts[idx]);
+        if (verts[idx] == end) break;
+        idx = (idx + n + dir) % n;
+    }
+    
+    return path;
+}
+
+std::vector<VertexID> BuildSegmentVertices(
+    EditableMesh& mesh,
+    VertexID startId,
+    VertexID endId,
+    int segments
+) {
+    std::vector<VertexID> result;
+    if (segments < 1) segments = 1;
+    const EMVertex* startV = mesh.GetVertex(startId);
+    const EMVertex* endV = mesh.GetVertex(endId);
+    if (!startV || !endV) return result;
+    
+    result.reserve(static_cast<size_t>(segments + 1));
+    result.push_back(startId);
+    for (int s = 1; s < segments; ++s) {
+        float t = static_cast<float>(s) / static_cast<float>(segments);
+        glm::vec3 pos = glm::mix(startV->position, endV->position, t);
+        VertexID vid = mesh.AddVertex(pos);
+        EMVertex* v = mesh.GetVertex(vid);
+        if (v) {
+            v->uv = glm::mix(startV->uv, endV->uv, t);
+        }
+        result.push_back(vid);
+    }
+    result.push_back(endId);
+    return result;
+}
+
+} // namespace
 
 // ============================================================================
 // Transform Operations
@@ -372,67 +483,249 @@ std::vector<FaceID> InsetFaces(EditableMesh& mesh, float thickness) {
 }
 
 void BevelEdges(EditableMesh& mesh, float width, int segments) {
-    // TODO: Implement full bevel
-    // For MVP, just offset vertices slightly
     const auto& selection = mesh.GetSelection();
     
     if (selection.edges.empty()) return;
+    if (segments < 1) segments = 1;
     
-    // Simple bevel: move edge vertices perpendicular to edge
-    for (EdgeID eid : selection.edges) {
+    std::vector<EdgeID> edgesToBevel(selection.edges.begin(), selection.edges.end());
+    std::vector<FaceID> newFaces;
+    
+    for (EdgeID eid : edgesToBevel) {
         const EMEdge* e = mesh.GetEdge(eid);
         if (!e) continue;
         
-        EMVertex* v0 = mesh.GetVertex(e->v0);
-        EMVertex* v1 = mesh.GetVertex(e->v1);
+        const EMVertex* v0 = mesh.GetVertex(e->v0);
+        const EMVertex* v1 = mesh.GetVertex(e->v1);
         if (!v0 || !v1) continue;
         
-        glm::vec3 edgeDir = glm::normalize(v1->position - v0->position);
+        auto edgeFaces = mesh.GetEdgeFaces(eid);
+        if (edgeFaces.empty()) continue;
         
-        // Find perpendicular direction (average of adjacent face normals)
-        glm::vec3 perpDir(0.0f);
-        auto faces = mesh.GetEdgeFaces(eid);
-        for (FaceID fid : faces) {
-            const EMFace* f = mesh.GetFace(fid);
-            if (f) perpDir += f->normal;
+        struct FaceOffset {
+            FaceID face = INVALID_ID;
+            VertexID v0Offset = INVALID_ID;
+            VertexID v1Offset = INVALID_ID;
+            bool valid = false;
+        };
+        
+        std::vector<FaceOffset> offsets;
+        offsets.reserve(edgeFaces.size());
+        
+        for (FaceID fid : edgeFaces) {
+            EMFace* face = mesh.GetFace(fid);
+            if (!face) continue;
+            mesh.RecalculateFaceNormal(fid);
+            
+            std::vector<VertexID> faceVerts = CollectFaceVertices(mesh, fid);
+            if (faceVerts.size() < 3) continue;
+            
+            size_t startIdx = faceVerts.size();
+            bool forward = false;
+            for (size_t i = 0; i < faceVerts.size(); ++i) {
+                size_t next = (i + 1) % faceVerts.size();
+                if (faceVerts[i] == e->v0 && faceVerts[next] == e->v1) {
+                    startIdx = i;
+                    forward = true;
+                    break;
+                }
+                if (faceVerts[i] == e->v1 && faceVerts[next] == e->v0) {
+                    startIdx = i;
+                    forward = false;
+                    break;
+                }
+            }
+            if (startIdx == faceVerts.size()) continue;
+            
+            VertexID fV0 = forward ? e->v0 : e->v1;
+            VertexID fV1 = forward ? e->v1 : e->v0;
+            const EMVertex* fv0 = mesh.GetVertex(fV0);
+            const EMVertex* fv1 = mesh.GetVertex(fV1);
+            if (!fv0 || !fv1) continue;
+            
+            glm::vec3 edgeDir = glm::normalize(fv1->position - fv0->position);
+            glm::vec3 offsetDir = glm::normalize(glm::cross(face->normal, edgeDir));
+            glm::vec3 faceCenter = mesh.CalculateFaceCenter(fid);
+            glm::vec3 edgeCenter = (fv0->position + fv1->position) * 0.5f;
+            if (glm::dot(offsetDir, faceCenter - edgeCenter) < 0.0f) {
+                offsetDir = -offsetDir;
+            }
+            
+            VertexID v0Offset = mesh.AddVertex(fv0->position + offsetDir * width);
+            VertexID v1Offset = mesh.AddVertex(fv1->position + offsetDir * width);
+            EMVertex* newV0 = mesh.GetVertex(v0Offset);
+            EMVertex* newV1 = mesh.GetVertex(v1Offset);
+            if (newV0) newV0->uv = fv0->uv;
+            if (newV1) newV1->uv = fv1->uv;
+            
+            faceVerts[startIdx] = v0Offset;
+            faceVerts[(startIdx + 1) % faceVerts.size()] = v1Offset;
+            
+            mesh.RemoveFace(fid);
+            FaceID newFid = mesh.AddFace(faceVerts);
+            if (newFid != INVALID_ID) {
+                newFaces.push_back(newFid);
+            }
+            
+            offsets.push_back({fid, v0Offset, v1Offset, true});
         }
-        if (glm::length(perpDir) > 0.001f) {
-            perpDir = glm::normalize(perpDir);
-        } else {
-            perpDir = glm::vec3(0, 1, 0);
+        
+        if (offsets.size() == 2) {
+            auto chain0 = BuildSegmentVertices(mesh, offsets[0].v0Offset, offsets[1].v0Offset, segments);
+            auto chain1 = BuildSegmentVertices(mesh, offsets[0].v1Offset, offsets[1].v1Offset, segments);
+            
+            size_t count = std::min(chain0.size(), chain1.size());
+            for (size_t i = 0; i + 1 < count; ++i) {
+                FaceID bevelFace = mesh.AddFace({chain0[i], chain1[i], chain1[i + 1], chain0[i + 1]});
+                if (bevelFace != INVALID_ID) {
+                    newFaces.push_back(bevelFace);
+                }
+            }
+        } else if (offsets.size() == 1) {
+            auto chain0 = BuildSegmentVertices(mesh, e->v0, offsets[0].v0Offset, segments);
+            auto chain1 = BuildSegmentVertices(mesh, e->v1, offsets[0].v1Offset, segments);
+            size_t count = std::min(chain0.size(), chain1.size());
+            for (size_t i = 0; i + 1 < count; ++i) {
+                FaceID bevelFace = mesh.AddFace({chain0[i], chain1[i], chain1[i + 1], chain0[i + 1]});
+                if (bevelFace != INVALID_ID) {
+                    newFaces.push_back(bevelFace);
+                }
+            }
         }
-        
-        glm::vec3 offsetDir = glm::normalize(glm::cross(edgeDir, perpDir));
-        
-        v0->position += offsetDir * width * 0.5f;
-        v1->position += offsetDir * width * 0.5f;
     }
     
-    (void)segments; // TODO: Use for multi-segment bevel
+    CleanupOrphanEdges(mesh);
+    
+    mesh.DeselectAll();
+    for (FaceID fid : newFaces) {
+        mesh.SelectFace(fid, true);
+    }
+    
+    mesh.MakeWindingConsistentAndOutward();
     mesh.RecalculateNormals();
 }
 
 std::vector<EdgeID> LoopCut(EditableMesh& mesh, EdgeID startEdge, float position) {
     std::vector<EdgeID> newEdges;
     
-    // TODO: Implement full loop cut
-    // For MVP, just split the starting edge
-    
     const EMEdge* e = mesh.GetEdge(startEdge);
     if (!e) return newEdges;
     
-    const EMVertex* v0 = mesh.GetVertex(e->v0);
-    const EMVertex* v1 = mesh.GetVertex(e->v1);
-    if (!v0 || !v1) return newEdges;
+    position = std::clamp(position, 0.0f, 1.0f);
     
-    // Create new vertex at position along edge
-    glm::vec3 newPos = glm::mix(v0->position, v1->position, position);
-    VertexID newVid = mesh.AddVertex(newPos);
-    (void)newVid; // TODO: Use when implementing full loop cut
+    std::unordered_set<EdgeID> loopEdges;
+    std::vector<EdgeID> edgeQueue;
+    edgeQueue.push_back(startEdge);
+    loopEdges.insert(startEdge);
     
-    // TODO: Split edge and update topology
-    // This is complex and requires splitting adjacent faces
+    while (!edgeQueue.empty()) {
+        EdgeID eid = edgeQueue.back();
+        edgeQueue.pop_back();
+        
+        auto faces = mesh.GetEdgeFaces(eid);
+        for (FaceID fid : faces) {
+            const EMFace* face = mesh.GetFace(fid);
+            if (!face || face->vertCount != 4) continue;
+            
+            size_t loopIndex = 0;
+            if (!FaceHasEdge(mesh, fid, eid, loopIndex)) continue;
+            
+            auto loops = CollectFaceLoops(mesh, fid);
+            size_t oppositeIndex = (loopIndex + 2) % loops.size();
+            const EMLoop* oppositeLoop = mesh.GetLoop(loops[oppositeIndex]);
+            if (!oppositeLoop) continue;
+            
+            EdgeID oppEid = oppositeLoop->edge;
+            if (oppEid == INVALID_ID) continue;
+            
+            if (loopEdges.insert(oppEid).second) {
+                edgeQueue.push_back(oppEid);
+            }
+        }
+    }
     
+    std::unordered_map<EdgeID, VertexID> splitVertices;
+    std::unordered_set<FaceID> splitFaces;
+    std::unordered_set<EdgeID> newEdgeSet;
+    
+    for (EdgeID eid : loopEdges) {
+        auto faces = mesh.GetEdgeFaces(eid);
+        for (FaceID fid : faces) {
+            if (splitFaces.count(fid)) continue;
+            
+            const EMFace* face = mesh.GetFace(fid);
+            if (!face || face->vertCount != 4) continue;
+            
+            size_t loopIndex = 0;
+            if (!FaceHasEdge(mesh, fid, eid, loopIndex)) continue;
+            
+            auto loops = CollectFaceLoops(mesh, fid);
+            if (loops.size() != 4) continue;
+            
+            const EMLoop* loop0 = mesh.GetLoop(loops[loopIndex]);
+            const EMLoop* loop1 = mesh.GetLoop(loops[(loopIndex + 1) % loops.size()]);
+            const EMLoop* loop2 = mesh.GetLoop(loops[(loopIndex + 2) % loops.size()]);
+            const EMLoop* loop3 = mesh.GetLoop(loops[(loopIndex + 3) % loops.size()]);
+            if (!loop0 || !loop1 || !loop2 || !loop3) continue;
+            
+            VertexID v0 = loop0->vertex;
+            VertexID v1 = loop1->vertex;
+            VertexID v2 = loop2->vertex;
+            VertexID v3 = loop3->vertex;
+            
+            VertexID newEdgeV = INVALID_ID;
+            auto it = splitVertices.find(eid);
+            if (it != splitVertices.end()) {
+                newEdgeV = it->second;
+            } else {
+                const EMVertex* ev0 = mesh.GetVertex(v0);
+                const EMVertex* ev1 = mesh.GetVertex(v1);
+                if (!ev0 || !ev1) continue;
+                glm::vec3 newPos = glm::mix(ev0->position, ev1->position, position);
+                newEdgeV = mesh.AddVertex(newPos);
+                EMVertex* newV = mesh.GetVertex(newEdgeV);
+                if (newV) newV->uv = glm::mix(ev0->uv, ev1->uv, position);
+                splitVertices[eid] = newEdgeV;
+            }
+            
+            EdgeID oppEdge = loop2->edge;
+            VertexID newOppV = INVALID_ID;
+            auto oppIt = splitVertices.find(oppEdge);
+            if (oppIt != splitVertices.end()) {
+                newOppV = oppIt->second;
+            } else {
+                const EMVertex* ev2 = mesh.GetVertex(v2);
+                const EMVertex* ev3 = mesh.GetVertex(v3);
+                if (!ev2 || !ev3) continue;
+                glm::vec3 newPos = glm::mix(ev2->position, ev3->position, position);
+                newOppV = mesh.AddVertex(newPos);
+                EMVertex* newV = mesh.GetVertex(newOppV);
+                if (newV) newV->uv = glm::mix(ev2->uv, ev3->uv, position);
+                splitVertices[oppEdge] = newOppV;
+            }
+            
+            mesh.RemoveFace(fid);
+            FaceID f0 = mesh.AddFace({v0, newEdgeV, newOppV, v3});
+            FaceID f1 = mesh.AddFace({newEdgeV, v1, v2, newOppV});
+            splitFaces.insert(fid);
+            
+            EdgeID cutEdge = FindEdgeBetween(mesh, newEdgeV, newOppV);
+            if (cutEdge != INVALID_ID) {
+                newEdgeSet.insert(cutEdge);
+            }
+        }
+    }
+    
+    CleanupOrphanEdges(mesh);
+    
+    newEdges.assign(newEdgeSet.begin(), newEdgeSet.end());
+    
+    mesh.DeselectAll();
+    for (EdgeID eid : newEdges) {
+        mesh.SelectEdge(eid, true);
+    }
+    
+    mesh.MakeWindingConsistentAndOutward();
     mesh.RecalculateNormals();
     return newEdges;
 }
@@ -527,15 +820,119 @@ void DeleteFaces(EditableMesh& mesh) {
 }
 
 void DissolveVertices(EditableMesh& mesh) {
-    // TODO: Implement vertex dissolve (merge edges through vertex)
-    LUCENT_CORE_WARN("DissolveVertices not fully implemented");
-    DeleteVertices(mesh);
+    const auto& selection = mesh.GetSelection();
+    if (selection.vertices.empty()) return;
+    
+    std::unordered_set<FaceID> facesToUpdate;
+    for (VertexID vid : selection.vertices) {
+        auto faces = mesh.GetVertexFaces(vid);
+        facesToUpdate.insert(faces.begin(), faces.end());
+    }
+    
+    std::vector<FaceID> newFaces;
+    
+    for (FaceID fid : facesToUpdate) {
+        const EMFace* face = mesh.GetFace(fid);
+        if (!face) continue;
+        
+        std::vector<VertexID> verts = CollectFaceVertices(mesh, fid);
+        verts.erase(
+            std::remove_if(
+                verts.begin(),
+                verts.end(),
+                [&](VertexID vid) { return selection.vertices.count(vid) > 0; }
+            ),
+            verts.end()
+        );
+        
+        mesh.RemoveFace(fid);
+        if (verts.size() >= 3) {
+            FaceID newFid = mesh.AddFace(verts);
+            if (newFid != INVALID_ID) newFaces.push_back(newFid);
+        }
+    }
+    
+    for (VertexID vid : selection.vertices) {
+        if (mesh.GetVertex(vid)) {
+            mesh.RemoveVertex(vid);
+        }
+    }
+    
+    CleanupOrphanEdges(mesh);
+    
+    mesh.DeselectAll();
+    for (FaceID fid : newFaces) {
+        mesh.SelectFace(fid, true);
+    }
+    
+    mesh.MakeWindingConsistentAndOutward();
+    mesh.RecalculateNormals();
 }
 
 void DissolveEdges(EditableMesh& mesh) {
-    // TODO: Implement edge dissolve (merge adjacent faces)
-    LUCENT_CORE_WARN("DissolveEdges not fully implemented");
-    DeleteEdges(mesh);
+    const auto& selection = mesh.GetSelection();
+    if (selection.edges.empty()) return;
+    
+    std::vector<EdgeID> edgesToDissolve(selection.edges.begin(), selection.edges.end());
+    std::vector<FaceID> newFaces;
+    
+    for (EdgeID eid : edgesToDissolve) {
+        const EMEdge* edge = mesh.GetEdge(eid);
+        if (!edge) continue;
+        
+        auto faces = mesh.GetEdgeFaces(eid);
+        if (faces.size() < 1) continue;
+        
+        if (faces.size() == 1) {
+            FaceID fid = faces[0];
+            std::vector<VertexID> verts = CollectFaceVertices(mesh, fid);
+            verts.erase(
+                std::remove_if(
+                    verts.begin(),
+                    verts.end(),
+                    [&](VertexID vid) { return vid == edge->v0 || vid == edge->v1; }
+                ),
+                verts.end()
+            );
+            mesh.RemoveFace(fid);
+            if (verts.size() >= 3) {
+                FaceID newFid = mesh.AddFace(verts);
+                if (newFid != INVALID_ID) newFaces.push_back(newFid);
+            }
+            continue;
+        }
+        
+        FaceID f0 = faces[0];
+        FaceID f1 = faces[1];
+        if (!mesh.GetFace(f0) || !mesh.GetFace(f1)) continue;
+        
+        std::vector<VertexID> verts0 = CollectFaceVertices(mesh, f0);
+        std::vector<VertexID> verts1 = CollectFaceVertices(mesh, f1);
+        
+        std::vector<VertexID> path0 = BuildPathAvoidingEdge(verts0, edge->v0, edge->v1);
+        std::vector<VertexID> path1 = BuildPathAvoidingEdge(verts1, edge->v1, edge->v0);
+        if (path0.size() < 2 || path1.size() < 2) continue;
+        
+        std::vector<VertexID> merged;
+        merged.reserve(path0.size() + path1.size() - 2);
+        merged.insert(merged.end(), path0.begin(), path0.end());
+        merged.insert(merged.end(), path1.begin() + 1, path1.end() - 1);
+        
+        mesh.RemoveFace(f0);
+        mesh.RemoveFace(f1);
+        FaceID newFid = mesh.AddFace(merged);
+        if (newFid != INVALID_ID) newFaces.push_back(newFid);
+    }
+    
+    CleanupOrphanEdges(mesh);
+    
+    mesh.DeselectAll();
+    for (FaceID fid : newFaces) {
+        mesh.SelectFace(fid, true);
+    }
+    
+    mesh.MakeWindingConsistentAndOutward();
+    mesh.RecalculateNormals();
 }
 
 // ============================================================================
@@ -543,13 +940,88 @@ void DissolveEdges(EditableMesh& mesh) {
 // ============================================================================
 
 void SelectEdgeLoop(EditableMesh& mesh, EdgeID startEdge) {
-    // TODO: Implement edge loop selection
-    mesh.SelectEdge(startEdge, true);
+    const EMEdge* e = mesh.GetEdge(startEdge);
+    if (!e) return;
+    
+    std::unordered_set<EdgeID> loopEdges;
+    std::vector<EdgeID> edgeQueue;
+    edgeQueue.push_back(startEdge);
+    loopEdges.insert(startEdge);
+    
+    while (!edgeQueue.empty()) {
+        EdgeID eid = edgeQueue.back();
+        edgeQueue.pop_back();
+        
+        auto faces = mesh.GetEdgeFaces(eid);
+        for (FaceID fid : faces) {
+            const EMFace* face = mesh.GetFace(fid);
+            if (!face || face->vertCount != 4) continue;
+            
+            size_t loopIndex = 0;
+            if (!FaceHasEdge(mesh, fid, eid, loopIndex)) continue;
+            
+            auto loops = CollectFaceLoops(mesh, fid);
+            size_t oppositeIndex = (loopIndex + 2) % loops.size();
+            const EMLoop* oppositeLoop = mesh.GetLoop(loops[oppositeIndex]);
+            if (!oppositeLoop) continue;
+            
+            EdgeID oppEid = oppositeLoop->edge;
+            if (oppEid != INVALID_ID && loopEdges.insert(oppEid).second) {
+                edgeQueue.push_back(oppEid);
+            }
+        }
+    }
+    
+    mesh.DeselectAll();
+    for (EdgeID eid : loopEdges) {
+        mesh.SelectEdge(eid, true);
+    }
 }
 
 void SelectEdgeRing(EditableMesh& mesh, EdgeID startEdge) {
-    // TODO: Implement edge ring selection
-    mesh.SelectEdge(startEdge, true);
+    const EMEdge* e = mesh.GetEdge(startEdge);
+    if (!e) return;
+    
+    std::unordered_set<EdgeID> ringEdges;
+    std::vector<EdgeID> edgeQueue;
+    edgeQueue.push_back(startEdge);
+    ringEdges.insert(startEdge);
+    
+    while (!edgeQueue.empty()) {
+        EdgeID eid = edgeQueue.back();
+        edgeQueue.pop_back();
+        
+        auto faces = mesh.GetEdgeFaces(eid);
+        for (FaceID fid : faces) {
+            const EMFace* face = mesh.GetFace(fid);
+            if (!face || face->vertCount != 4) continue;
+            
+            std::vector<LoopID> loops = CollectFaceLoops(mesh, fid);
+            for (size_t i = 0; i < loops.size(); ++i) {
+                const EMLoop* loop = mesh.GetLoop(loops[i]);
+                if (!loop) continue;
+                if (loop->edge != eid) continue;
+                
+                const EMLoop* prevLoop = mesh.GetLoop(loop->prev);
+                const EMLoop* nextLoop = mesh.GetLoop(loop->next);
+                if (prevLoop && prevLoop->edge != INVALID_ID) {
+                    if (ringEdges.insert(prevLoop->edge).second) {
+                        edgeQueue.push_back(prevLoop->edge);
+                    }
+                }
+                if (nextLoop && nextLoop->edge != INVALID_ID) {
+                    if (ringEdges.insert(nextLoop->edge).second) {
+                        edgeQueue.push_back(nextLoop->edge);
+                    }
+                }
+            }
+        }
+    }
+    
+    mesh.DeselectAll();
+    for (EdgeID eid : ringEdges) {
+        mesh.SelectEdge(eid, true);
+    }
 }
 
 void GrowSelection(EditableMesh& mesh) {
@@ -604,8 +1076,67 @@ void GrowSelection(EditableMesh& mesh) {
 }
 
 void ShrinkSelection(EditableMesh& mesh) {
-    // TODO: Implement shrink selection
-    (void)mesh;
+    const auto& selection = mesh.GetSelection();
+    
+    std::unordered_set<VertexID> shrinkVerts;
+    for (VertexID vid : selection.vertices) {
+        bool keep = true;
+        auto edges = mesh.GetVertexEdges(vid);
+        for (EdgeID eid : edges) {
+            const EMEdge* e = mesh.GetEdge(eid);
+            if (!e) continue;
+            VertexID other = e->OtherVertex(vid);
+            if (selection.vertices.count(other) == 0) {
+                keep = false;
+                break;
+            }
+        }
+        if (keep) shrinkVerts.insert(vid);
+    }
+    
+    std::unordered_set<EdgeID> shrinkEdges;
+    for (EdgeID eid : selection.edges) {
+        const EMEdge* e = mesh.GetEdge(eid);
+        if (!e) continue;
+        bool keep = true;
+        auto edges0 = mesh.GetVertexEdges(e->v0);
+        auto edges1 = mesh.GetVertexEdges(e->v1);
+        for (EdgeID adj : edges0) {
+            if (selection.edges.count(adj) == 0) {
+                keep = false;
+                break;
+            }
+        }
+        if (keep) {
+            for (EdgeID adj : edges1) {
+                if (selection.edges.count(adj) == 0) {
+                    keep = false;
+                    break;
+                }
+            }
+        }
+        if (keep) shrinkEdges.insert(eid);
+    }
+    
+    std::unordered_set<FaceID> shrinkFaces;
+    for (FaceID fid : selection.faces) {
+        bool keep = true;
+        mesh.ForEachFaceLoop(fid, [&](const EMLoop& loop) {
+            auto adjFaces = mesh.GetEdgeFaces(loop.edge);
+            for (FaceID adj : adjFaces) {
+                if (selection.faces.count(adj) == 0) {
+                    keep = false;
+                    break;
+                }
+            }
+        });
+        if (keep) shrinkFaces.insert(fid);
+    }
+    
+    mesh.DeselectAll();
+    for (VertexID vid : shrinkVerts) mesh.SelectVertex(vid, true);
+    for (EdgeID eid : shrinkEdges) mesh.SelectEdge(eid, true);
+    for (FaceID fid : shrinkFaces) mesh.SelectFace(fid, true);
 }
 
 // ============================================================================
@@ -630,9 +1161,135 @@ void RecalculateNormals(EditableMesh& mesh) {
 }
 
 void SubdivideFaces(EditableMesh& mesh, int cuts) {
-    // TODO: Implement face subdivision
-    (void)mesh;
-    (void)cuts;
+    if (cuts < 1) return;
+    
+    const auto& selection = mesh.GetSelection();
+    std::vector<FaceID> facesToSubdivide(selection.faces.begin(), selection.faces.end());
+    std::vector<FaceID> newFaces;
+    
+    for (FaceID fid : facesToSubdivide) {
+        const EMFace* face = mesh.GetFace(fid);
+        if (!face) continue;
+        
+        std::vector<VertexID> verts = CollectFaceVertices(mesh, fid);
+        if (verts.size() < 3) continue;
+        
+        std::vector<glm::vec3> positions;
+        positions.reserve(verts.size());
+        for (VertexID vid : verts) {
+            const EMVertex* v = mesh.GetVertex(vid);
+            if (v) positions.push_back(v->position);
+        }
+        if (positions.size() < 3) continue;
+        
+        mesh.RecalculateFaceNormal(fid);
+        std::vector<uint32_t> tri = Triangulator::Triangulate(positions, mesh.GetFace(fid)->normal);
+        if (tri.size() < 3) continue;
+        
+        mesh.RemoveFace(fid);
+        
+        std::unordered_map<uint64_t, std::vector<VertexID>> edgePoints;
+        auto getEdgeKey = [](VertexID a, VertexID b) -> uint64_t {
+            if (a > b) std::swap(a, b);
+            return (static_cast<uint64_t>(a) << 32) | b;
+        };
+        
+        auto getEdgePoint = [&](VertexID a, VertexID b, int idx) -> VertexID {
+            uint64_t key = getEdgeKey(a, b);
+            auto& pts = edgePoints[key];
+            if (pts.empty()) {
+                pts.resize(static_cast<size_t>(cuts + 2), INVALID_ID);
+            }
+            int forwardIdx = (a <= b) ? idx : (cuts + 1 - idx);
+            if (pts[forwardIdx] != INVALID_ID) return pts[forwardIdx];
+            
+            const EMVertex* v0 = mesh.GetVertex(a);
+            const EMVertex* v1 = mesh.GetVertex(b);
+            if (!v0 || !v1) return INVALID_ID;
+            
+            float t = static_cast<float>(idx) / static_cast<float>(cuts + 1);
+            VertexID vid = (idx == 0) ? a : (idx == cuts + 1 ? b : mesh.AddVertex(glm::mix(v0->position, v1->position, t)));
+            if (vid != a && vid != b) {
+                EMVertex* nv = mesh.GetVertex(vid);
+                if (nv) nv->uv = glm::mix(v0->uv, v1->uv, t);
+            }
+            pts[forwardIdx] = vid;
+            return vid;
+        };
+        
+        for (size_t i = 0; i + 2 < tri.size(); i += 3) {
+            VertexID v0 = verts[tri[i]];
+            VertexID v1 = verts[tri[i + 1]];
+            VertexID v2 = verts[tri[i + 2]];
+            
+            std::vector<std::vector<VertexID>> grid;
+            grid.resize(static_cast<size_t>(cuts + 2));
+            
+            for (int row = 0; row <= cuts + 1; ++row) {
+                int count = (cuts + 2) - row;
+                grid[row].resize(static_cast<size_t>(count), INVALID_ID);
+                
+                VertexID rowStart = getEdgePoint(v0, v2, row);
+                VertexID rowEnd = getEdgePoint(v1, v2, row);
+                
+                const EMVertex* startV = mesh.GetVertex(rowStart);
+                const EMVertex* endV = mesh.GetVertex(rowEnd);
+                
+                for (int col = 0; col < count; ++col) {
+                    if (row == 0) {
+                        grid[row][col] = getEdgePoint(v0, v1, col);
+                        continue;
+                    }
+                    if (col == 0) {
+                        grid[row][col] = rowStart;
+                        continue;
+                    }
+                    if (col == count - 1) {
+                        grid[row][col] = rowEnd;
+                        continue;
+                    }
+                    
+                    if (!startV || !endV) continue;
+                    float t = static_cast<float>(col) / static_cast<float>(count - 1);
+                    glm::vec3 pos = glm::mix(startV->position, endV->position, t);
+                    VertexID vid = mesh.AddVertex(pos);
+                    EMVertex* nv = mesh.GetVertex(vid);
+                    if (nv) nv->uv = glm::mix(startV->uv, endV->uv, t);
+                    grid[row][col] = vid;
+                }
+            }
+            
+            for (int row = 0; row < cuts + 1; ++row) {
+                for (int col = 0; col < (cuts + 1 - row); ++col) {
+                    VertexID v00 = grid[row][col];
+                    VertexID v01 = grid[row][col + 1];
+                    VertexID v10 = grid[row + 1][col];
+                    if (v00 == INVALID_ID || v01 == INVALID_ID || v10 == INVALID_ID) continue;
+                    
+                    FaceID f0 = mesh.AddFace({v00, v01, v10});
+                    if (f0 != INVALID_ID) newFaces.push_back(f0);
+                    
+                    if (col < (cuts - row)) {
+                        VertexID v11 = grid[row + 1][col + 1];
+                        if (v11 != INVALID_ID) {
+                            FaceID f1 = mesh.AddFace({v01, v11, v10});
+                            if (f1 != INVALID_ID) newFaces.push_back(f1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    CleanupOrphanEdges(mesh);
+    
+    mesh.DeselectAll();
+    for (FaceID fid : newFaces) {
+        mesh.SelectFace(fid, true);
+    }
+    
+    mesh.MakeWindingConsistentAndOutward();
+    mesh.RecalculateNormals();
 }
 
 void TriangulateFaces(EditableMesh& mesh) {

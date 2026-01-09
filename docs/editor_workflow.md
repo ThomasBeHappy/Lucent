@@ -61,3 +61,13 @@ The editor uses ImGui docking. Panels can be rearranged or reset via:
 | Delete | `Delete` |
 | Focus | `F` |
 | Move / Rotate / Scale | `W` / `E` / `R` |
+| Mesh Select Mode | `1` / `2` / `3` |
+| Extrude Faces | `E` |
+| Inset Faces | `I` |
+| Bevel Edges | `Ctrl+B` |
+| Loop Cut | `Ctrl+R` |
+| Select Edge Loop | `Alt+L` |
+| Select Edge Ring | `Alt+R` |
+| Dissolve | `Alt+X` |
+| Subdivide Faces | `Ctrl+Shift+R` |
+| Shrink Selection | `Ctrl+-` |
