@@ -486,40 +486,54 @@ std::vector<FaceID> ExtrudeFaces(EditableMesh& mesh, float distance) {
         }
     }
     
-    // Create side faces for boundary edges.
+    // Collect side faces for boundary edges.
     //
-    // IMPORTANT: Use face loop order to preserve consistent winding.
-    // Using EMEdge::v0/v1 is not oriented (edges are undirected), which can flip half the side quads.
+    // IMPORTANT:
+    // We must remove the original faces BEFORE creating side faces, otherwise boundary edges
+    // are temporarily shared by 3 faces (adjacent + original + side) and the edge can no longer
+    // store correct loop adjacency (edge->loop0/loop1). That breaks winding/orientation fixes and
+    // can make the side walls appear missing (backface culled).
+    struct SideQuad {
+        VertexID v0;
+        VertexID v1;
+        VertexID v1New;
+        VertexID v0New;
+    };
+    std::vector<SideQuad> sideQuads;
+    sideQuads.reserve(selection.faces.size() * 4);
+
     for (FaceID fid : selection.faces) {
         // For each boundary loop edge in this face, build a quad:
         // [curr, next, next', curr'] with the same winding as the original face loop.
         mesh.ForEachFaceLoop(fid, [&](const EMLoop& loop) {
             if (edgeFaceCount[loop.edge] != 1) return; // Not a boundary edge
-            
+
             const EMLoop* nextLoop = mesh.GetLoop(loop.next);
             if (!nextLoop) return;
-            
+
             VertexID v0 = loop.vertex;
             VertexID v1 = nextLoop->vertex;
-            
+
             auto it0 = vertexDuplicates.find(v0);
             auto it1 = vertexDuplicates.find(v1);
             if (it0 == vertexDuplicates.end() || it1 == vertexDuplicates.end()) return;
-            
-            VertexID v0New = it0->second;
-            VertexID v1New = it1->second;
-            
-            std::vector<VertexID> sideVerts = { v0, v1, v1New, v0New };
-            FaceID sideFace = mesh.AddFace(sideVerts);
-            if (sideFace != INVALID_ID) {
-                newFaces.push_back(sideFace);
-            }
+
+            sideQuads.push_back(SideQuad{ v0, v1, it1->second, it0->second });
         });
     }
     
     // Remove original faces
     for (FaceID fid : facesToRemove) {
         mesh.RemoveFace(fid);
+    }
+
+    // Create side faces now that original faces are gone (edges have room for correct adjacency)
+    for (const auto& q : sideQuads) {
+        std::vector<VertexID> sideVerts = { q.v0, q.v1, q.v1New, q.v0New };
+        FaceID sideFace = mesh.AddFace(sideVerts);
+        if (sideFace != INVALID_ID) {
+            newFaces.push_back(sideFace);
+        }
     }
     
     // Select new top faces
