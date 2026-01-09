@@ -19,7 +19,9 @@ void main() {
     
     // Reconstruct view direction from clip space
     // We use inverse viewProj to get world direction
-    vec4 clipPos = vec4(pos, 1.0, 1.0); // Far plane
+    // NOTE: The renderer uses Vulkan-style Y-down screen space (no projection Y-flip).
+    // For correct environment/sky directions, convert back to a Y-up clip position for reconstruction.
+    vec4 clipPos = vec4(pos.x, -pos.y, 1.0, 1.0); // Far plane
     vec4 worldPos = inverse(pc.viewProj) * clipPos;
     outDirection = normalize(worldPos.xyz / worldPos.w);
     

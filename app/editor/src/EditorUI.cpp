@@ -1635,9 +1635,7 @@ void EditorUI::DrawGizmo() {
         m_EditorCamera->GetNearClip(),
         m_EditorCamera->GetFarClip()
     );
-    
-    // ImGuizmo expects OpenGL-style projection (Y-up), but Vulkan is Y-down
-    // Flip the Y axis in the projection matrix for ImGuizmo
+    // Match the engine's Vulkan projection convention (we flip Y in the camera projection).
     projection[1][1] *= -1.0f;
     
     // Get transform matrix
@@ -3806,7 +3804,7 @@ void EditorUI::HandleGlobalShortcuts() {
             if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R) && !io.KeyShift) {
                 if (!meshPtr->GetSelection().edges.empty()) {
                     auto before = MeshEditCommand::CaptureSnapshot(editMesh);
-                    EdgeID startEdge = *meshPtr->GetSelection().edges.begin();
+                    mesh::EdgeID startEdge = *meshPtr->GetSelection().edges.begin();
                     mesh::MeshOps::LoopCut(*meshPtr, startEdge, 0.5f);
                     editMesh->MarkDirty();
                     m_SceneDirty = true;
@@ -3818,7 +3816,7 @@ void EditorUI::HandleGlobalShortcuts() {
             // Alt+L - Select edge loop
             if (io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_L)) {
                 if (!meshPtr->GetSelection().edges.empty()) {
-                    EdgeID startEdge = *meshPtr->GetSelection().edges.begin();
+                    mesh::EdgeID startEdge = *meshPtr->GetSelection().edges.begin();
                     mesh::MeshOps::SelectEdgeLoop(*meshPtr, startEdge);
                 }
             }
@@ -3826,7 +3824,7 @@ void EditorUI::HandleGlobalShortcuts() {
             // Alt+R - Select edge ring
             if (io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_R)) {
                 if (!meshPtr->GetSelection().edges.empty()) {
-                    EdgeID startEdge = *meshPtr->GetSelection().edges.begin();
+                    mesh::EdgeID startEdge = *meshPtr->GetSelection().edges.begin();
                     mesh::MeshOps::SelectEdgeRing(*meshPtr, startEdge);
                 }
             }
@@ -3921,6 +3919,16 @@ void EditorUI::HandleGlobalShortcuts() {
                     pushMeshUndo("Merge", before);
                     LUCENT_CORE_INFO("Merged vertices at center");
                 }
+            }
+
+            // Ctrl+Shift+M - Weld by distance (useful for imported meshes with split verts)
+            if (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_M)) {
+                auto before = MeshEditCommand::CaptureSnapshot(editMesh);
+                mesh::MeshOps::WeldVerticesByDistance(*meshPtr, 1e-4f);
+                editMesh->MarkDirty();
+                m_SceneDirty = true;
+                pushMeshUndo("Weld", before);
+                LUCENT_CORE_INFO("Welded vertices (threshold = 1e-4)");
             }
             
             // A - Select All / Deselect All

@@ -247,7 +247,7 @@ void Application::CreatePrimitiveMeshes() {
     std::vector<uint32_t> indices;
     
     // Cube
-    assets::Primitives::GenerateCube(vertices, indices, 1.0f);
+    assets::Primitives::GenerateCube(vertices, indices, 1.0f, /*mergedVertices=*/true);
     auto cubeMesh = std::make_unique<assets::Mesh>();
     if (cubeMesh->Create(&m_Device, vertices, indices, "Primitive_Cube")) {
         m_PrimitiveMeshes[PrimitiveType::Cube] = std::move(cubeMesh);

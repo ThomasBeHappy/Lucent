@@ -95,7 +95,10 @@ private:
 
 // Primitive mesh generators
 namespace Primitives {
-    void GenerateCube(std::vector<Vertex>& outVertices, std::vector<uint32_t>& outIndices, float size = 1.0f);
+    // NOTE:
+    // - When mergedVertices=false (default), we generate 24 verts (4 per face) so hard normals + per-face UVs work.
+    // - When mergedVertices=true, we generate 8 shared verts (smooth cube; UVs are a simple projection).
+    void GenerateCube(std::vector<Vertex>& outVertices, std::vector<uint32_t>& outIndices, float size = 1.0f, bool mergedVertices = false);
     void GenerateSphere(std::vector<Vertex>& outVertices, std::vector<uint32_t>& outIndices, float radius = 0.5f, uint32_t segments = 32, uint32_t rings = 16);
     void GeneratePlane(std::vector<Vertex>& outVertices, std::vector<uint32_t>& outIndices, float width = 1.0f, float height = 1.0f, uint32_t subdivisions = 1);
     void GenerateCylinder(std::vector<Vertex>& outVertices, std::vector<uint32_t>& outIndices, float radius = 0.5f, float height = 1.0f, uint32_t segments = 32);

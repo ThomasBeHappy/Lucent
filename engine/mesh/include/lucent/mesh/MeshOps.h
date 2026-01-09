@@ -89,6 +89,11 @@ void ShrinkSelection(EditableMesh& mesh);
 // Utility Operations
 // ============================================================================
 
+// Weld vertices by position (merge within distance threshold).
+// This rebuilds topology and preserves per-loop UVs where possible.
+// Typical values: 1e-6 .. 1e-3 depending on your asset scale.
+void WeldVerticesByDistance(EditableMesh& mesh, float distance);
+
 // Flip normals of selected faces
 void FlipNormals(EditableMesh& mesh);
 

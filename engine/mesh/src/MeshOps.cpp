@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <unordered_set>
 #include <unordered_map>
+#include <cmath>
 
 namespace lucent::mesh {
 namespace MeshOps {
@@ -118,6 +119,175 @@ std::vector<VertexID> BuildSegmentVertices(
 }
 
 } // namespace
+
+// ============================================================================
+// Utility Operations
+// ============================================================================
+
+namespace {
+
+struct WeldGridKey {
+    int64_t x = 0;
+    int64_t y = 0;
+    int64_t z = 0;
+    bool operator==(const WeldGridKey& o) const { return x == o.x && y == o.y && z == o.z; }
+};
+
+struct WeldGridKeyHash {
+    size_t operator()(const WeldGridKey& k) const noexcept {
+        auto mix = [](uint64_t v) {
+            v ^= v >> 33;
+            v *= 0xff51afd7ed558ccdULL;
+            v ^= v >> 33;
+            v *= 0xc4ceb9fe1a85ec53ULL;
+            v ^= v >> 33;
+            return v;
+        };
+        uint64_t hx = mix(static_cast<uint64_t>(k.x));
+        uint64_t hy = mix(static_cast<uint64_t>(k.y));
+        uint64_t hz = mix(static_cast<uint64_t>(k.z));
+        return static_cast<size_t>(hx ^ (hy << 1) ^ (hz << 2));
+    }
+};
+
+static WeldGridKey WeldQuantize(const glm::vec3& p, float cell) {
+    const float inv = 1.0f / cell;
+    return WeldGridKey{
+        static_cast<int64_t>(std::floor(p.x * inv)),
+        static_cast<int64_t>(std::floor(p.y * inv)),
+        static_cast<int64_t>(std::floor(p.z * inv))
+    };
+}
+
+} // namespace
+
+void WeldVerticesByDistance(EditableMesh& mesh, float distance) {
+    if (distance <= 0.0f) return;
+
+    std::vector<VertexID> vids;
+    vids.reserve(mesh.VertexCount());
+    for (const auto& v : mesh.GetVertices()) {
+        if (v.id == INVALID_ID) continue;
+        vids.push_back(v.id);
+    }
+    if (vids.size() < 2) return;
+
+    const float dist2 = distance * distance;
+
+    std::unordered_map<WeldGridKey, std::vector<VertexID>, WeldGridKeyHash> grid;
+    grid.reserve(vids.size());
+
+    std::unordered_map<VertexID, VertexID> toRep;
+    toRep.reserve(vids.size());
+
+    auto tryFindRep = [&](const glm::vec3& p, const WeldGridKey& key) -> VertexID {
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    WeldGridKey nk{ key.x + dx, key.y + dy, key.z + dz };
+                    auto it = grid.find(nk);
+                    if (it == grid.end()) continue;
+                    for (VertexID rep : it->second) {
+                        const EMVertex* rv = mesh.GetVertex(rep);
+                        if (!rv) continue;
+                        glm::vec3 d = rv->position - p;
+                        if (glm::dot(d, d) <= dist2) return rep;
+                    }
+                }
+            }
+        }
+        return INVALID_ID;
+    };
+
+    for (VertexID vid : vids) {
+        const EMVertex* v = mesh.GetVertex(vid);
+        if (!v) continue;
+        WeldGridKey k = WeldQuantize(v->position, distance);
+        VertexID rep = tryFindRep(v->position, k);
+        if (rep == INVALID_ID) {
+            grid[k].push_back(vid);
+            toRep[vid] = vid;
+        } else {
+            toRep[vid] = rep;
+        }
+    }
+
+    bool anyMerge = false;
+    for (const auto& kv : toRep) {
+        if (kv.first != kv.second) { anyMerge = true; break; }
+    }
+    if (!anyMerge) return;
+
+    // Representatives -> new vertex ids
+    std::unordered_map<VertexID, VertexID> repToNew;
+    repToNew.reserve(vids.size());
+
+    EditableMesh newMesh;
+    for (VertexID vid : vids) {
+        if (toRep[vid] != vid) continue;
+        const EMVertex* rv = mesh.GetVertex(vid);
+        if (!rv) continue;
+        VertexID newVid = newMesh.AddVertex(rv->position);
+        if (EMVertex* nv = newMesh.GetVertex(newVid)) {
+            nv->uv = rv->uv;      // best-effort
+            nv->normal = rv->normal;
+        }
+        repToNew[vid] = newVid;
+    }
+
+    // Rebuild faces, preserving per-loop UVs
+    for (const auto& face : mesh.GetFaces()) {
+        if (face.id == INVALID_ID) continue;
+
+        std::vector<VertexID> newFaceVerts;
+        std::vector<glm::vec2> newFaceUVs;
+        mesh.ForEachFaceLoop(face.id, [&](const EMLoop& loop) {
+            VertexID rep = toRep[loop.vertex];
+            auto it = repToNew.find(rep);
+            if (it == repToNew.end()) return;
+            newFaceVerts.push_back(it->second);
+            newFaceUVs.push_back(loop.uv);
+        });
+
+        // Collapse consecutive duplicates introduced by welding
+        if (newFaceVerts.size() >= 2) {
+            std::vector<VertexID> collapsedVerts;
+            std::vector<glm::vec2> collapsedUVs;
+            collapsedVerts.reserve(newFaceVerts.size());
+            collapsedUVs.reserve(newFaceUVs.size());
+            for (size_t i = 0; i < newFaceVerts.size(); ++i) {
+                if (!collapsedVerts.empty() && collapsedVerts.back() == newFaceVerts[i]) continue;
+                collapsedVerts.push_back(newFaceVerts[i]);
+                collapsedUVs.push_back(newFaceUVs[i]);
+            }
+            if (collapsedVerts.size() >= 3 && collapsedVerts.front() == collapsedVerts.back()) {
+                collapsedVerts.pop_back();
+                collapsedUVs.pop_back();
+            }
+            newFaceVerts = std::move(collapsedVerts);
+            newFaceUVs = std::move(collapsedUVs);
+        }
+
+        if (newFaceVerts.size() < 3) continue;
+        FaceID nf = newMesh.AddFace(newFaceVerts);
+        if (nf == INVALID_ID) continue;
+
+        // Assign per-loop UVs in the same order
+        size_t idx = 0;
+        newMesh.ForEachFaceLoop(nf, [&](const EMLoop& l) {
+            if (EMLoop* ml = newMesh.GetLoop(l.id)) {
+                if (idx < newFaceUVs.size()) ml->uv = newFaceUVs[idx];
+            }
+            idx++;
+        });
+    }
+
+    newMesh.MakeWindingConsistentAndOutward();
+    newMesh.RecalculateNormals();
+    mesh = std::move(newMesh);
+
+    LUCENT_CORE_INFO("Welded vertices by distance: {}", distance);
+}
 
 // ============================================================================
 // Transform Operations
@@ -705,8 +875,9 @@ std::vector<EdgeID> LoopCut(EditableMesh& mesh, EdgeID startEdge, float position
             }
             
             mesh.RemoveFace(fid);
-            FaceID f0 = mesh.AddFace({v0, newEdgeV, newOppV, v3});
-            FaceID f1 = mesh.AddFace({newEdgeV, v1, v2, newOppV});
+            // Create two new quads. Return values are not currently used, but keeping the calls for side effects.
+            (void)mesh.AddFace({v0, newEdgeV, newOppV, v3});
+            (void)mesh.AddFace({newEdgeV, v1, v2, newOppV});
             splitFaces.insert(fid);
             
             EdgeID cutEdge = FindEdgeBetween(mesh, newEdgeV, newOppV);
@@ -1183,7 +1354,15 @@ void SubdivideFaces(EditableMesh& mesh, int cuts) {
         if (positions.size() < 3) continue;
         
         mesh.RecalculateFaceNormal(fid);
-        std::vector<uint32_t> tri = Triangulator::Triangulate(positions, mesh.GetFace(fid)->normal);
+        // NOTE: We don't currently ship an ear-clipping triangulator here.
+        // Fall back to simple fan triangulation for subdivision seeding (works well for convex faces).
+        std::vector<uint32_t> tri;
+        tri.reserve((positions.size() - 2) * 3);
+        for (uint32_t i = 1; i + 1 < static_cast<uint32_t>(positions.size()); ++i) {
+            tri.push_back(0u);
+            tri.push_back(i);
+            tri.push_back(i + 1u);
+        }
         if (tri.size() < 3) continue;
         
         mesh.RemoveFace(fid);

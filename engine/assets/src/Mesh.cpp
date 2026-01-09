@@ -113,11 +113,44 @@ void Mesh::DrawSubmesh(VkCommandBuffer cmd, uint32_t submeshIndex, uint32_t inst
 
 namespace Primitives {
 
-void GenerateCube(std::vector<Vertex>& outVertices, std::vector<uint32_t>& outIndices, float size) {
+void GenerateCube(std::vector<Vertex>& outVertices, std::vector<uint32_t>& outIndices, float size, bool mergedVertices) {
     outVertices.clear();
     outIndices.clear();
     
     float h = size * 0.5f;
+
+    if (mergedVertices) {
+        // 8 shared vertices (smooth cube). This cannot represent hard edges + per-face UV seams,
+        // but is useful for "merged topology" workflows.
+        const glm::vec3 p[8] = {
+            {-h, -h, -h}, { h, -h, -h}, { h,  h, -h}, {-h,  h, -h},
+            {-h, -h,  h}, { h, -h,  h}, { h,  h,  h}, {-h,  h,  h}
+        };
+
+        outVertices.reserve(8);
+        for (int i = 0; i < 8; ++i) {
+            glm::vec3 normal = glm::normalize(p[i]); // smooth corner normal
+            glm::vec2 uv = glm::vec2((p[i].x / size) + 0.5f, (p[i].z / size) + 0.5f); // simple projection
+            outVertices.push_back({ p[i], normal, uv, glm::vec4(1, 0, 0, 1) });
+        }
+
+        // 12 triangles, CCW winding (same vertex ordering as engine/scene cube ngon)
+        // Faces:
+        // Front (Z+): 7,6,5,4
+        outIndices.insert(outIndices.end(), {7, 6, 5, 7, 5, 4});
+        // Back (Z-): 2,3,0,1
+        outIndices.insert(outIndices.end(), {2, 3, 0, 2, 0, 1});
+        // Top (Y+): 7,6,2,3
+        outIndices.insert(outIndices.end(), {7, 6, 2, 7, 2, 3});
+        // Bottom (Y-): 0,1,5,4
+        outIndices.insert(outIndices.end(), {0, 1, 5, 0, 5, 4});
+        // Right (X+): 6,2,1,5
+        outIndices.insert(outIndices.end(), {6, 2, 1, 6, 1, 5});
+        // Left (X-): 3,7,4,0
+        outIndices.insert(outIndices.end(), {3, 7, 4, 3, 4, 0});
+
+        return;
+    }
     
     // 6 faces, 4 vertices each (for proper normals)
     // Front face (Z+)

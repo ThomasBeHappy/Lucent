@@ -150,7 +150,9 @@ vec3 sampleEnvironment(vec3 direction) {
     
     // Equirectangular mapping
     float u = atan(rotDir.z, rotDir.x) / (2.0 * PI) + 0.5;
-    float v = asin(clamp(rotDir.y, -1.0, 1.0)) / PI + 0.5;
+    // NOTE: Use acos(y) so v=0 is the "top" (north pole, y=+1) which matches how we build the CDFs
+    // and how most HDR equirectangular textures are authored.
+    float v = acos(clamp(rotDir.y, -1.0, 1.0)) / PI;
     
     if (pc.useEnvMap != 0u) {
         return texture(envMap, vec2(u, v)).rgb * pc.envIntensity;
